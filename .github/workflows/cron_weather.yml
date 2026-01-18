@@ -1,0 +1,17 @@
+name: Cron Weather (09/12/15 JST)
+
+on:
+  schedule:
+    - cron: "0 0 * * *"  # 09:00 JST
+    - cron: "0 3 * * *"  # 12:00 JST
+    - cron: "0 6 * * *"  # 15:00 JST
+  workflow_dispatch:
+
+jobs:
+  call-cron-weather:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call Supabase Edge Function
+        run: |
+          curl -sS -X POST "https://mvnaqmhxraxblsnzarnn.supabase.co/functions/v1/cron_weather" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}"
