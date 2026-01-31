@@ -2,7 +2,7 @@
 
 import React from "react";
 import Link from "next/link";
-import { supabase } from "@/app/lib/supabase";
+import { supabase } from "@/app/lib/supabaseClient";
 
 type Project = {
   id: string;
