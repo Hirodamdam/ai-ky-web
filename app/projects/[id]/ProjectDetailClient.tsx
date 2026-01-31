@@ -4,7 +4,6 @@ import Link from "next/link";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 import { supabase } from "@/app/lib/supabaseClient";
-import { useAuthReady } from "@/app/lib/useAuthReady";
 
 type Status = { type: "success" | "error" | null; text: string };
 
@@ -12,6 +11,7 @@ type Project = {
   id: string;
   name: string | null;
   contractor_name?: string | null;
+  address?: string | null;
   lat?: number | null;
   lon?: number | null;
 };
@@ -36,21 +36,19 @@ export default function ProjectDetailClient() {
   const params = useParams<{ id: string }>();
   const projectId = params?.id;
 
-  const { ready: authReady, session } = useAuthReady();
-
   const [status, setStatus] = useState<Status>({ type: null, text: "" });
   const [loading, setLoading] = useState(true);
 
   const [project, setProject] = useState<Project | null>(null);
   const [kyRows, setKyRows] = useState<KyEntryRow[]>([]);
-
-  const canOperate = authReady && !!session;
+  const [loggedIn, setLoggedIn] = useState<boolean | null>(null);
 
   const refresh = useCallback(async () => {
-    if (!projectId) return;
-
     setLoading(true);
     setStatus({ type: null, text: "" });
+
+    const sess = await supabase.auth.getSession();
+    setLoggedIn(!!sess.data.session);
 
     const p = await supabase.from("projects").select("*").eq("id", projectId).maybeSingle();
     if (p.error || !p.data) {
@@ -110,20 +108,6 @@ export default function ProjectDetailClient() {
         </div>
       </div>
 
-      {/* auth復元中 */}
-      {!authReady && <div className="text-sm text-gray-500">ログイン確認中…</div>}
-
-      {/* auth復元後に未ログインなら警告 */}
-      {authReady && !session && (
-        <div className="rounded border border-yellow-300 bg-yellow-50 p-3 text-sm">
-          ログイン状態を確認できません。操作（保存/承認等）を行うには{" "}
-          <Link className="underline" href="/login">
-            /login
-          </Link>{" "}
-          から再ログインしてください。
-        </div>
-      )}
-
       {status.type && (
         <div
           className={`rounded border p-3 text-sm ${
@@ -131,6 +115,23 @@ export default function ProjectDetailClient() {
           }`}
         >
           {status.text}
+          {status.type === "error" && status.text.includes("/login") && (
+            <div className="mt-2">
+              <Link className="underline" href="/login">
+                /login へ
+              </Link>
+            </div>
+          )}
+        </div>
+      )}
+
+      {loggedIn === false && (
+        <div className="rounded border border-yellow-300 bg-yellow-50 p-3 text-sm">
+          ログイン状態を確認できません。操作（保存/承認等）を行うには{" "}
+          <Link className="underline" href="/login">
+            /login
+          </Link>{" "}
+          から再ログインしてください。
         </div>
       )}
 
@@ -144,12 +145,14 @@ export default function ProjectDetailClient() {
                 <div className="font-semibold mb-1">工事件名</div>
                 <div>{fmt(project.name)}</div>
               </div>
-
               <div className="border rounded p-3">
                 <div className="font-semibold mb-1">施工会社</div>
                 <div>{fmt(project.contractor_name ?? "株式会社三竹工業")}</div>
               </div>
-
+              <div className="border rounded p-3">
+                <div className="font-semibold mb-1">住所</div>
+                <div>{fmt(project.address)}</div>
+              </div>
               <div className="border rounded p-3">
                 <div className="font-semibold mb-1">緯度 / 経度</div>
                 <div>
@@ -162,24 +165,12 @@ export default function ProjectDetailClient() {
               <Link className="bg-black text-white rounded px-4 py-2 text-sm" href={`/projects/${projectId}/ky`}>
                 KY一覧へ
               </Link>
-
-              <Link
-                className={`border rounded px-4 py-2 text-sm ${canOperate ? "" : "opacity-50 pointer-events-none"}`}
-                href={`/projects/${projectId}/ky/new`}
-                aria-disabled={!canOperate}
-              >
+              <Link className="border rounded px-4 py-2 text-sm" href={`/projects/${projectId}/ky/new`}>
                 ＋KY登録（新規）
               </Link>
-
               <Link className="border rounded px-4 py-2 text-sm" href={`/projects/${projectId}/project-subcontractors`}>
                 協力会社管理
               </Link>
-
-              {!canOperate && (
-                <div className="text-xs text-gray-600 self-center">
-                  ※ ログイン後に「＋KY登録」「承認操作」が可能になります
-                </div>
-              )}
             </div>
           </div>
 
