@@ -150,10 +150,6 @@ export default function ProjectDetailClient() {
                 <div>{fmt(project.contractor_name ?? "株式会社三竹工業")}</div>
               </div>
               <div className="border rounded p-3">
-                <div className="font-semibold mb-1">住所</div>
-                <div>{fmt(project.address)}</div>
-              </div>
-              <div className="border rounded p-3">
                 <div className="font-semibold mb-1">緯度 / 経度</div>
                 <div>
                   {fmt(project.lat)} / {fmt(project.lon)}
