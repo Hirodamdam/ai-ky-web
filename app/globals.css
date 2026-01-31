@@ -1,26 +1,83 @@
+/* app/globals.css */
+
+/* ✅ Tailwind v4 推奨（これが確実） */
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/* 最低限のリセット（壊さない範囲） */
+* {
+  box-sizing: border-box;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html,
+body {
+  padding: 0;
+  margin: 0;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  color: #111;
+  background: #fff;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP",
+    "Hiragino Kaku Gothic ProN", "Yu Gothic", "Meiryo", sans-serif;
+}
+
+/* 画面では非表示、印刷で表示する要素 */
+.print-only {
+  display: none;
+}
+
+/* =========================================================
+   Print Styles (B: 編集結果 + AI提案も印刷する)
+========================================================= */
+@media print {
+  @page {
+    size: A4;
+    margin: 10mm;
+  }
+
+  .print-only {
+    display: block !important;
+  }
+
+  .print-header {
+    font-size: 12pt;
+    font-weight: 700;
+    padding: 0 0 6mm 0;
+    margin: 0 0 6mm 0;
+    border-bottom: 1px solid #777;
+    white-space: pre-wrap;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-one-col {
+    display: block !important;
+  }
+
+  .print-avoid-break {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .print-no-bg {
+    background: transparent !important;
+  }
+
+  input,
+  textarea {
+    border: 1px solid #777 !important;
+    background: #fff !important;
+  }
+
+  textarea {
+    overflow: visible !important;
+    height: auto !important;
+  }
+
+  .print-tight {
+    padding: 0 !important;
+    margin: 0 !important;
+  }
 }

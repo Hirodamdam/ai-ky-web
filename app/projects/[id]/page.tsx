@@ -1,14 +1,7 @@
+// app/projects/[id]/page.tsx
 import ProjectDetailClient from "./ProjectDetailClient";
 
-type Params = {
-  id: string;
-};
-
-export default async function Page({
-  params,
-}: {
-  params: Promise<Params>;
-}) {
-  const { id } = await params;
-  return <ProjectDetailClient id={id} />;
+export default function Page() {
+  // params はクライアント側で useParams を使う運用
+  return <ProjectDetailClient />;
 }

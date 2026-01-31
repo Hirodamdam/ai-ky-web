@@ -9,8 +9,11 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.90.1",
+    "@supabase/supabase-js": "^2.91.0",
+    "cheerio": "^1.1.2",
+    "dotenv": "^17.2.3",
     "next": "16.1.1",
+    "openai": "^6.16.0",
     "react": "19.2.3",
     "react-dom": "19.2.3"
   },
@@ -21,7 +24,9 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.1.1",
+    "sharp": "^0.34.5",
     "tailwindcss": "^4",
+    "tsx": "^4.21.0",
     "typescript": "^5"
   }
 }

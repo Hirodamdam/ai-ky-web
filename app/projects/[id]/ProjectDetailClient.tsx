@@ -1,287 +1,225 @@
 "use client";
 
-import React from "react";
 import Link from "next/link";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useParams } from "next/navigation";
 import { supabase } from "@/app/lib/supabaseClient";
+
+type Status = { type: "success" | "error" | null; text: string };
 
 type Project = {
   id: string;
-  name: string;
-  site_name: string | null;
-  lat: number | null;
-  lon: number | null;
-  is_active: boolean | null;
-  created_at: string | null;
+  name: string | null;
+  contractor_name?: string | null;
+  address?: string | null;
+  lat?: number | null;
+  lon?: number | null;
 };
 
-type KyEntry = {
+type KyEntryRow = {
   id: string;
   project_id: string | null;
-
   work_date: string | null;
   work_detail: string | null;
-
-  title: string | null;
-
-  hazards: string | null;
-  countermeasures: string | null;
-
-  temperature_text: string | null;
-  wind_direction: string | null;
-  wind_speed_text: string | null;
-  precipitation_mm: number | null;
-
-  weather: string | null;
-  workers: number | null;
-  notes: string | null;
-
+  partner_company_name: string | null;
+  third_party_situation: string | null;
+  is_approved: boolean | null;
   created_at: string | null;
 };
-function fmtDateTime(iso: string | null) {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString();
+
+function fmt(v: any): string {
+  if (v === null || v === undefined || v === "") return "—";
+  return String(v);
 }
 
-export default function ProjectDetailClient({ id }: { id: string }) {
-  if (!id) {
-  return (
-    <div style={{ padding: 24 }}>
-      <div style={{ color: "#b00020"}}>ERROR: project id is empty</div>
-      <div>URLを確認してください（/projects/&lt;uuid&gt; になっている必要があります）</div>
-    </div>
-  );
-}
-  const [project, setProject] = React.useState<Project | null>(null);
-  const [status, setStatus] = React.useState<string>("loading...");
+export default function ProjectDetailClient() {
+  const params = useParams<{ id: string }>();
+  const projectId = params?.id;
 
-  const [kyEntries, setKyEntries] = React.useState<KyEntry[]>([]);
-  const [kyStatus, setKyStatus] = React.useState<string>("loading...");
-  const [kyError, setKyError] = React.useState<string>("");
+  const [status, setStatus] = useState<Status>({ type: null, text: "" });
+  const [loading, setLoading] = useState(true);
 
-  React.useEffect(() => {
-    console.log("project id =", id);
-    
-    if (!id) return;
+  const [project, setProject] = useState<Project | null>(null);
+  const [kyRows, setKyRows] = useState<KyEntryRow[]>([]);
+  const [loggedIn, setLoggedIn] = useState<boolean | null>(null);
 
-    const fetchProject = async () => {
-      setStatus("loading...");
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setStatus({ type: null, text: "" });
 
-      const { data, error } = await supabase
-        .from("projects")
-        .select("id, name, site_name, lat, lon, is_active, created_at")
-        .eq("id", id)
-        .single();
+    const sess = await supabase.auth.getSession();
+    setLoggedIn(!!sess.data.session);
 
-      if (error) {
-        setStatus("ERROR: " + error.message);
-        setProject(null);
-        return;
-      }
+    const p = await supabase.from("projects").select("*").eq("id", projectId).maybeSingle();
+    if (p.error || !p.data) {
+      setProject(null);
+      setKyRows([]);
+      setStatus({ type: "error", text: "工事情報を取得できません。" });
+      setLoading(false);
+      return;
+    }
+    setProject(p.data as Project);
 
-      setProject(data as Project);
-      setStatus("OK");
-    };
+    const k = await supabase
+      .from("ky_entries")
+      .select("id,project_id,work_date,work_detail,partner_company_name,third_party_situation,is_approved,created_at")
+      .eq("project_id", projectId)
+      .order("work_date", { ascending: false })
+      .order("created_at", { ascending: false })
+      .limit(10);
 
-    fetchProject();
-  }, [id]);
+    if (k.error) {
+      setKyRows([]);
+      setStatus({ type: "error", text: `KY一覧の取得に失敗しました：${k.error.message}` });
+      setLoading(false);
+      return;
+    }
 
-  React.useEffect(() => {
-    if (!id) return;
+    setKyRows((k.data ?? []) as KyEntryRow[]);
+    setLoading(false);
+  }, [projectId]);
 
-    const fetchKyEntries = async () => {
-      setKyStatus("loading...");
-      setKyError("");
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
 
-      const { data, error } = await supabase
-        .from("ky_entries")
-        .select(
-          "id, project_id, work_date, title, work_detail, hazards, countermeasures, temperature_text, wind_direction, wind_speed_text, precipitation_mm, weather, workers, notes, created_at"
-        )
-        .eq("project_id", id)
-        .order("created_at", { ascending: false })
-        .limit(50);
-
-      if (error) {
-        setKyStatus("ERROR");
-        setKyError(error.message);
-        setKyEntries([]);
-        return;
-      }
-
-      setKyEntries((data ?? []) as KyEntry[]);
-      setKyStatus("OK");
-    };
-
-    fetchKyEntries();
-  }, [id]);
+  const kySummary = useMemo(() => {
+    const total = kyRows.length;
+    const approved = kyRows.filter((r) => r.is_approved).length;
+    const unapproved = total - approved;
+    return { total, approved, unapproved };
+  }, [kyRows]);
 
   return (
-    <div style={{ padding: 24 }}>
-      <Link href="/projects">← 一覧へ戻る</Link>
-
-      <h1>工事詳細</h1>
-
-      <p>
-        <Link href={`/projects/${id}/ky/new`}>＋ KY登録</Link>
-      </p>
-
-      <p>ID: {id}</p>
-      <p>状態: {status}</p>
-
-      <h2 style={{ marginTop: 16 }}>工事名</h2>
-      <p style={{ fontWeight: "bold" }}>{project?.name ?? "—"}</p>
-
-      <div
-        style={{
-          marginTop: 16,
-          border: "1px solid #ddd",
-          borderRadius: 8,
-          padding: 12,
-        }}
-      >
+    <div className="max-w-5xl mx-auto p-4 space-y-4">
+      <div className="flex items-center justify-between gap-3">
         <div>
-          <b>現場名</b>：{project?.site_name ?? "—"}
+          <div className="text-sm text-gray-600">工事詳細</div>
+          <h1 className="text-xl font-bold">{project?.name ?? "—"}</h1>
         </div>
-        <div>
-          <b>緯度</b>：{project?.lat ?? "—"}
-        </div>
-        <div>
-          <b>経度</b>：{project?.lon ?? "—"}
-        </div>
-        <div>
-          <b>稼働中</b>：{project?.is_active ? "はい" : "いいえ"}
-        </div>
-        <div>
-          <b>登録日時</b>：{project?.created_at ?? "—"}
+
+        <div className="flex items-center gap-2">
+          <Link className="border rounded px-3 py-2 text-sm" href="/projects">
+            一覧へ
+          </Link>
+          <Link className="border rounded px-3 py-2 text-sm" href={`/projects/${projectId}/edit`}>
+            工事情報を編集
+          </Link>
         </div>
       </div>
 
-      <h2 style={{ marginTop: 24 }}>KY一覧</h2>
-      <p
-        style={{
-          marginTop: 6,
-          color: kyStatus.startsWith("ERROR") ? "#b00020" : "#666",
-        }}
-      >
-        {kyStatus === "loading..."
-          ? "読み込み中..."
-          : kyStatus === "OK"
-          ? `件数: ${kyEntries.length}`
-          : `ERROR: ${kyError}`}
-      </p>
+      {status.type && (
+        <div
+          className={`rounded border p-3 text-sm ${
+            status.type === "success" ? "border-green-300 bg-green-50" : "border-red-300 bg-red-50"
+          }`}
+        >
+          {status.text}
+          {status.type === "error" && status.text.includes("/login") && (
+            <div className="mt-2">
+              <Link className="underline" href="/login">
+                /login へ
+              </Link>
+            </div>
+          )}
+        </div>
+      )}
 
-      <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
-        {kyEntries.length === 0 && kyStatus === "OK" ? (
-          <div style={{ color: "#666" }}>
-            まだKYがありません。右上の「＋ KY登録」から追加してください。
-          </div>
-        ) : null}
+      {loggedIn === false && (
+        <div className="rounded border border-yellow-300 bg-yellow-50 p-3 text-sm">
+          ログイン状態を確認できません。操作（保存/承認等）を行うには{" "}
+          <Link className="underline" href="/login">
+            /login
+          </Link>{" "}
+          から再ログインしてください。
+        </div>
+      )}
 
-        {kyEntries.map((k) => (
-          <div
-            key={k.id}
-            style={{
-              border: "1px solid #ddd",
-              borderRadius: 10,
-              padding: 12,
-              background: "#fff",
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                gap: 12,
-                flexWrap: "wrap",
-              }}
-            >
-              <div>
-                <b>作業日</b>：{k.work_date ?? "—"}
+      {loading && <div className="text-sm text-gray-500">読み込み中…</div>}
+
+      {!loading && project && (
+        <>
+          <div className="border rounded p-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+              <div className="border rounded p-3">
+                <div className="font-semibold mb-1">工事件名</div>
+                <div>{fmt(project.name)}</div>
               </div>
-              <div style={{ color: "#666" }}>
-                <b>作成</b>：{fmtDateTime(k.created_at)}
+              <div className="border rounded p-3">
+                <div className="font-semibold mb-1">施工会社</div>
+                <div>{fmt(project.contractor_name ?? "株式会社三竹工業")}</div>
               </div>
-            </div>
-{k.title && (
-  <div style={{ marginTop: 6, fontWeight: 700, fontSize: 18 }}>
-    {k.title}
-  </div>
-)}
-            <div style={{ marginTop: 8 }}>
-              <b>作業内容</b>
-              <div style={{ whiteSpace: "pre-wrap" }}>{k.work_detail ?? "—"}</div>
-            </div>
-
-            <div style={{ marginTop: 8 }}>
-              <b>危険ポイント（K）</b>
-              <div style={{ whiteSpace: "pre-wrap" }}>{k.hazards ?? "—"}</div>
-            </div>
-
-            <div style={{ marginTop: 8 }}>
-              <b>対策（Y）</b>
-              <div style={{ whiteSpace: "pre-wrap" }}>
-                {k.countermeasures ?? "—"}
+              <div className="border rounded p-3">
+                <div className="font-semibold mb-1">住所</div>
+                <div>{fmt(project.address)}</div>
+              </div>
+              <div className="border rounded p-3">
+                <div className="font-semibold mb-1">緯度 / 経度</div>
+                <div>
+                  {fmt(project.lat)} / {fmt(project.lon)}
+                </div>
               </div>
             </div>
 
-            <div
-              style={{
-                marginTop: 10,
-                display: "grid",
-                gap: 6,
-                gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-              }}
-            >
-              <div>
-                <b>気温</b>：{k.temperature_text ?? "—"}
-              </div>
-              <div>
-                <b>風向</b>：{k.wind_direction ?? "—"}
-              </div>
-              <div>
-                <b>風速</b>：{k.wind_speed_text ?? "—"}
-              </div>
-              <div>
-                <b>降水量</b>：{k.precipitation_mm ?? "—"}
-              </div>
-              <div>
-                <b>天候</b>：{k.weather ?? "—"}
-              </div>
-              <div>
-                <b>作業人数</b>：{k.workers ?? "—"}
-              </div>
-              <div>
-                <b>備考</b>：{k.notes ?? "—"}
-              </div>
-            </div>
-
-            <div
-              style={{
-                marginTop: 8,
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                gap: 12,
-              }}
-            >
-              <div style={{ color: "#666", fontSize: 12 }}>id: {k.id}</div>
-
-              <Link
-                href={`/projects/${id}/ky/${k.id}/edit`}
-                style={{
-                  fontSize: 12,
-                  color: "#0a66c2",
-                  textDecoration: "underline",
-                }}
-              >
-                編集
+            <div className="mt-4 flex flex-wrap gap-2">
+              <Link className="bg-black text-white rounded px-4 py-2 text-sm" href={`/projects/${projectId}/ky`}>
+                KY一覧へ
+              </Link>
+              <Link className="border rounded px-4 py-2 text-sm" href={`/projects/${projectId}/ky/new`}>
+                ＋KY登録（新規）
+              </Link>
+              <Link className="border rounded px-4 py-2 text-sm" href={`/projects/${projectId}/project-subcontractors`}>
+                協力会社管理
               </Link>
             </div>
           </div>
-        ))}
-      </div>
+
+          <div className="border rounded p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="font-semibold">直近のKY（最大10件）</div>
+              <div className="text-sm text-gray-600">
+                合計 {kySummary.total} / 未承認 {kySummary.unapproved} / 承認済 {kySummary.approved}
+              </div>
+            </div>
+
+            {kyRows.length === 0 ? (
+              <div className="text-sm text-gray-500">KYがまだありません。「＋KY登録」から作成してください。</div>
+            ) : (
+              <div className="space-y-2">
+                {kyRows.map((r) => (
+                  <div key={r.id} className="border rounded p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="space-y-1">
+                        <div className="text-sm text-gray-600">{r.work_date ?? "—"}</div>
+                        <div className="font-semibold">{r.work_detail ?? "（作業内容 未入力）"}</div>
+
+                        <div className="flex flex-wrap gap-2 text-xs mt-2">
+                          <span className="px-2 py-1 rounded bg-gray-100">協力会社：{r.partner_company_name ?? "—"}</span>
+                          <span className="px-2 py-1 rounded bg-yellow-100">第三者：{r.third_party_situation ?? "—"}</span>
+                          {r.is_approved ? (
+                            <span className="px-2 py-1 rounded bg-blue-100">承認済み</span>
+                          ) : (
+                            <span className="px-2 py-1 rounded bg-red-100">未承認</span>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        <Link className="border rounded px-3 py-2 text-sm" href={`/projects/${projectId}/ky/${r.id}/review`}>
+                          レビュー
+                        </Link>
+                        <Link className="border rounded px-3 py-2 text-sm" href={`/projects/${projectId}/ky/${r.id}/edit`}>
+                          編集
+                        </Link>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }

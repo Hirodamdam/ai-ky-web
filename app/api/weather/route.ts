@@ -1,147 +1,189 @@
 // app/api/weather/route.ts
 import { NextResponse } from "next/server";
 
-type WeatherPayload = {
-  weather: string | null;            // 例: "晴れ"
-  temperature_text: string | null;   // 例: "12.3"
-  wind_direction: string | null;     // 例: "北北西"
-  wind_speed_text: string | null;    // 例: "3.5"
-  precipitation_mm: number | null;   // 例: 0.0（直近10分 or 1時間のどちらかで運用）
-  observed_at: string | null;        // ISO
+type Slot = {
+  hour: 9 | 12 | 15;
+  time_iso: string;
+  weather_text: string;
+  temperature_c: number | null;
+  wind_direction_deg: number | null;
+  wind_speed_ms: number | null;
+  precipitation_mm: number | null;
+  weather_code: number | null;
 };
 
-function jsonError(status: number, message: string, detail?: any) {
-  return NextResponse.json({ ok: false, error: message, detail }, { status });
+function ymdJst(d: Date): string {
+  // JST基準のYYYY-MM-DD
+  const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+  const y = jst.getUTCFullYear();
+  const m = String(jst.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(jst.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
-function toJstIsoSafe(s: string) {
-  // latest_time.txt は ISO で返る（例: 2022-08-06T10:10:00+09:00） :contentReference[oaicite:4]{index=4}
-  const d = new Date(s);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toISOString();
+function addDaysYmd(ymd: string, days: number): string {
+  // ymd は YYYY-MM-DD 前提
+  const [y, m, d] = ymd.split("-").map((x) => Number(x));
+  const utc = Date.UTC(y, m - 1, d); // 00:00 UTC
+  const next = new Date(utc + days * 24 * 60 * 60 * 1000);
+  // ここは UTC の日付でOK（ymdは暦日指定に使うだけ）
+  const yy = next.getUTCFullYear();
+  const mm = String(next.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(next.getUTCDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
 }
 
-function yyyymmdd(d: Date) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}${m}${day}`;
+function weatherCodeToJa(code: number | null | undefined): string {
+  if (code == null || !Number.isFinite(code)) return "不明";
+  // Open-Meteo weathercode: https://open-meteo.com/en/docs
+  const c = Number(code);
+
+  if (c === 0) return "快晴";
+  if (c === 1) return "晴れ";
+  if (c === 2) return "薄曇り";
+  if (c === 3) return "曇り";
+
+  if (c === 45 || c === 48) return "霧";
+
+  if (c === 51 || c === 53 || c === 55) return "霧雨";
+  if (c === 56 || c === 57) return "着氷性の霧雨";
+
+  if (c === 61 || c === 63 || c === 65) return "雨";
+  if (c === 66 || c === 67) return "着氷性の雨";
+
+  if (c === 71 || c === 73 || c === 75) return "雪";
+  if (c === 77) return "霰";
+
+  if (c === 80 || c === 81 || c === 82) return "にわか雨";
+  if (c === 85 || c === 86) return "にわか雪";
+
+  if (c === 95) return "雷雨";
+  if (c === 96 || c === 99) return "ひょうを伴う雷雨";
+
+  return `天気コード${c}`;
 }
 
-function floorTo3HourBlock(h: number) {
-  // 0,1,2 -> 00 / 3,4,5 -> 03 ... 21-23 -> 21
-  const b = Math.floor(h / 3) * 3;
-  return String(b).padStart(2, "0");
-}
+function pickNearestIndex(times: string[], targetIso: string): number | null {
+  if (!Array.isArray(times) || times.length === 0) return null;
+  const exact = times.indexOf(targetIso);
+  if (exact >= 0) return exact;
 
-function pickLatestKeyLE(data: Record<string, any>, targetIso: string) {
-  // data のキーは日時文字列（例: "2022-08-06T10:00:00+09:00"） :contentReference[oaicite:5]{index=5}
-  // targetIso より「過去で最大」のキーを拾う
+  // 近い時刻を探す（念のため）
   const t = new Date(targetIso).getTime();
-  let bestKey: string | null = null;
-  let bestTime = -Infinity;
+  if (!Number.isFinite(t)) return null;
 
-  for (const k of Object.keys(data)) {
-    const kt = new Date(k).getTime();
-    if (!Number.isNaN(kt) && kt <= t && kt > bestTime) {
-      bestTime = kt;
-      bestKey = k;
+  let bestIdx = 0;
+  let bestDiff = Infinity;
+  for (let i = 0; i < times.length; i++) {
+    const ti = new Date(times[i]).getTime();
+    if (!Number.isFinite(ti)) continue;
+    const diff = Math.abs(ti - t);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestIdx = i;
     }
   }
-  return bestKey;
+  return Number.isFinite(bestDiff) ? bestIdx : null;
 }
 
 export async function GET(req: Request) {
-  const url = new URL(req.url);
-
-  // 今回は A（鹿児島固定）なので lat/lon は受け取っても未使用でOK
-  // const lat = url.searchParams.get("lat");
-  // const lon = url.searchParams.get("lon");
-
-  const forecastArea =
-    process.env.JMA_FORECAST_AREA_CODE?.trim() || "460100"; // 鹿児島県（奄美除く） :contentReference[oaicite:6]{index=6}
-  const amedasCode =
-    process.env.JMA_AMEDAS_CODE?.trim() || "88317"; // 必要なら後で差し替え
-
   try {
-    // 1) 予報（天気文字列）: forecast/{area}.json から今日の天気を拾う :contentReference[oaicite:7]{index=7}
-    const forecastUrl = `https://www.jma.go.jp/bosai/forecast/data/forecast/${forecastArea}.json`;
-    const forecastRes = await fetch(forecastUrl, { cache: "no-store" });
-    if (!forecastRes.ok) {
-      const t = await forecastRes.text().catch(() => "");
-      return jsonError(502, `JMA forecast fetch failed: ${forecastRes.status}`, t);
-    }
-    const forecastJson = await forecastRes.json();
+    const { searchParams } = new URL(req.url);
+    const lat = searchParams.get("lat");
+    const lon = searchParams.get("lon");
+    const date = searchParams.get("date"); // YYYY-MM-DD（任意）
 
-    // かなり構造が深いので「安全に」探す（見つからなければ null）
-    // よくある: [0].timeSeries[0].areas[0].weathers[0] に入っているケース
-    let weatherText: string | null = null;
-    try {
-      const w =
-        forecastJson?.[0]?.timeSeries?.[0]?.areas?.[0]?.weathers?.[0] ??
-        forecastJson?.[0]?.timeSeries?.[0]?.areas?.[0]?.weathers?.[1] ??
-        null;
-      weatherText = typeof w === "string" ? w : null;
-    } catch {
-      weatherText = null;
+    if (!lat || !lon) {
+      return NextResponse.json({ error: "lat/lon required" }, { status: 400 });
     }
 
-    // 2) アメダス（観測）: latest_time.txt → point/{code}/{YYYYMMDD}_{HH}.json :contentReference[oaicite:8]{index=8}
-    const latestTimeRes = await fetch(
-      "https://www.jma.go.jp/bosai/amedas/data/latest_time.txt",
-      { cache: "no-store" }
+    const targetDate =
+      date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : ymdJst(new Date());
+
+    // ✅ Open-Meteo の end_date は排他的に扱われるので「翌日」を指定する
+    const endDate = addDaysYmd(targetDate, 1);
+
+    const url = new URL("https://api.open-meteo.com/v1/forecast");
+    url.searchParams.set("latitude", lat);
+    url.searchParams.set("longitude", lon);
+    url.searchParams.set("timezone", "Asia/Tokyo");
+
+    // ✅ 指定日（0:00〜23:00）を確実に含める
+    url.searchParams.set("start_date", targetDate);
+    url.searchParams.set("end_date", endDate);
+
+    url.searchParams.set(
+      "hourly",
+      [
+        "temperature_2m",
+        "precipitation",
+        "windspeed_10m",
+        "winddirection_10m",
+        "weathercode",
+      ].join(",")
     );
-    if (!latestTimeRes.ok) {
-      const t = await latestTimeRes.text().catch(() => "");
-      return jsonError(502, `JMA latest_time fetch failed: ${latestTimeRes.status}`, t);
+
+    // 風速単位を m/s に揃える
+    url.searchParams.set("windspeed_unit", "ms");
+    url.searchParams.set("temperature_unit", "celsius");
+    url.searchParams.set("precipitation_unit", "mm");
+
+    const res = await fetch(url.toString(), { cache: "no-store" });
+    if (!res.ok) {
+      return NextResponse.json(
+        { error: "open-meteo fetch failed", status: res.status },
+        { status: 500 }
+      );
     }
-    const latestIso = (await latestTimeRes.text()).trim();
-    const latestDate = new Date(latestIso);
-    if (Number.isNaN(latestDate.getTime())) {
-      return jsonError(500, "latest_time.txt の日時解釈に失敗しました。", latestIso);
-    }
 
-    const datePart = yyyymmdd(latestDate);
-    const blockHH = floorTo3HourBlock(latestDate.getHours());
-    const pointUrl = `https://www.jma.go.jp/bosai/amedas/data/point/${amedasCode}/${datePart}_${blockHH}.json`;
+    const json = await res.json();
 
-    const pointRes = await fetch(pointUrl, { cache: "no-store" });
-    if (!pointRes.ok) {
-      const t = await pointRes.text().catch(() => "");
-      return jsonError(502, `JMA amedas point fetch failed: ${pointRes.status}`, t);
-    }
-    const pointJson = await pointRes.json();
+    const times: string[] = json?.hourly?.time ?? [];
+    const temp: (number | null)[] = json?.hourly?.temperature_2m ?? [];
+    const precip: (number | null)[] = json?.hourly?.precipitation ?? [];
+    const windMs: (number | null)[] = json?.hourly?.windspeed_10m ?? [];
+    const windDeg: (number | null)[] = json?.hourly?.winddirection_10m ?? [];
+    const code: (number | null)[] = json?.hourly?.weathercode ?? [];
 
-    // pointJson は { "日時": { temp:[値,品質], wind:[値,品質], windDirection:[値,品質], precipitation10m:[値,品質], ... } } の形が多い :contentReference[oaicite:9]{index=9}
-    const bestKey = pickLatestKeyLE(pointJson, latestIso) ?? Object.keys(pointJson).sort().pop() ?? null;
-    const row = bestKey ? pointJson[bestKey] : null;
+    const hours: (9 | 12 | 15)[] = [9, 12, 15];
 
-    const temp = row?.temp?.[0];
-    const wind = row?.wind?.[0];
-    const windDir = row?.windDirection?.[0];
+    const slots: Slot[] = hours.map((h) => {
+      const hh = String(h).padStart(2, "0");
+      // Asia/Tokyo の hourly time は "YYYY-MM-DDTHH:00" 形式
+      const targetIso = `${targetDate}T${hh}:00`;
+      const idx = pickNearestIndex(times, targetIso);
 
-    // 降水量はまず「10分降水量」を使う（手動取得ボタンの用途なら十分） :contentReference[oaicite:10]{index=10}
-    const precip10m = row?.precipitation10m?.[0];
-    const precip1h = row?.precipitation1h?.[0]; // あればこちらを優先してもOK
+      const c = idx == null ? null : (code[idx] ?? null);
 
-    const payload: WeatherPayload = {
-      weather: weatherText,
-      temperature_text:
-        typeof temp === "number" ? String(temp) : temp != null ? String(temp) : null,
-      wind_direction: typeof windDir === "string" ? windDir : windDir != null ? String(windDir) : null,
-      wind_speed_text:
-        typeof wind === "number" ? String(wind) : wind != null ? String(wind) : null,
-      precipitation_mm:
-        typeof precip1h === "number"
-          ? precip1h
-          : typeof precip10m === "number"
-            ? precip10m
-            : null,
-      observed_at: toJstIsoSafe(bestKey ?? latestIso),
-    };
+      return {
+        hour: h,
+        time_iso: idx == null ? targetIso : (times[idx] ?? targetIso),
+        weather_text: weatherCodeToJa(c),
+        temperature_c:
+          idx == null ? null : typeof temp[idx] === "number" ? temp[idx] : null,
+        wind_direction_deg:
+          idx == null ? null : typeof windDeg[idx] === "number" ? windDeg[idx] : null,
+        wind_speed_ms:
+          idx == null ? null : typeof windMs[idx] === "number" ? windMs[idx] : null,
+        precipitation_mm:
+          idx == null ? null : typeof precip[idx] === "number" ? precip[idx] : null,
+        weather_code: c,
+      };
+    });
 
-    return NextResponse.json({ ok: true, data: payload }, { status: 200 });
+    return NextResponse.json({
+      date: targetDate,
+      lat: Number(lat),
+      lon: Number(lon),
+      slots,
+      raw: {
+        has_hourly: Array.isArray(times) && times.length > 0,
+      },
+    });
   } catch (e: any) {
-    return jsonError(500, "サーバ側で例外が発生しました。", e?.message ?? String(e));
+    return NextResponse.json(
+      { error: e?.message ?? "unexpected error" },
+      { status: 500 }
+    );
   }
 }
