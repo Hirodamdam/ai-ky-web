@@ -497,7 +497,37 @@ export default function KyNewClient() {
         is_approved: false,
       };
 
-      await insertWithDropUnknownColumns("ky_entries", insert);
+      // ✅ ここから（supabase直insertをやめてAPI経由にする）
+const { data: sessRes, error: sessErr } = await supabase.auth.getSession();
+if (sessErr) throw sessErr;
+
+const accessToken = sessRes?.session?.access_token;
+if (!accessToken) throw new Error("ログインが切れています（セッション無し）");
+
+const res = await fetch("/api/ky-create", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${accessToken}`,
+  },
+  body: JSON.stringify(insert),
+});
+
+const text = await res.text();
+let json: any = null;
+try {
+  json = text ? JSON.parse(text) : null;
+} catch {
+  json = null;
+}
+
+if (!res.ok) {
+  const msg = json?.error ?? `保存に失敗しました (${res.status})`;
+  const extra = !json && text ? ` / response: ${text.slice(0, 200)}` : "";
+  throw new Error(msg + extra);
+}
+// ✅ ここまで
+
 
       setStatus({ type: "success", text: "保存しました" });
       router.push(`/projects/${projectId}/ky`);
