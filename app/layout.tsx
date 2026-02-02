@@ -1,4 +1,5 @@
-import type { Metadata } from "next";
+// app/layout.tsx
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import PwaRegister from "./PwaRegister";
@@ -13,10 +14,24 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+// ✅ ここがNext.js 16の推奨（themeColorはviewportへ）
+export const viewport: Viewport = {
+  themeColor: "#0f172a",
+};
+
 export const metadata: Metadata = {
   title: "KYシステム",
   description: "現場KYの作成・閲覧・承認（所長管理、現場スマホ閲覧中心）",
-  themeColor: "#0f172a",
+
+  // ✅ PWA（manifest を紐付け）
+  manifest: "/manifest.webmanifest",
+
+  // ✅ iOS: ホーム画面追加時の体裁
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "default",
+    title: "KYシステム",
+  },
 };
 
 export default function RootLayout({
@@ -26,9 +41,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="ja">
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
-      >
+      <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
         {/* PWA: Service Worker 登録（必須） */}
         <PwaRegister />
 

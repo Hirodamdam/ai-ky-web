@@ -1,3 +1,4 @@
+// app/projects/[id]/ProjectDetailClient.tsx
 "use client";
 
 import Link from "next/link";
@@ -7,219 +8,290 @@ import { supabase } from "@/app/lib/supabaseClient";
 
 type Status = { type: "success" | "error" | null; text: string };
 
-type Project = {
+// ✅ 実DBの列に合わせる（company_name は存在しない）
+type PartnerEntry = {
   id: string;
-  name: string | null;
-  contractor_name?: string | null;
-  address?: string | null;
-  lat?: number | null;
-  lon?: number | null;
+  project_id: string;
+  partner_company_name: string;
+  created_at: string;
 };
-
-type KyEntryRow = {
-  id: string;
-  project_id: string | null;
-  work_date: string | null;
-  work_detail: string | null;
-  partner_company_name: string | null;
-  third_party_situation: string | null;
-  is_approved: boolean | null;
-  created_at: string | null;
-};
-
-function fmt(v: any): string {
-  if (v === null || v === undefined || v === "") return "—";
-  return String(v);
-}
 
 export default function ProjectDetailClient() {
   const params = useParams<{ id: string }>();
-  const projectId = params?.id;
+  const projectId = useMemo(() => String(params?.id ?? ""), [params]);
 
   const [status, setStatus] = useState<Status>({ type: null, text: "" });
-  const [loading, setLoading] = useState(true);
 
-  const [project, setProject] = useState<Project | null>(null);
-  const [kyRows, setKyRows] = useState<KyEntryRow[]>([]);
-  const [loggedIn, setLoggedIn] = useState<boolean | null>(null);
+  const [project, setProject] = useState<any>(null);
+  const [projectLoading, setProjectLoading] = useState<boolean>(true);
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setStatus({ type: null, text: "" });
+  const [enteredPartners, setEnteredPartners] = useState<PartnerEntry[]>([]);
+  const [partnersLoading, setPartnersLoading] = useState<boolean>(true);
 
-    const sess = await supabase.auth.getSession();
-    setLoggedIn(!!sess.data.session);
+  const [companyName, setCompanyName] = useState<string>("");
+  const [saving, setSaving] = useState<boolean>(false);
 
-    const p = await supabase.from("projects").select("*").eq("id", projectId).maybeSingle();
-    if (p.error || !p.data) {
-      setProject(null);
-      setKyRows([]);
-      setStatus({ type: "error", text: "工事情報を取得できません。" });
-      setLoading(false);
-      return;
+  // ✅ Supabase の型定義(Database)に project_partner_entries が未反映なため TS が落ちている
+  //    → ここだけ any で逃がして、実行時は正しく動かす
+  const sb = supabase as any;
+
+  const clearStatusSoon = useCallback(() => {
+    window.setTimeout(() => setStatus({ type: null, text: "" }), 3500);
+  }, []);
+
+  const loadProject = useCallback(async () => {
+    if (!projectId) return;
+    setProjectLoading(true);
+    try {
+      const { data, error } = await supabase.from("projects").select("*").eq("id", projectId).single();
+      if (error) throw error;
+      setProject(data ?? null);
+    } catch (e: any) {
+      console.error(e);
+      setStatus({ type: "error", text: `工事情報の取得に失敗しました：${e?.message ?? "unknown error"}` });
+      clearStatusSoon();
+    } finally {
+      setProjectLoading(false);
     }
-    setProject(p.data as Project);
+  }, [projectId, clearStatusSoon]);
 
-    const k = await supabase
-      .from("ky_entries")
-      .select("id,project_id,work_date,work_detail,partner_company_name,third_party_situation,is_approved,created_at")
-      .eq("project_id", projectId)
-      .order("work_date", { ascending: false })
-      .order("created_at", { ascending: false })
-      .limit(10);
+  const loadEnteredPartners = useCallback(async () => {
+    if (!projectId) return;
+    setPartnersLoading(true);
+    try {
+      const { data, error } = await sb
+        .from("project_partner_entries")
+        .select("id, project_id, partner_company_name, created_at")
+        .eq("project_id", projectId)
+        .order("created_at", { ascending: false });
 
-    if (k.error) {
-      setKyRows([]);
-      setStatus({ type: "error", text: `KY一覧の取得に失敗しました：${k.error.message}` });
-      setLoading(false);
-      return;
+      if (error) throw error;
+      setEnteredPartners((data ?? []) as PartnerEntry[]);
+    } catch (e: any) {
+      console.error(e);
+      setStatus({
+        type: "error",
+        text: `入場済み協力会社の取得に失敗しました：${e?.message ?? "unknown error"}`,
+      });
+      clearStatusSoon();
+    } finally {
+      setPartnersLoading(false);
     }
-
-    setKyRows((k.data ?? []) as KyEntryRow[]);
-    setLoading(false);
-  }, [projectId]);
+  }, [projectId, clearStatusSoon, sb]);
 
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    if (!projectId) return;
+    loadProject();
+    loadEnteredPartners();
+  }, [projectId, loadProject, loadEnteredPartners]);
 
-  const kySummary = useMemo(() => {
-    const total = kyRows.length;
-    const approved = kyRows.filter((r) => r.is_approved).length;
-    const unapproved = total - approved;
-    return { total, approved, unapproved };
-  }, [kyRows]);
+  const canSubmit = useMemo(() => {
+    return !saving && companyName.trim().length > 0 && !!projectId;
+  }, [saving, companyName, projectId]);
+
+  const handleRegister = useCallback(async () => {
+    if (!canSubmit) return;
+
+    const name = companyName.trim();
+    setSaving(true);
+    setStatus({ type: null, text: "" });
+
+    try {
+      // ✅ insert → 戻り値1行を返す（即時反映）
+      const { data: inserted, error } = await sb
+        .from("project_partner_entries")
+        .insert({
+          project_id: projectId,
+          partner_company_name: name,
+        })
+        .select("id, project_id, partner_company_name, created_at")
+        .single();
+
+      if (error) throw error;
+
+      if (inserted) {
+        setEnteredPartners((prev) => {
+          if (prev.some((x) => x.id === inserted.id)) return prev;
+          return [inserted as PartnerEntry, ...prev];
+        });
+      }
+
+      setCompanyName("");
+      setStatus({ type: "success", text: "入場登録しました。" });
+      clearStatusSoon();
+    } catch (e: any) {
+      console.error(e);
+      setStatus({ type: "error", text: `入場登録に失敗しました：${e?.message ?? "unknown error"}` });
+      clearStatusSoon();
+    } finally {
+      setSaving(false);
+    }
+  }, [canSubmit, companyName, projectId, clearStatusSoon, sb]);
 
   return (
-    <div className="max-w-5xl mx-auto p-4 space-y-4">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <div className="text-sm text-gray-600">工事詳細</div>
-          <h1 className="text-xl font-bold">{project?.name ?? "—"}</h1>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <Link className="border rounded px-3 py-2 text-sm" href="/projects">
-            一覧へ
-          </Link>
-          <Link className="border rounded px-3 py-2 text-sm" href={`/projects/${projectId}/edit`}>
-            工事情報を編集
-          </Link>
-        </div>
+    <div style={{ maxWidth: 980, margin: "0 auto", padding: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+        <h1 style={{ margin: 0 }}>工事詳細</h1>
+        <Link href="/projects" style={{ textDecoration: "none" }}>
+          ← プロジェクト一覧へ
+        </Link>
       </div>
 
       {status.type && (
         <div
-          className={`rounded border p-3 text-sm ${
-            status.type === "success" ? "border-green-300 bg-green-50" : "border-red-300 bg-red-50"
-          }`}
+          style={{
+            marginTop: 12,
+            padding: 12,
+            borderRadius: 8,
+            border: "1px solid #ddd",
+            background: status.type === "success" ? "#f0fff4" : "#fff5f5",
+          }}
         >
           {status.text}
-          {status.type === "error" && status.text.includes("/login") && (
-            <div className="mt-2">
-              <Link className="underline" href="/login">
-                /login へ
-              </Link>
+        </div>
+      )}
+
+      <section style={{ marginTop: 16, padding: 14, border: "1px solid #e5e5e5", borderRadius: 10 }}>
+        <h2 style={{ marginTop: 0 }}>工事情報</h2>
+
+        {projectLoading ? (
+          <p style={{ margin: 0 }}>読み込み中…</p>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", rowGap: 8, columnGap: 12 }}>
+            <div>工事名</div>
+            <div style={{ fontWeight: 600 }}>{project?.name ?? "（未設定）"}</div>
+
+            <div>プロジェクトID</div>
+            <div style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>{projectId}</div>
+
+            {"contractor_name" in (project ?? {}) && (
+              <>
+                <div>施工会社</div>
+                <div>{project?.contractor_name ?? "（未設定）"}</div>
+              </>
+            )}
+
+            {"address" in (project ?? {}) && (
+              <>
+                <div>場所</div>
+                <div>{project?.address ?? "（未設定）"}</div>
+              </>
+            )}
+          </div>
+        )}
+      </section>
+
+      <section style={{ marginTop: 16, padding: 14, border: "1px solid #e5e5e5", borderRadius: 10 }}>
+        <h2 style={{ marginTop: 0 }}>入場済み協力会社</h2>
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <input
+            value={companyName}
+            onChange={(e) => setCompanyName(e.target.value)}
+            placeholder="協力会社名を入力（例：○○建設）"
+            style={{
+              flex: "1 1 320px",
+              padding: "10px 12px",
+              borderRadius: 8,
+              border: "1px solid #ccc",
+            }}
+          />
+          <button
+            onClick={handleRegister}
+            disabled={!canSubmit}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 8,
+              border: "1px solid #333",
+              background: canSubmit ? "#111" : "#999",
+              color: "#fff",
+              cursor: canSubmit ? "pointer" : "not-allowed",
+            }}
+          >
+            {saving ? "登録中…" : "入場登録"}
+          </button>
+          <button
+            onClick={loadEnteredPartners}
+            disabled={partnersLoading}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 8,
+              border: "1px solid #ccc",
+              background: "#fff",
+              cursor: partnersLoading ? "not-allowed" : "pointer",
+            }}
+          >
+            {partnersLoading ? "更新中…" : "再読込"}
+          </button>
+        </div>
+
+        <div style={{ marginTop: 12 }}>
+          {partnersLoading ? (
+            <p style={{ margin: 0 }}>読み込み中…</p>
+          ) : enteredPartners.length === 0 ? (
+            <p style={{ margin: 0, opacity: 0.8 }}>まだ入場登録がありません。</p>
+          ) : (
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr>
+                    <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #ddd" }}>協力会社</th>
+                    <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #ddd" }}>登録日時</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {enteredPartners.map((row) => (
+                    <tr key={row.id}>
+                      <td style={{ padding: 10, borderBottom: "1px solid #f0f0f0", fontWeight: 600 }}>
+                        {row.partner_company_name}
+                      </td>
+                      <td style={{ padding: 10, borderBottom: "1px solid #f0f0f0" }}>
+                        {row.created_at ? new Date(row.created_at).toLocaleString("ja-JP") : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
         </div>
-      )}
 
-      {loggedIn === false && (
-        <div className="rounded border border-yellow-300 bg-yellow-50 p-3 text-sm">
-          ログイン状態を確認できません。操作（保存/承認等）を行うには{" "}
-          <Link className="underline" href="/login">
-            /login
-          </Link>{" "}
-          から再ログインしてください。
-        </div>
-      )}
+        <p style={{ marginTop: 10, marginBottom: 0, fontSize: 12, opacity: 0.75 }}>
+          ※ DBの列は <code>partner_company_name</code> です（<code>company_name</code> は存在しません）。
+        </p>
+      </section>
 
-      {loading && <div className="text-sm text-gray-500">読み込み中…</div>}
+      <section style={{ marginTop: 16, display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <Link
+          href={`/projects/${projectId}/ky`}
+          style={{
+            display: "inline-block",
+            padding: "10px 14px",
+            borderRadius: 8,
+            border: "1px solid #333",
+            textDecoration: "none",
+            color: "#111",
+            background: "#fff",
+          }}
+        >
+          KY一覧へ
+        </Link>
 
-      {!loading && project && (
-        <>
-          <div className="border rounded p-4">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
-              <div className="border rounded p-3">
-                <div className="font-semibold mb-1">工事件名</div>
-                <div>{fmt(project.name)}</div>
-              </div>
-              <div className="border rounded p-3">
-                <div className="font-semibold mb-1">施工会社</div>
-                <div>{fmt(project.contractor_name ?? "株式会社三竹工業")}</div>
-              </div>
-              <div className="border rounded p-3">
-                <div className="font-semibold mb-1">住所</div>
-                <div>{fmt(project.address)}</div>
-              </div>
-              <div className="border rounded p-3">
-                <div className="font-semibold mb-1">緯度 / 経度</div>
-                <div>
-                  {fmt(project.lat)} / {fmt(project.lon)}
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-4 flex flex-wrap gap-2">
-              <Link className="bg-black text-white rounded px-4 py-2 text-sm" href={`/projects/${projectId}/ky`}>
-                KY一覧へ
-              </Link>
-              <Link className="border rounded px-4 py-2 text-sm" href={`/projects/${projectId}/ky/new`}>
-                ＋KY登録（新規）
-              </Link>
-              <Link className="border rounded px-4 py-2 text-sm" href={`/projects/${projectId}/project-subcontractors`}>
-                協力会社管理
-              </Link>
-            </div>
-          </div>
-
-          <div className="border rounded p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="font-semibold">直近のKY（最大10件）</div>
-              <div className="text-sm text-gray-600">
-                合計 {kySummary.total} / 未承認 {kySummary.unapproved} / 承認済 {kySummary.approved}
-              </div>
-            </div>
-
-            {kyRows.length === 0 ? (
-              <div className="text-sm text-gray-500">KYがまだありません。「＋KY登録」から作成してください。</div>
-            ) : (
-              <div className="space-y-2">
-                {kyRows.map((r) => (
-                  <div key={r.id} className="border rounded p-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="space-y-1">
-                        <div className="text-sm text-gray-600">{r.work_date ?? "—"}</div>
-                        <div className="font-semibold">{r.work_detail ?? "（作業内容 未入力）"}</div>
-
-                        <div className="flex flex-wrap gap-2 text-xs mt-2">
-                          <span className="px-2 py-1 rounded bg-gray-100">協力会社：{r.partner_company_name ?? "—"}</span>
-                          <span className="px-2 py-1 rounded bg-yellow-100">第三者：{r.third_party_situation ?? "—"}</span>
-                          {r.is_approved ? (
-                            <span className="px-2 py-1 rounded bg-blue-100">承認済み</span>
-                          ) : (
-                            <span className="px-2 py-1 rounded bg-red-100">未承認</span>
-                          )}
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-2 shrink-0">
-                        <Link className="border rounded px-3 py-2 text-sm" href={`/projects/${projectId}/ky/${r.id}/review`}>
-                          レビュー
-                        </Link>
-                        <Link className="border rounded px-3 py-2 text-sm" href={`/projects/${projectId}/ky/${r.id}/edit`}>
-                          編集
-                        </Link>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </>
-      )}
+        <Link
+          href={`/projects/${projectId}/ky/new`}
+          style={{
+            display: "inline-block",
+            padding: "10px 14px",
+            borderRadius: 8,
+            border: "1px solid #333",
+            textDecoration: "none",
+            color: "#fff",
+            background: "#111",
+          }}
+        >
+          KY新規作成
+        </Link>
+      </section>
     </div>
   );
 }
