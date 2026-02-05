@@ -46,6 +46,12 @@ type KyEntryRow = {
   approved_at?: string | null;
   approved_by?: string | null;
 
+  // ✅ 公開リンク用（追加）
+  public_id?: string | null;
+  public_token?: string | null;
+  public_enabled?: boolean | null;
+  public_enabled_at?: string | null;
+
   created_at?: string | null;
 };
 
@@ -107,7 +113,6 @@ function canonicalKind(kindRaw: string): "slope" | "path" | "" {
   if (!k) return "";
   if (k === "slope" || k === "slope_photo" || k === "法面") return "slope";
   if (k === "path" || k === "path_photo" || k === "通路") return "path";
-  // prev系の古い表記が混ざっても、とにかく slope/path に寄せる（表示は今回/前回で制御する）
   if (k.includes("slope") || k.includes("法面")) return "slope";
   if (k.includes("path") || k.includes("通路")) return "path";
   return "";
@@ -259,6 +264,13 @@ export default function KyReviewClient() {
             "is_approved",
             "approved_at",
             "approved_by",
+
+            // ✅ 公開リンク用（追加）
+            "public_id",
+            "public_token",
+            "public_enabled",
+            "public_enabled_at",
+
             "created_at",
           ].join(",")
         )
@@ -299,8 +311,6 @@ export default function KyReviewClient() {
 
       // =========================================================
       // ✅ 写真：今回＝このkyIdの最新 / 前回＝別kyIdの最新（同プロジェクト）
-      //    - kindは slope/path を正規化して判定
-      //    - ky_id / ky_entry_id どっちで入っていても拾う
       // =========================================================
       const photoProjectId = kyData?.project_id || projectId;
 
@@ -329,7 +339,6 @@ export default function KyReviewClient() {
           if (!k) continue;
 
           const rowKy = s(row?.ky_id).trim() || s(row?.ky_entry_id).trim();
-
           const isCurrent = rowKy === curKyKey;
 
           if (k === "slope") {
@@ -409,7 +418,7 @@ export default function KyReviewClient() {
 
       await postJsonTry(["/api/ky-approve"], { projectId, kyId, accessToken });
 
-      setStatus({ type: "success", text: "承認しました" });
+      setStatus({ type: "success", text: "承認しました（公開リンクを発行しました）" });
       await load();
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "承認に失敗しました" });
@@ -436,6 +445,42 @@ export default function KyReviewClient() {
       setActing(false);
     }
   }, [projectId, kyId, load]);
+
+  // ✅ 公開URL（承認＝公開ON）
+  const publicUrl = useMemo(() => {
+    const token = s(ky?.public_token).trim();
+    const enabled = !!ky?.public_enabled;
+    const approved = !!ky?.is_approved;
+    if (!approved || !enabled || !token) return "";
+
+    const origin = typeof window !== "undefined" ? window.location.origin : "";
+    if (!origin) return "";
+    return `${origin}/ky/public/${token}`;
+  }, [ky?.public_token, ky?.public_enabled, ky?.is_approved]);
+
+  const onCopyPublicUrl = useCallback(async () => {
+    const url = publicUrl;
+    if (!url) return;
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(url);
+      } else {
+        // 古い環境向けフォールバック
+        const ta = document.createElement("textarea");
+        ta.value = url;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      setStatus({ type: "success", text: "公開リンクをコピーしました" });
+    } catch (e: any) {
+      setStatus({ type: "error", text: e?.message ?? "コピーに失敗しました" });
+    }
+  }, [publicUrl]);
 
   if (loading) {
     return (
@@ -472,6 +517,27 @@ export default function KyReviewClient() {
       ) : (
         <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">未承認</div>
       )}
+
+      {/* ✅ 公開リンク（承認済み＆公開ON＆tokenあり） */}
+      {publicUrl ? (
+        <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
+          <div className="text-sm font-semibold text-slate-800">公開リンク（作業員閲覧用）</div>
+          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm break-all">{publicUrl}</div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onCopyPublicUrl}
+              className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
+            >
+              コピー
+            </button>
+            <a className="text-sm text-blue-600 underline" href={publicUrl} target="_blank" rel="noreferrer">
+              別タブで開く
+            </a>
+          </div>
+          <div className="text-xs text-slate-500">※承認＝公開ON。リンクを知っている人だけが閲覧できます。</div>
+        </div>
+      ) : null}
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">施工会社（固定）</div>
@@ -611,11 +677,7 @@ export default function KyReviewClient() {
         </button>
 
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onPrint}
-            className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
-          >
+          <button type="button" onClick={onPrint} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50">
             印刷
           </button>
 

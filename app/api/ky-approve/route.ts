@@ -3,128 +3,116 @@ import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 
+export const runtime = "nodejs";
+
 type Body = {
-  projectId?: string;
-  kyId?: string;
-
-  // ✅ あってもなくてもOK（あれば管理者チェックに使う）
-  accessToken?: string;
-
-  // 互換のため残す（今回はDBへ保存しない）
-  approvalNote?: string | null;
+  projectId: string;
+  kyId: string;
+  accessToken: string; // supabase session access_token
+  action?: "approve" | "unapprove";
 };
 
 function s(v: any) {
-  if (v == null) return "";
-  return String(v);
-}
-
-function newTokenHex(bytes = 24) {
-  // 48文字（24bytes=192bit）
-  return crypto.randomBytes(bytes).toString("hex");
+  return v == null ? "" : String(v);
 }
 
 export async function POST(req: Request) {
   try {
     const body = (await req.json()) as Body;
 
-    const projectId = s(body.projectId).trim();
-    const kyId = s(body.kyId).trim();
+    const projectId = s(body.projectId);
+    const kyId = s(body.kyId);
+    const accessToken = s(body.accessToken);
+    const action: "approve" | "unapprove" = body.action ?? "approve";
 
-    if (!projectId || !kyId) {
-      return NextResponse.json({ error: "projectId/kyId required" }, { status: 400 });
-    }
-
+    const adminUserId = process.env.KY_ADMIN_USER_ID;
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
     const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    const adminUserId = s(process.env.KY_ADMIN_USER_ID).trim() || null; // UUID想定
 
-    if (!url || !anonKey || !serviceKey) {
+    if (!adminUserId || !url || !anonKey || !serviceKey) {
       return NextResponse.json(
-        { error: "Missing env: NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY" },
+        { error: "Missing env: KY_ADMIN_USER_ID / NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY" },
         { status: 500 }
       );
     }
-
-    // ✅ accessTokenが来た時だけ「そのユーザーが管理者か」を検証
-    let authedUserId: string | null = null;
-    if (body.accessToken) {
-      try {
-        const anon = createClient(url, anonKey, { auth: { persistSession: false } });
-        const { data, error } = await anon.auth.getUser(body.accessToken);
-        if (error) return NextResponse.json({ error: `Invalid accessToken: ${error.message}` }, { status: 401 });
-
-        authedUserId = data.user?.id ?? null;
-
-        if (adminUserId && authedUserId !== adminUserId) {
-          return NextResponse.json({ error: "Forbidden: not admin user" }, { status: 403 });
-        }
-      } catch (e: any) {
-        return NextResponse.json({ error: e?.message ?? "Invalid accessToken" }, { status: 401 });
-      }
+    if (!projectId || !kyId || !accessToken) {
+      return NextResponse.json({ error: "Missing body: projectId / kyId / accessToken" }, { status: 400 });
     }
 
-    // ✅ service_roleで確実に更新
-    const admin = createClient(url, serviceKey, { auth: { persistSession: false } });
+    // 1) ログインユーザー確認（accessTokenで認証）
+    const userClient = createClient(url, anonKey, {
+      global: { headers: { Authorization: `Bearer ${accessToken}` } },
+      auth: { persistSession: false },
+    });
 
-    // 対象KY確認（project_id一致も必須）
-    // public_* も読み、存在していれば流用
-    const exists = await admin
+    const { data: userData, error: userErr } = await userClient.auth.getUser();
+    if (userErr || !userData?.user) {
+      return NextResponse.json({ error: "Unauthorized (invalid session)" }, { status: 401 });
+    }
+    if (userData.user.id !== adminUserId) {
+      return NextResponse.json({ error: "Forbidden (not admin)" }, { status: 403 });
+    }
+
+    // 2) 管理クライアント（service role）で更新
+    const adminClient = createClient(url, serviceKey, { auth: { persistSession: false } });
+
+    // 対象KYの現状取得（public_token が既にあるか確認）
+    const { data: current, error: curErr } = await adminClient
       .from("ky_entries")
-      .select("id, project_id, is_approved, public_id, public_token, public_enabled")
+      .select("id, project_id, is_approved, public_token")
       .eq("id", kyId)
-      .eq("project_id", projectId)
       .maybeSingle();
 
-    if (exists.error) return NextResponse.json({ error: exists.error.message }, { status: 500 });
-    if (!exists.data) return NextResponse.json({ error: "KY entry not found" }, { status: 404 });
+    if (curErr) {
+      return NextResponse.json({ error: `Fetch ky failed: ${curErr.message}` }, { status: 500 });
+    }
+    if (!current) {
+      return NextResponse.json({ error: "KY not found" }, { status: 404 });
+    }
+    if (s(current.project_id) !== projectId) {
+      return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
+    }
 
-    const nowIso = new Date().toISOString();
+    if (action === "unapprove") {
+      // 安全優先：承認解除＝公開停止（トークンも無効化）
+      const { error: updErr } = await adminClient
+        .from("ky_entries")
+        .update({
+          is_approved: false,
+          public_token: null,
+        })
+        .eq("id", kyId);
 
-    // ✅ 公開用ID/トークン（無ければ生成）
-    const publicId = s((exists.data as any).public_id).trim() || crypto.randomUUID();
-    // 承認のたびにトークンをローテーションしてもOKだが、運用上は「初回生成＋解除でローテ」で十分
-    const publicToken = s((exists.data as any).public_token).trim() || newTokenHex(24);
+      if (updErr) {
+        return NextResponse.json({ error: `Unapprove failed: ${updErr.message}` }, { status: 500 });
+      }
 
-    // ✅ DB列に合わせる（approved_at / approved_by は存在確認済み）
-    // approved_by は uuid 列なので、入れる値は UUID のみ
-    const payload: Record<string, any> = {
-      is_approved: true,
-      approved_at: nowIso,
-      approved_by: authedUserId || adminUserId || null,
+      return NextResponse.json({ ok: true, action: "unapprove" });
+    }
 
-      // ✅ 承認＝公開ON（安全運用：公開は承認と連動）
-      public_id: publicId,
-      public_token: publicToken,
-      public_enabled: true,
-      public_enabled_at: nowIso,
-    };
+    // approve
+    const token = current.public_token || crypto.randomUUID();
 
-    const upd = await admin
+    const { error: updErr } = await adminClient
       .from("ky_entries")
-      .update(payload)
-      .eq("id", kyId)
-      .eq("project_id", projectId)
-      .select("id, project_id, is_approved, approved_at, approved_by, public_id, public_token, public_enabled, public_enabled_at")
-      .maybeSingle();
+      .update({
+        is_approved: true,
+        public_token: token,
+      })
+      .eq("id", kyId);
 
-    if (upd.error) return NextResponse.json({ error: upd.error.message }, { status: 500 });
+    if (updErr) {
+      return NextResponse.json({ error: `Approve failed: ${updErr.message}` }, { status: 500 });
+    }
 
-    // ✅ 公開URL組み立て用の情報を返す（レビュー側でコピーに使える）
     return NextResponse.json({
       ok: true,
-      data: upd.data,
-      public: {
-        public_id: (upd.data as any)?.public_id ?? publicId,
-        public_token: (upd.data as any)?.public_token ?? publicToken,
-        enabled: true,
-      },
-      note: body.accessToken
-        ? "Approved (authenticated)"
-        : "Approved (accessToken not provided; approval executed via service_role)",
+      action: "approve",
+      public_token: token,
+      public_path: `/ky/public/${token}`,
     });
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message ?? "Unknown error" }, { status: 500 });
+    return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
   }
 }
