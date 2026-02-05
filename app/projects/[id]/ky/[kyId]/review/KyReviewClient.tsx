@@ -46,7 +46,7 @@ type KyEntryRow = {
   approved_at?: string | null;
   approved_by?: string | null;
 
-  // ✅ 公開リンク用（追加）
+  // ✅ 公開リンク用
   public_id?: string | null;
   public_token?: string | null;
   public_enabled?: boolean | null;
@@ -86,28 +86,13 @@ function degToDirJp(deg: number | null | undefined): string {
   return dirs[idx];
 }
 
-// ky_photos の列名差を吸収（環境差・過去実装差対策）
+// ky_photos の列名差を吸収
 function pickKind(row: any): string {
-  return (
-    s(row?.photo_kind).trim() ||
-    s(row?.kind).trim() || // ✅ 今回の実テーブル
-    s(row?.type).trim() ||
-    s(row?.category).trim() ||
-    ""
-  );
+  return s(row?.photo_kind).trim() || s(row?.kind).trim() || s(row?.type).trim() || s(row?.category).trim() || "";
 }
 function pickUrl(row: any): string {
-  return (
-    s(row?.image_url).trim() ||
-    s(row?.photo_url).trim() ||
-    s(row?.url).trim() ||
-    s(row?.photo_path).trim() ||
-    s(row?.path).trim() ||
-    ""
-  );
+  return s(row?.image_url).trim() || s(row?.photo_url).trim() || s(row?.url).trim() || s(row?.photo_path).trim() || s(row?.path).trim() || "";
 }
-
-// ✅ kindをレビュー用に正規化（slope/path以外の過去表記も救う）
 function canonicalKind(kindRaw: string): "slope" | "path" | "" {
   const k = s(kindRaw).trim();
   if (!k) return "";
@@ -128,12 +113,7 @@ function safeParseJson(text: string | null | undefined): any | null {
   }
 }
 
-function pickAiFromSupplement(obj: any): {
-  work: string;
-  hazards: string;
-  measures: string;
-  third: string;
-} {
+function pickAiFromSupplement(obj: any): { work: string; hazards: string; measures: string; third: string } {
   const get = (keys: string[]) => {
     for (const k of keys) {
       const v = obj?.[k];
@@ -243,6 +223,7 @@ export default function KyReviewClient() {
     setStatus({ type: null, text: "" });
 
     try {
+      // ✅ 1）取得：public_token等を必ず含める
       const { data: kyRow, error: kyErr } = await supabase
         .from("ky_entries")
         .select(
@@ -265,7 +246,6 @@ export default function KyReviewClient() {
             "approved_at",
             "approved_by",
 
-            // ✅ 公開リンク用（追加）
             "public_id",
             "public_token",
             "public_enabled",
@@ -298,20 +278,11 @@ export default function KyReviewClient() {
       }
       setKy(kyData);
 
-      // project（施工会社表示）
       const projectTargetId = kyData?.project_id || projectId;
-      const { data: pRow, error: pErr } = await supabase
-        .from("projects")
-        .select("id,name,contractor_name")
-        .eq("id", projectTargetId)
-        .maybeSingle();
-
+      const { data: pRow, error: pErr } = await supabase.from("projects").select("id,name,contractor_name").eq("id", projectTargetId).maybeSingle();
       if (pErr) throw pErr;
       setProject((pRow as any) ?? null);
 
-      // =========================================================
-      // ✅ 写真：今回＝このkyIdの最新 / 前回＝別kyIdの最新（同プロジェクト）
-      // =========================================================
       const photoProjectId = kyData?.project_id || projectId;
 
       const { data: photos, error: phErr } = await supabase
@@ -366,7 +337,6 @@ export default function KyReviewClient() {
           if (slopeNow && slopePrev && pathNow && pathPrev) break;
         }
 
-        // ✅ 保険：今回が無い（写真未登録）のときでも、前回だけは出しておく
         if (!slopePrev) {
           const firstSlope = (photos as any[])
             .map((r) => ({ k: canonicalKind(pickKind(r)), url: pickUrl(r), rowKy: s(r?.ky_id).trim() || s(r?.ky_entry_id).trim() }))
@@ -435,9 +405,10 @@ export default function KyReviewClient() {
       const accessToken = data?.session?.access_token;
       if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
 
-      await postJsonTry(["/api/ky-unapprove"], { projectId, kyId, accessToken });
+      // 既存のエンドポイントを尊重（あなたの環境に合わせる）
+      await postJsonTry(["/api/ky-unapprove", "/api/ky-approve"], { projectId, kyId, accessToken, action: "unapprove" });
 
-      setStatus({ type: "success", text: "承認解除しました" });
+      setStatus({ type: "success", text: "承認解除しました（公開停止）" });
       await load();
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "承認解除に失敗しました" });
@@ -446,17 +417,15 @@ export default function KyReviewClient() {
     }
   }, [projectId, kyId, load]);
 
-  // ✅ 公開URL（承認＝公開ON）
+  // ✅ 2）公開URL：public_enabled に依存させず、承認済み＋tokenで表示（“消えた”を確実に解消）
   const publicUrl = useMemo(() => {
     const token = s(ky?.public_token).trim();
-    const enabled = !!ky?.public_enabled;
     const approved = !!ky?.is_approved;
-    if (!approved || !enabled || !token) return "";
-
+    if (!approved || !token) return "";
     const origin = typeof window !== "undefined" ? window.location.origin : "";
     if (!origin) return "";
     return `${origin}/ky/public/${token}`;
-  }, [ky?.public_token, ky?.public_enabled, ky?.is_approved]);
+  }, [ky?.public_token, ky?.is_approved]);
 
   const onCopyPublicUrl = useCallback(async () => {
     const url = publicUrl;
@@ -466,7 +435,6 @@ export default function KyReviewClient() {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(url);
       } else {
-        // 古い環境向けフォールバック
         const ta = document.createElement("textarea");
         ta.value = url;
         ta.style.position = "fixed";
@@ -511,14 +479,13 @@ export default function KyReviewClient() {
 
       {ky?.is_approved ? (
         <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
-          承認済み
-          {ky.approved_at ? `（${fmtDateTimeJp(ky.approved_at)}）` : ""}
+          承認済み{ky.approved_at ? `（${fmtDateTimeJp(ky.approved_at)}）` : ""}
         </div>
       ) : (
         <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">未承認</div>
       )}
 
-      {/* ✅ 公開リンク（承認済み＆公開ON＆tokenあり） */}
+      {/* ✅ 公開リンク（作業員閲覧用） */}
       {publicUrl ? (
         <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
           <div className="text-sm font-semibold text-slate-800">公開リンク（作業員閲覧用）</div>
@@ -535,24 +502,20 @@ export default function KyReviewClient() {
               別タブで開く
             </a>
           </div>
-          <div className="text-xs text-slate-500">※承認＝公開ON。リンクを知っている人だけが閲覧できます。</div>
+          <div className="text-xs text-slate-500">※承認済みのKYのみ公開されます（編集不可）。</div>
         </div>
       ) : null}
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">施工会社（固定）</div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
-          {project?.contractor_name ?? "（未入力）"}
-        </div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{project?.contractor_name ?? "（未入力）"}</div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">
           協力会社 <span className="text-rose-600">（必須）</span>
         </div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
-          {ky?.partner_company_name ?? "（未入力）"}
-        </div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.partner_company_name ?? "（未入力）"}</div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
@@ -640,30 +603,24 @@ export default function KyReviewClient() {
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">作業内容の補足</div>
-          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">
-            {ky?.ai_work_detail?.trim() || "（なし）"}
-          </div>
+          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.ai_work_detail).trim() || "（なし）"}</div>
         </div>
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">危険予知の補足</div>
-          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">
-            {ky?.ai_hazards?.trim() || "（なし）"}
-          </div>
+          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.ai_hazards).trim() || "（なし）"}</div>
         </div>
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">対策の補足</div>
           <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">
-            {ky?.ai_countermeasures?.trim() || "（なし）"}
+            {s(ky?.ai_countermeasures).trim() || "（なし）"}
           </div>
         </div>
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">第三者（墓参者）の補足</div>
-          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">
-            {ky?.ai_third_party?.trim() || "（なし）"}
-          </div>
+          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.ai_third_party).trim() || "（なし）"}</div>
         </div>
       </div>
 
