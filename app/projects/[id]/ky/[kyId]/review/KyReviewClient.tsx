@@ -5,6 +5,7 @@ import Link from "next/link";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { supabase } from "@/app/lib/supabaseClient";
+import QRCode from "qrcode";
 
 type Status = { type: "success" | "error" | null; text: string };
 
@@ -91,7 +92,14 @@ function pickKind(row: any): string {
   return s(row?.photo_kind).trim() || s(row?.kind).trim() || s(row?.type).trim() || s(row?.category).trim() || "";
 }
 function pickUrl(row: any): string {
-  return s(row?.image_url).trim() || s(row?.photo_url).trim() || s(row?.url).trim() || s(row?.photo_path).trim() || s(row?.path).trim() || "";
+  return (
+    s(row?.image_url).trim() ||
+    s(row?.photo_url).trim() ||
+    s(row?.url).trim() ||
+    s(row?.photo_path).trim() ||
+    s(row?.path).trim() ||
+    ""
+  );
 }
 function canonicalKind(kindRaw: string): "slope" | "path" | "" {
   const k = s(kindRaw).trim();
@@ -130,7 +138,6 @@ function pickAiFromSupplement(obj: any): { work: string; hazards: string; measur
   };
 }
 
-// ✅ ai_supplement（文字列：見出し付き）を分解して ai_* を保険で埋める
 function splitAiHeadedText(text: string): { work: string; hazards: string; counter: string; third: string } {
   const src = s(text).replace(/\r\n/g, "\n").trim();
   if (!src) return { work: "", hazards: "", counter: "", third: "" };
@@ -210,6 +217,10 @@ export default function KyReviewClient() {
 
   const [acting, setActing] = useState(false);
 
+  // ✅ QR表示用
+  const [qrDataUrl, setQrDataUrl] = useState<string>("");
+  const [qrOpen, setQrOpen] = useState(false);
+
   const statusClass = useMemo(() => {
     if (status.type === "success") return "border border-emerald-200 bg-emerald-50 text-emerald-800";
     if (status.type === "error") return "border border-rose-200 bg-rose-50 text-rose-800";
@@ -223,7 +234,6 @@ export default function KyReviewClient() {
     setStatus({ type: null, text: "" });
 
     try {
-      // ✅ 1）取得：public_token等を必ず含める
       const { data: kyRow, error: kyErr } = await supabase
         .from("ky_entries")
         .select(
@@ -405,7 +415,6 @@ export default function KyReviewClient() {
       const accessToken = data?.session?.access_token;
       if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
 
-      // 既存のエンドポイントを尊重（あなたの環境に合わせる）
       await postJsonTry(["/api/ky-unapprove", "/api/ky-approve"], { projectId, kyId, accessToken, action: "unapprove" });
 
       setStatus({ type: "success", text: "承認解除しました（公開停止）" });
@@ -417,7 +426,7 @@ export default function KyReviewClient() {
     }
   }, [projectId, kyId, load]);
 
-  // ✅ 2）公開URL：public_enabled に依存させず、承認済み＋tokenで表示（“消えた”を確実に解消）
+  // 公開URL（承認済み＋tokenで表示）
   const publicUrl = useMemo(() => {
     const token = s(ky?.public_token).trim();
     const approved = !!ky?.is_approved;
@@ -426,6 +435,34 @@ export default function KyReviewClient() {
     if (!origin) return "";
     return `${origin}/ky/public/${token}`;
   }, [ky?.public_token, ky?.is_approved]);
+
+  // ✅ QR生成（publicUrlが変わったら作り直し）
+  useEffect(() => {
+    let cancelled = false;
+
+    const run = async () => {
+      if (!publicUrl) {
+        setQrDataUrl("");
+        return;
+      }
+      try {
+        // 印刷でも潰れにくいように、余白付き＆高誤り訂正
+        const dataUrl = await QRCode.toDataURL(publicUrl, {
+          errorCorrectionLevel: "M",
+          margin: 2,
+          width: 320,
+        });
+        if (!cancelled) setQrDataUrl(dataUrl);
+      } catch {
+        if (!cancelled) setQrDataUrl("");
+      }
+    };
+
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [publicUrl]);
 
   const onCopyPublicUrl = useCallback(async () => {
     const url = publicUrl;
@@ -485,12 +522,14 @@ export default function KyReviewClient() {
         <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">未承認</div>
       )}
 
-      {/* ✅ 公開リンク（作業員閲覧用） */}
+      {/* 公開リンク（作業員閲覧用）＋QR */}
       {publicUrl ? (
-        <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
+        <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
           <div className="text-sm font-semibold text-slate-800">公開リンク（作業員閲覧用）</div>
+
           <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm break-all">{publicUrl}</div>
-          <div className="flex items-center gap-2">
+
+          <div className="flex items-center gap-3 flex-wrap">
             <button
               type="button"
               onClick={onCopyPublicUrl}
@@ -501,8 +540,63 @@ export default function KyReviewClient() {
             <a className="text-sm text-blue-600 underline" href={publicUrl} target="_blank" rel="noreferrer">
               別タブで開く
             </a>
+
+            {qrDataUrl ? (
+              <button
+                type="button"
+                onClick={() => setQrOpen(true)}
+                className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
+              >
+                QRを表示
+              </button>
+            ) : null}
           </div>
-          <div className="text-xs text-slate-500">※承認済みのKYのみ公開されます（編集不可）。</div>
+
+          {qrDataUrl ? (
+            <div className="flex items-start gap-4 flex-wrap">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={qrDataUrl}
+                  alt="公開リンクQR"
+                  className="w-40 h-40"
+                  onClick={() => setQrOpen(true)}
+                  style={{ cursor: "pointer" }}
+                />
+              </div>
+              <div className="text-xs text-slate-500 leading-relaxed">
+                ・スマホのカメラでQRを読み取り→そのまま閲覧できます。<br />
+                ・このページは閲覧専用（編集不可）です。<br />
+                ・承認解除すると公開停止になります。
+              </div>
+            </div>
+          ) : null}
+
+          {/* QR拡大モーダル */}
+          {qrOpen && qrDataUrl ? (
+            <div
+              className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4"
+              onClick={() => setQrOpen(false)}
+            >
+              <div className="bg-white rounded-xl p-4 max-w-md w-full" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-center justify-between mb-3">
+                  <div className="text-sm font-semibold text-slate-800">QRコード（拡大）</div>
+                  <button
+                    type="button"
+                    className="rounded-lg border border-slate-300 bg-white px-3 py-1 text-sm hover:bg-slate-50"
+                    onClick={() => setQrOpen(false)}
+                  >
+                    閉じる
+                  </button>
+                </div>
+                <div className="flex justify-center">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={qrDataUrl} alt="公開リンクQR（拡大）" className="w-72 h-72" />
+                </div>
+                <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs break-all">{publicUrl}</div>
+              </div>
+            </div>
+          ) : null}
         </div>
       ) : null}
 
@@ -520,7 +614,6 @@ export default function KyReviewClient() {
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
         <div className="text-sm font-semibold text-slate-800">気象（9/12/15）</div>
-
         {weatherSlots.length ? (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             {weatherSlots.map((slot) => (
@@ -542,6 +635,7 @@ export default function KyReviewClient() {
         )}
       </div>
 
+      {/* 以降：写真・AI補足・ボタン群（あなたの現状維持） */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
         <div className="text-sm font-semibold text-slate-800">写真（今回／前回）</div>
 
@@ -613,9 +707,7 @@ export default function KyReviewClient() {
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">対策の補足</div>
-          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">
-            {s(ky?.ai_countermeasures).trim() || "（なし）"}
-          </div>
+          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.ai_countermeasures).trim() || "（なし）"}</div>
         </div>
 
         <div className="space-y-2">
