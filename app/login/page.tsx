@@ -4,7 +4,6 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/app/lib/supabaseClient";
 
-
 export default function LoginPage() {
   const router = useRouter();
 
@@ -52,6 +51,12 @@ export default function LoginPage() {
     setStatus("パスワード再設定メールを送信しました。メールを確認してください。");
   };
 
+  const onLogout = async () => {
+    setStatus("");
+    await supabase.auth.signOut();
+    setStatus("ログアウトしました。");
+  };
+
   return (
     <div style={{ padding: 24, maxWidth: 420 }}>
       <h1>ログイン</h1>
@@ -65,6 +70,7 @@ export default function LoginPage() {
             onChange={(e) => setEmail(e.target.value)}
             placeholder="email"
             style={{ padding: 10 }}
+            autoComplete="email"
           />
         </label>
 
@@ -77,6 +83,7 @@ export default function LoginPage() {
             placeholder="password"
             type="password"
             style={{ padding: 10 }}
+            autoComplete="current-password"
           />
         </label>
 
@@ -106,7 +113,20 @@ export default function LoginPage() {
           パスワード再設定メールを送る
         </button>
 
-        <div style={{ color: "crimson" }}>{status}</div>
+        <button
+          onClick={onLogout}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 8,
+            border: "1px solid #ccc",
+            cursor: "pointer",
+            fontWeight: 700,
+          }}
+        >
+          ログアウト（セッション初期化）
+        </button>
+
+        <div style={{ color: "crimson", whiteSpace: "pre-wrap" }}>{status}</div>
       </div>
     </div>
   );

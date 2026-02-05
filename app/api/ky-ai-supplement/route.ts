@@ -1,27 +1,28 @@
+// app/api/ky-ai-supplement/route.ts
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 
 export const runtime = "nodejs";
 
 type Body = {
-  // 表示用（任意）
-  project_name?: string | null;
-  site_name?: string | null;
-  contractor_name?: string | null; // 施工会社（固定で渡してOK）
-  partner_company_name?: string | null;
+  work_detail?: string | null;
+  hazards?: string | null;
+  countermeasures?: string | null;
+  third_party_level?: string | null;
 
-  // KY
-  work_date?: string | null;
-  work_detail?: string | null; // 作業内容（複数可）
-  hazards?: string | null; // 人入力
-  countermeasures?: string | null; // 人入力
+  weather_slots?: Array<{
+    hour: 9 | 12 | 15;
+    weather_text: string;
+    temperature_c: number | null;
+    wind_direction_deg: number | null;
+    wind_speed_ms: number | null;
+    precipitation_mm: number | null;
+  }> | null;
 
-  // 気象
-  weather?: string | null;
-  temperature_text?: string | null;
-  wind_direction?: string | null;
-  wind_speed_text?: string | null;
-  precipitation_mm?: number | null;
+  slope_photo_url?: string | null;
+  slope_prev_photo_url?: string | null;
+  path_photo_url?: string | null;
+  path_prev_photo_url?: string | null;
 };
 
 function s(v: any) {
@@ -29,69 +30,174 @@ function s(v: any) {
   return String(v);
 }
 
-function n(v: any) {
-  const x = Number(v);
-  return Number.isFinite(x) ? x : null;
+function fmtSlots(slots: any[] | null | undefined): string {
+  const arr = Array.isArray(slots) ? slots : [];
+  if (!arr.length) return "（未取得）";
+  return arr
+    .map((x) => {
+      const h = x?.hour;
+      const w = x?.weather_text ?? "";
+      const t = x?.temperature_c == null ? "—" : `${x.temperature_c}℃`;
+      const wd = x?.wind_direction_deg == null ? "—" : String(x.wind_direction_deg);
+      const ws = x?.wind_speed_ms == null ? "—" : `${x.wind_speed_ms}m/s`;
+      const p = x?.precipitation_mm == null ? "—" : `${x.precipitation_mm}mm`;
+      return `${h}:00 ${w} / 気温${t} / 風向${wd} / 風速${ws} / 雨量${p}`;
+    })
+    .join("\n");
+}
+
+/** AI出力から4枠を抜き出す */
+function extractSection(all: string, header: string, nextHeaders: string[]): string {
+  const norm = all.replace(/\r\n/g, "\n");
+  const idx = norm.indexOf(header);
+  if (idx < 0) return "";
+  const after = norm.slice(idx + header.length);
+  let end = after.length;
+  for (const nh of nextHeaders) {
+    const j = after.indexOf(nh);
+    if (j >= 0) end = Math.min(end, j);
+  }
+  return after.slice(0, end).trim();
+}
+
+/** URL画像をサーバーで取得し dataURL に変換（OpenAIが外部URLへ取りに行かないように） */
+async function fetchAsDataUrl(url: string, timeoutMs = 8000): Promise<string | null> {
+  const u = s(url).trim();
+  if (!u) return null;
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(u, { method: "GET", cache: "no-store", signal: controller.signal });
+    if (!res.ok) return null;
+
+    const ct = res.headers.get("content-type") || "image/jpeg";
+    const ab = await res.arrayBuffer();
+    const b64 = Buffer.from(ab).toString("base64");
+    return `data:${ct};base64,${b64}`;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/** OpenAI呼び出し（失敗時に画像なしへフォールバック） */
+async function callOpenAIWithFallback(args: {
+  openai: OpenAI;
+  model: string;
+  system: string;
+  userText: string;
+  images: Array<{ label: string; dataUrl: string }>;
+}) {
+  const { openai, model, system, userText, images } = args;
+
+  const buildMessages = (useImages: boolean) => {
+    if (!useImages || images.length === 0) {
+      return [
+        { role: "system", content: system },
+        { role: "user", content: userText },
+      ] as any;
+    }
+
+    const content: any[] = [{ type: "text", text: userText }];
+    for (const img of images) {
+      content.push({ type: "text", text: `\n${img.label}\n` });
+      content.push({ type: "image_url", image_url: { url: img.dataUrl } });
+    }
+
+    return [
+      { role: "system", content: system },
+      { role: "user", content },
+    ] as any;
+  };
+
+  // ① 画像ありで試す
+  try {
+    return await openai.chat.completions.create({
+      model,
+      temperature: 0.3,
+      messages: buildMessages(true),
+    } as any);
+  } catch (e: any) {
+    const msg = (e?.message ?? "").toLowerCase();
+
+    // 画像ダウンロード系は text-only で再試行して必ず返す
+    const looksLikeImageFetchFail =
+      msg.includes("timeout while downloading") ||
+      msg.includes("failed to download") ||
+      msg.includes("could not download") ||
+      msg.includes("image") ||
+      msg.includes("400");
+
+    if (!looksLikeImageFetchFail) throw e;
+
+    return await openai.chat.completions.create({
+      model,
+      temperature: 0.3,
+      messages: buildMessages(false),
+    } as any);
+  }
 }
 
 export async function POST(req: Request) {
   try {
     const body = (await req.json()) as Body;
 
-    const contractor = s(body.contractor_name || "株式会社三竹工業").trim();
-    const partner = s(body.partner_company_name).trim();
-
-    const workDate = s(body.work_date).trim();
     const workDetail = s(body.work_detail).trim();
-
     if (!workDetail) {
-      return NextResponse.json(
-        { error: "作業内容（work_detail）が空です。" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "作業内容（work_detail）が空です。" }, { status: 400 });
     }
-
-    const weather = s(body.weather).trim();
-    const temp = s(body.temperature_text).trim();
-    const windDir = s(body.wind_direction).trim();
-    const windSpd = s(body.wind_speed_text).trim();
-    const precip = n(body.precipitation_mm);
 
     const hazardsHuman = s(body.hazards).trim();
     const measuresHuman = s(body.countermeasures).trim();
+    const third = s(body.third_party_level).trim();
 
-    const projectName = s(body.project_name).trim();
-    const siteName = s(body.site_name).trim();
+    const slopeNowUrl = s(body.slope_photo_url).trim();
+    const slopePrevUrl = s(body.slope_prev_photo_url).trim();
+    const pathNowUrl = s(body.path_photo_url).trim();
+    const pathPrevUrl = s(body.path_prev_photo_url).trim();
+
+    const slotsText = fmtSlots(body.weather_slots ?? null);
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+    const hasSlopePair = !!(slopeNowUrl && slopePrevUrl);
+    const hasPathPair = !!(pathNowUrl && pathPrevUrl);
 
     const system = `
 あなたは日本の建設現場向けの安全衛生（KY：危険予知活動）の専門家。
-ユーザーが入力した「作業内容」「危険」「対策」と、気象条件を踏まえて、
-「危険予知活動（KY）」の文章を“現場でそのまま印刷して使える体裁”で生成する。
+入力（作業内容/危険/対策/第三者）と気象（9/12/15）を踏まえ、
+「AI補足」を4枠（作業内容/危険予知/対策/第三者）に分けて、現場でそのまま貼り付けられる文章を生成する。
 
-制約（必須）:
+【最重要ルール（必須）】
 - 出力は日本語。
-- 厚労省やWebの事例・リンク・引用は一切出さない（参照しない）。
-- 見出し・構成は指定テンプレを厳守。
-- 作業内容が複数行/複数項目の場合は、作業の塊を維持しつつ全体として「リスクが高い順」に危険(K)を並べ替える。
-- 想定される主な危険（K）は 3〜6 件。各Kは具体的に。
-- 対策（Y）は K と対応する形で、実行可能なレベルまで具体化（現場で言える文）。
-- 最後に「本日の重点KY（指差呼称）」を短く強く1フレーズ。
-- 最後に「作業前確認（朝礼で共有）」を4〜6項目。
-- 余計な前置き・謝罪・注釈は禁止。テンプレ以外の段落を増やさない。
-`;
+- 余計な前置き・謝罪・注釈は禁止。指定フォーマット以外の段落を増やさない。
+- 各枠は箇条書き（「- 」開始）で統一。
+- 各枠は最大5点まで。1点は短文（1行）で、具体行動にする。
+- 曖昧語（例：注意する、気をつける、徹底する、十分に）は禁止。必ず「何を／どこで／誰が／どうする／停止基準」まで書く。
+- Webリンク・引用・出典・URLの列挙は禁止。
 
-    const user = `
-次の入力を前提に、テンプレどおりに「危険予知活動（KY）」を作成してください。
+【画像の扱い（任意）】
+- 画像がある場合：画像から見える事実に基づき、短く補足する（想像で断定しない。見えないことは書かない）。
+- 画像が無い場合でも必ず生成し、気象と作業内容を軸にする。
+- （重要）前回と今回が両方ある場合は、差分（変化点）を必ず3点以内で抽出し、その差分が生む危険と対策を「危険予知」「対策」に落とし込む。
+  - 差分が読み取れない場合は「変化点（判別困難）」とし、気象と作業条件に基づくリスクへ切り替える。
 
-【基本情報（表示用）】
-- 工事名: ${projectName || "（未指定）"}
-- 現場名: ${siteName || "（未指定）"}
-- 施工会社: ${contractor || "株式会社三竹工業"}
-- 協力会社: ${partner || "（未指定）"}
-- 作業日: ${workDate || "（未指定）"}
+【出力フォーマット（固定・厳守）】
+【AI補足｜作業内容】
+- ...
+【AI補足｜危険予知】
+- ...
+【AI補足｜対策】
+- ...
+【AI補足｜第三者】
+- ...
+`.trim();
 
+    const userText = `
 【人の入力】
 - 作業内容:
 ${workDetail}
@@ -102,49 +208,44 @@ ${hazardsHuman || "（未入力）"}
 - 対策（人が入力）:
 ${measuresHuman || "（未入力）"}
 
-【気象条件】
-- 天気: ${weather || "（未指定）"}
-- 気温: ${temp || "（未指定）"}
-- 風向: ${windDir || "（未指定）"}
-- 風速: ${windSpd || "（未指定）"}
-- 降水量(mm): ${precip == null ? "（未指定）" : String(precip)}
+- 第三者（墓参者）の状況:
+${third || "（未指定）"}
 
-【出力テンプレ（この順序・見出し固定）】
-## 危険予知活動（KY）
+【気象（9/12/15）】
+${slotsText}
 
-### 作業内容
-（作業内容を短く整理）
+【画像（任意）】
+- 法面（今回）: ${slopeNowUrl ? "あり" : "なし"}
+- 法面（前回）: ${slopePrevUrl ? "あり" : "なし"}
+- 通路（今回）: ${pathNowUrl ? "あり" : "なし"}
+- 通路（前回）: ${pathPrevUrl ? "あり" : "なし"}
 
-### 作業条件の特徴（本日のポイント）
-（気象＋作業から、箇条書き4〜6）
+【差分指示（写真が揃う場合のみ必須）】
+- 法面：${hasSlopePair ? "前回と今回の差分を3点以内で抽出し、危険予知/対策に反映する" : "（差分なし：写真が揃っていない）"}
+- 通路：${hasPathPair ? "前回と今回の差分を3点以内で抽出し、危険予知/対策に反映する" : "（差分なし：写真が揃っていない）"}
+`.trim();
 
-## 想定される主な危険（K）
-### ① ...
-- ...
-### ② ...
-- ...
-（③以降も同様）
+    // ✅ サーバーで画像を dataURL 化（失敗した画像は無視）
+    const images: Array<{ label: string; dataUrl: string }> = [];
 
-## 危険に対する対策（Y）
-### ◆ ...
-- ...
-（カテゴリ分け。Kに対応）
+    const slopeNowData = await fetchAsDataUrl(slopeNowUrl);
+    if (slopeNowData) images.push({ label: "【法面（今回）】", dataUrl: slopeNowData });
 
-## 本日の重点KY（指差呼称）
-**「...」**
+    const slopePrevData = await fetchAsDataUrl(slopePrevUrl);
+    if (slopePrevData) images.push({ label: "【法面（前回）】", dataUrl: slopePrevData });
 
-## 作業前確認（朝礼で共有）
-- ...
-- ...
-`;
+    const pathNowData = await fetchAsDataUrl(pathNowUrl);
+    if (pathNowData) images.push({ label: "【通路（今回）】", dataUrl: pathNowData });
 
-    const r = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-      temperature: 0.4,
-      messages: [
-        { role: "system", content: system.trim() },
-        { role: "user", content: user.trim() },
-      ],
+    const pathPrevData = await fetchAsDataUrl(pathPrevUrl);
+    if (pathPrevData) images.push({ label: "【通路（前回）】", dataUrl: pathPrevData });
+
+    const r = await callOpenAIWithFallback({
+      openai,
+      model,
+      system,
+      userText,
+      images,
     });
 
     const text = (r.choices?.[0]?.message?.content ?? "").trim();
@@ -152,11 +253,24 @@ ${measuresHuman || "（未入力）"}
       return NextResponse.json({ error: "AI出力が空でした。" }, { status: 500 });
     }
 
-    return NextResponse.json({ ai_supplement: text });
+    const H_WORK = "【AI補足｜作業内容】";
+    const H_HAZ = "【AI補足｜危険予知】";
+    const H_MEA = "【AI補足｜対策】";
+    const H_THI = "【AI補足｜第三者】";
+
+    const ai_work_detail = extractSection(text, H_WORK, [H_HAZ, H_MEA, H_THI]);
+    const ai_hazards = extractSection(text, H_HAZ, [H_WORK, H_MEA, H_THI]);
+    const ai_countermeasures = extractSection(text, H_MEA, [H_WORK, H_HAZ, H_THI]);
+    const ai_third_party = extractSection(text, H_THI, [H_WORK, H_HAZ, H_MEA]);
+
+    return NextResponse.json({
+      ai_supplement: text,
+      ai_work_detail,
+      ai_hazards,
+      ai_countermeasures,
+      ai_third_party,
+    });
   } catch (e: any) {
-    return NextResponse.json(
-      { error: e?.message ?? "AI補足生成に失敗しました。" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: e?.message ?? "AI補足生成に失敗しました。" }, { status: 500 });
   }
 }

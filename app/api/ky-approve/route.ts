@@ -9,7 +9,7 @@ type Body = {
   // ✅ あってもなくてもOK（あれば管理者チェックに使う）
   accessToken?: string;
 
-  // 任意
+  // 互換のため残す（今回はDBへ保存しない）
   approvalNote?: string | null;
 };
 
@@ -17,8 +17,8 @@ export async function POST(req: Request) {
   try {
     const body = (await req.json()) as Body;
 
-    const projectId = body.projectId?.trim();
-    const kyId = body.kyId?.trim();
+    const projectId = (body.projectId ?? "").trim();
+    const kyId = (body.kyId ?? "").trim();
 
     if (!projectId || !kyId) {
       return NextResponse.json({ error: "projectId/kyId required" }, { status: 400 });
@@ -27,6 +27,7 @@ export async function POST(req: Request) {
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
     const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    const adminUserId = (process.env.KY_ADMIN_USER_ID ?? "").trim() || null; // UUID想定
 
     if (!url || !anonKey || !serviceKey) {
       return NextResponse.json(
@@ -35,19 +36,14 @@ export async function POST(req: Request) {
       );
     }
 
-    // サーバー側の管理者ID（あれば厳密化できる）
-    const adminUserId = process.env.KY_ADMIN_USER_ID?.trim() || null;
-
-    // ✅ 1) accessToken が来ている場合だけ「管理者本人か」を検証する
-    // ※ 今回は「accessToken必須をやめる」方針なので、無い場合はスキップして進めます
+    // ✅ accessTokenが来た時だけ「そのユーザーが管理者か」を検証
     let authedUserId: string | null = null;
     if (body.accessToken) {
       try {
         const anon = createClient(url, anonKey, { auth: { persistSession: false } });
         const { data, error } = await anon.auth.getUser(body.accessToken);
-        if (error) {
-          return NextResponse.json({ error: `Invalid accessToken: ${error.message}` }, { status: 401 });
-        }
+        if (error) return NextResponse.json({ error: `Invalid accessToken: ${error.message}` }, { status: 401 });
+
         authedUserId = data.user?.id ?? null;
 
         if (adminUserId && authedUserId !== adminUserId) {
@@ -58,10 +54,10 @@ export async function POST(req: Request) {
       }
     }
 
-    // ✅ 2) service_role で確実に承認更新
+    // ✅ service_roleで確実に更新
     const admin = createClient(url, serviceKey, { auth: { persistSession: false } });
 
-    // まず対象KYが存在するか（project_id一致も確認）
+    // 対象KY確認（project_id一致も必須）
     const exists = await admin
       .from("ky_entries")
       .select("id, project_id, is_approved")
@@ -69,25 +65,20 @@ export async function POST(req: Request) {
       .eq("project_id", projectId)
       .maybeSingle();
 
-    if (exists.error) {
-      return NextResponse.json({ error: exists.error.message }, { status: 500 });
-    }
-    if (!exists.data) {
-      return NextResponse.json({ error: "KY entry not found" }, { status: 404 });
-    }
+    if (exists.error) return NextResponse.json({ error: exists.error.message }, { status: 500 });
+    if (!exists.data) return NextResponse.json({ error: "KY entry not found" }, { status: 404 });
 
-    // すでに承認済みならそのまま返す（安全）
+    // すでに承認済みならそのまま返す
     if (exists.data.is_approved === true) {
       return NextResponse.json({ ok: true, alreadyApproved: true });
     }
 
-    // 更新payload（列が存在している前提。無い列があると Supabase がエラーを返します）
-    // もしあなたのDBに approved_by 等が無い場合は、該当行だけコメントアウトでOKです。
+    // ✅ DB列に合わせる（approved_at / approved_by は存在確認済み）
+    // approved_by は uuid 列なので、入れる値は UUID のみ（管理者UUID固定）
     const payload: Record<string, any> = {
       is_approved: true,
       approved_at: new Date().toISOString(),
       approved_by: authedUserId || adminUserId || null,
-      approval_note: body.approvalNote ?? null,
     };
 
     const upd = await admin
@@ -95,12 +86,10 @@ export async function POST(req: Request) {
       .update(payload)
       .eq("id", kyId)
       .eq("project_id", projectId)
-      .select("id, project_id, is_approved, approved_at, approved_by, approval_note")
+      .select("id, project_id, is_approved, approved_at, approved_by")
       .maybeSingle();
 
-    if (upd.error) {
-      return NextResponse.json({ error: upd.error.message }, { status: 500 });
-    }
+    if (upd.error) return NextResponse.json({ error: upd.error.message }, { status: 500 });
 
     return NextResponse.json({
       ok: true,
