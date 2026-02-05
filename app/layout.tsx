@@ -1,9 +1,9 @@
 // app/layout.tsx
 import type { Metadata, Viewport } from "next";
-import Link from "next/link";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import PwaRegister from "./PwaRegister";
+import HeaderLinksClient from "./HeaderLinksClient";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -43,13 +43,9 @@ export default function RootLayout({
         <PwaRegister />
 
         <div className="min-h-screen bg-gray-50">
-          {/* ✅ 常時ログイン導線（セッション切れで詰まない） */}
+          {/* ✅ 常時ログイン導線（ただし /ky/public/* は非表示） */}
           <div className="mx-auto w-full max-w-5xl px-4 md:px-6 pt-3">
-            <div className="flex justify-end gap-3 text-sm">
-              <Link href="/login" className="text-blue-600 underline">
-                ログイン
-              </Link>
-            </div>
+            <HeaderLinksClient />
           </div>
 
           <main className="mx-auto w-full max-w-5xl px-4 md:px-6 py-4 md:py-6">
