@@ -47,7 +47,6 @@ type KyEntryRow = {
   approved_at?: string | null;
   approved_by?: string | null;
 
-  // ✅ 公開リンク用
   public_id?: string | null;
   public_token?: string | null;
   public_enabled?: boolean | null;
@@ -216,8 +215,8 @@ export default function KyReviewClient() {
   const [pathPrevUrl, setPathPrevUrl] = useState<string>("");
 
   const [acting, setActing] = useState(false);
+  const [aiGenerating, setAiGenerating] = useState(false);
 
-  // ✅ QR表示用
   const [qrDataUrl, setQrDataUrl] = useState<string>("");
   const [qrOpen, setQrOpen] = useState(false);
 
@@ -255,12 +254,10 @@ export default function KyReviewClient() {
             "is_approved",
             "approved_at",
             "approved_by",
-
             "public_id",
             "public_token",
             "public_enabled",
             "public_enabled_at",
-
             "created_at",
           ].join(",")
         )
@@ -289,7 +286,11 @@ export default function KyReviewClient() {
       setKy(kyData);
 
       const projectTargetId = kyData?.project_id || projectId;
-      const { data: pRow, error: pErr } = await supabase.from("projects").select("id,name,contractor_name").eq("id", projectTargetId).maybeSingle();
+      const { data: pRow, error: pErr } = await supabase
+        .from("projects")
+        .select("id,name,contractor_name")
+        .eq("id", projectTargetId)
+        .maybeSingle();
       if (pErr) throw pErr;
       setProject((pRow as any) ?? null);
 
@@ -426,7 +427,64 @@ export default function KyReviewClient() {
     }
   }, [projectId, kyId, load]);
 
-  // 公開URL（承認済み＋tokenで表示）
+  const onRegenerateAi = useCallback(async () => {
+    if (!ky) return;
+
+    if (ky.is_approved) {
+      setStatus({ type: "error", text: "承認済みのため、AI補足の再生成はできません。" });
+      return;
+    }
+
+    setStatus({ type: null, text: "" });
+    setAiGenerating(true);
+
+    try {
+      const payload = {
+        work_detail: ky.work_detail,
+        hazards: ky.hazards,
+        countermeasures: ky.countermeasures,
+        third_party_level: ky.third_party_level,
+        weather_slots: weatherSlots,
+        slope_photo_url: slopeNowUrl || null,
+        slope_prev_photo_url: slopePrevUrl || null,
+        path_photo_url: pathNowUrl || null,
+        path_prev_photo_url: pathPrevUrl || null,
+      };
+
+      const data = await postJsonTry(["/api/ky-ai-supplement"], payload);
+
+      const next: KyEntryRow = {
+        ...ky,
+        ai_work_detail: s(data?.ai_work_detail).trim(),
+        ai_hazards: s(data?.ai_hazards).trim(),
+        ai_countermeasures: s(data?.ai_countermeasures).trim(),
+        ai_third_party: s(data?.ai_third_party).trim(),
+        ai_supplement: s(data?.ai_supplement).trim() || ky.ai_supplement || null,
+      };
+
+      setKy(next);
+
+      const { error } = await supabase
+        .from("ky_entries")
+        .update({
+          ai_work_detail: next.ai_work_detail || null,
+          ai_hazards: next.ai_hazards || null,
+          ai_countermeasures: next.ai_countermeasures || null,
+          ai_third_party: next.ai_third_party || null,
+          ai_supplement: next.ai_supplement || null,
+        })
+        .eq("id", ky.id);
+
+      if (error) throw error;
+
+      setStatus({ type: "success", text: "AI補足を再生成して保存しました。" });
+    } catch (e: any) {
+      setStatus({ type: "error", text: e?.message ?? "AI補足の再生成に失敗しました" });
+    } finally {
+      setAiGenerating(false);
+    }
+  }, [ky, weatherSlots, slopeNowUrl, slopePrevUrl, pathNowUrl, pathPrevUrl]);
+
   const publicUrl = useMemo(() => {
     const token = s(ky?.public_token).trim();
     const approved = !!ky?.is_approved;
@@ -436,7 +494,6 @@ export default function KyReviewClient() {
     return `${origin}/ky/public/${token}`;
   }, [ky?.public_token, ky?.is_approved]);
 
-  // ✅ QR生成（publicUrlが変わったら作り直し）
   useEffect(() => {
     let cancelled = false;
 
@@ -446,7 +503,6 @@ export default function KyReviewClient() {
         return;
       }
       try {
-        // 印刷でも潰れにくいように、余白付き＆高誤り訂正
         const dataUrl = await QRCode.toDataURL(publicUrl, {
           errorCorrectionLevel: "M",
           margin: 2,
@@ -497,7 +553,7 @@ export default function KyReviewClient() {
 
   return (
     <div className="p-4 space-y-4">
-      <div className="flex items-start justify-between gap-3">
+      <div className="flex items-start justify-between gap-3 no-print">
         <div>
           <div className="text-lg font-bold text-slate-900">KY レビュー</div>
           <div className="mt-1 text-sm text-slate-600">日付：{ky?.work_date ? fmtDateJp(ky.work_date) : "（不明）"}</div>
@@ -512,24 +568,23 @@ export default function KyReviewClient() {
         </div>
       </div>
 
-      {!!status.text && <div className={`rounded-lg px-3 py-2 text-sm ${statusClass}`}>{status.text}</div>}
+      {!!status.text && <div className={`rounded-lg px-3 py-2 text-sm ${statusClass} no-print`}>{status.text}</div>}
 
       {ky?.is_approved ? (
-        <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+        <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 print-avoid-break">
           承認済み{ky.approved_at ? `（${fmtDateTimeJp(ky.approved_at)}）` : ""}
         </div>
       ) : (
-        <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">未承認</div>
+        <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 print-avoid-break">未承認</div>
       )}
 
-      {/* 公開リンク（作業員閲覧用）＋QR */}
       {publicUrl ? (
-        <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
           <div className="text-sm font-semibold text-slate-800">公開リンク（作業員閲覧用）</div>
 
           <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm break-all">{publicUrl}</div>
 
-          <div className="flex items-center gap-3 flex-wrap">
+          <div className="flex items-center gap-3 flex-wrap no-print">
             <button
               type="button"
               onClick={onCopyPublicUrl}
@@ -556,13 +611,7 @@ export default function KyReviewClient() {
             <div className="flex items-start gap-4 flex-wrap">
               <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={qrDataUrl}
-                  alt="公開リンクQR"
-                  className="w-40 h-40"
-                  onClick={() => setQrOpen(true)}
-                  style={{ cursor: "pointer" }}
-                />
+                <img src={qrDataUrl} alt="公開リンクQR" className="w-40 h-40" />
               </div>
               <div className="text-xs text-slate-500 leading-relaxed">
                 ・スマホのカメラでQRを読み取り→そのまま閲覧できます。<br />
@@ -572,12 +621,8 @@ export default function KyReviewClient() {
             </div>
           ) : null}
 
-          {/* QR拡大モーダル */}
           {qrOpen && qrDataUrl ? (
-            <div
-              className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4"
-              onClick={() => setQrOpen(false)}
-            >
+            <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4 no-print" onClick={() => setQrOpen(false)}>
               <div className="bg-white rounded-xl p-4 max-w-md w-full" onClick={(e) => e.stopPropagation()}>
                 <div className="flex items-center justify-between mb-3">
                   <div className="text-sm font-semibold text-slate-800">QRコード（拡大）</div>
@@ -600,24 +645,24 @@ export default function KyReviewClient() {
         </div>
       ) : null}
 
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
         <div className="text-sm font-semibold text-slate-800">施工会社（固定）</div>
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{project?.contractor_name ?? "（未入力）"}</div>
       </div>
 
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
         <div className="text-sm font-semibold text-slate-800">
           協力会社 <span className="text-rose-600">（必須）</span>
         </div>
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.partner_company_name ?? "（未入力）"}</div>
       </div>
 
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
         <div className="text-sm font-semibold text-slate-800">気象（9/12/15）</div>
         {weatherSlots.length ? (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             {weatherSlots.map((slot) => (
-              <div key={slot.hour} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <div key={slot.hour} className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
                 <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>
                 <div className="mt-1 text-sm text-slate-700">{slot.weather_text || "（不明）"}</div>
                 <div className="mt-2 text-xs text-slate-600 space-y-1">
@@ -635,15 +680,17 @@ export default function KyReviewClient() {
         )}
       </div>
 
-      {/* 以降：写真・AI補足・ボタン群（あなたの現状維持） */}
+      {/* ✅ 2ページ目へ（写真ブロックを2ページ目に固定） */}
+      <div className="print-page-break" />
+
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
         <div className="text-sm font-semibold text-slate-800">写真（今回／前回）</div>
 
         <div className="space-y-3">
-          <div>
+          <div className="print-avoid-break">
             <div className="text-sm font-semibold text-slate-800">法面（定点）</div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
                 <div className="text-xs text-slate-600 mb-2">今回写真</div>
                 {slopeNowUrl ? (
                   // eslint-disable-next-line @next/next/no-img-element
@@ -652,7 +699,7 @@ export default function KyReviewClient() {
                   <div className="text-sm text-slate-500">（なし）</div>
                 )}
               </div>
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
                 <div className="text-xs text-slate-600 mb-2">前回写真</div>
                 {slopePrevUrl ? (
                   // eslint-disable-next-line @next/next/no-img-element
@@ -664,12 +711,10 @@ export default function KyReviewClient() {
             </div>
           </div>
 
-          <div className="print-page-break" />
-
-          <div>
+          <div className="print-avoid-break">
             <div className="text-sm font-semibold text-slate-800">通路（定点）</div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
                 <div className="text-xs text-slate-600 mb-2">今回写真</div>
                 {pathNowUrl ? (
                   // eslint-disable-next-line @next/next/no-img-element
@@ -678,7 +723,7 @@ export default function KyReviewClient() {
                   <div className="text-sm text-slate-500">（なし）</div>
                 )}
               </div>
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
                 <div className="text-xs text-slate-600 mb-2">前回写真</div>
                 {pathPrevUrl ? (
                   // eslint-disable-next-line @next/next/no-img-element
@@ -692,31 +737,49 @@ export default function KyReviewClient() {
         </div>
       </div>
 
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
-        <div className="text-sm font-semibold text-slate-800">AI補足（項目別）</div>
+      {/* ✅ 3ページ目へ（AI補足ブロックを3ページ目に固定） */}
+      <div className="print-page-break" />
 
-        <div className="space-y-2">
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-sm font-semibold text-slate-800">AI補足（項目別）</div>
+
+          <button
+            type="button"
+            onClick={onRegenerateAi}
+            disabled={aiGenerating || acting || !!ky?.is_approved}
+            className={`rounded-lg border px-4 py-2 text-sm no-print ${
+              aiGenerating || acting || !!ky?.is_approved
+                ? "border-slate-300 bg-slate-100 text-slate-400"
+                : "border-slate-300 bg-white hover:bg-slate-50"
+            }`}
+          >
+            {!!ky?.is_approved ? "承認済み（再生成不可）" : aiGenerating ? "AI補足 生成中..." : "AI補足 再生成"}
+          </button>
+        </div>
+
+        <div className="space-y-2 print-avoid-break">
           <div className="text-xs text-slate-600">作業内容の補足</div>
           <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.ai_work_detail).trim() || "（なし）"}</div>
         </div>
 
-        <div className="space-y-2">
+        <div className="space-y-2 print-avoid-break">
           <div className="text-xs text-slate-600">危険予知の補足</div>
           <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.ai_hazards).trim() || "（なし）"}</div>
         </div>
 
-        <div className="space-y-2">
+        <div className="space-y-2 print-avoid-break">
           <div className="text-xs text-slate-600">対策の補足</div>
           <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.ai_countermeasures).trim() || "（なし）"}</div>
         </div>
 
-        <div className="space-y-2">
+        <div className="space-y-2 print-avoid-break">
           <div className="text-xs text-slate-600">第三者（墓参者）の補足</div>
           <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.ai_third_party).trim() || "（なし）"}</div>
         </div>
       </div>
 
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex items-center justify-between gap-3 no-print">
         <button
           type="button"
           onClick={() => router.push(`/projects/${projectId}/ky`)}

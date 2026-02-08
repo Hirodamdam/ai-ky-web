@@ -80,9 +80,20 @@ body {
     padding: 0 !important;
     margin: 0 !important;
   }
-}
 
-@media print {
+  /* ✅ 追加：画像のはみ出し防止（レビューの写真がズレる対策） */
+  img {
+    max-width: 100% !important;
+    height: auto !important;
+  }
+
+  /* ✅ 追加：色の再現（薄くなる対策） */
+  * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* ✅ 重要：ここは「必ず改ページ」 */
   .print-page-break {
     break-before: page;
     page-break-before: always;

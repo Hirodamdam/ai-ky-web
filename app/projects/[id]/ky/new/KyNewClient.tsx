@@ -404,11 +404,20 @@ export default function KyNewClient() {
       precipitation_mm: x.precipitation_mm ?? null,
     }));
 
+    // ✅ 追加：projects.lat/lon を AI生成payloadへ連携
+    const lat = project?.lat ?? null;
+    const lon = project?.lon ?? null;
+
     return {
       work_detail: w,
       hazards: hazards.trim() ? hazards.trim() : null,
       countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
       third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
+
+      // ✅ ここが追加
+      lat,
+      lon,
+
       weather_slots: slotsForAi.length ? slotsForAi : null,
       slope_photo_url: slopeNowUrl,
       slope_prev_photo_url: slopePrevUrl || null,
@@ -430,6 +439,9 @@ export default function KyNewClient() {
     uploadToStorage,
     slopePrevUrl,
     pathPrevUrl,
+    // ✅ 追加（依存）
+    project?.lat,
+    project?.lon,
   ]);
 
   const onGenerateAi = useCallback(async () => {

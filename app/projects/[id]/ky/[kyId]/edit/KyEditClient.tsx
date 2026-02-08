@@ -7,7 +7,7 @@ import { supabase } from "@/app/lib/supabaseClient";
 
 type Status = { type: "success" | "error" | null; text: string };
 
-type Project = { id: string; name: string | null };
+type Project = { id: string; name: string | null; lat: number | null; lon: number | null };
 
 type WeatherSlot = {
   hour: 9 | 12 | 15;
@@ -50,6 +50,11 @@ type KyRow = {
 
   // AI補足（保存値）
   ai_supplement?: string | null;
+
+  // ✅ 承認済み判定（列名差があるかもしれないのでanyで拾う）
+  approved_at?: any | null;
+  approved?: any | null;
+  is_approved?: any | null;
 };
 
 function tryParseJson<T = any>(v: any): T | null {
@@ -163,6 +168,67 @@ function buildAiSupplementFromParts(p: AiParts): string {
   return blocks.join("\n\n").trim();
 }
 
+function s(v: any) {
+  if (v == null) return "";
+  return String(v);
+}
+
+function normalizeText(text: string): string {
+  return (text || "").replace(/\r\n/g, "\n").replace(/\u3000/g, " ").trim();
+}
+
+function splitAiCombined(text: string): { work: string; hazards: string; countermeasures: string; third: string } {
+  const src = (text || "").trim();
+  if (!src) return { work: "", hazards: "", countermeasures: "", third: "" };
+
+  const makeBracketRe = (label: string) =>
+    new RegExp(String.raw`(?:^|\n)\s*(?:[•・\-*]\s*)?[【\[]\s*AI補足\s*[｜|]\s*${label}\s*[】\]]`, "g");
+
+  const headings: Array<{ key: "work" | "hazards" | "countermeasures" | "third"; re: RegExp }> = [
+    { key: "work", re: makeBracketRe("作業内容") },
+    { key: "hazards", re: makeBracketRe("危険予知") },
+    { key: "countermeasures", re: makeBracketRe("対策") },
+    { key: "third", re: makeBracketRe("第三者(?:\\s*（\\s*墓参者\\s*）)?") },
+    { key: "work", re: /(?:^|\n)\s*(作業内容)\s*[:：]/g },
+    { key: "hazards", re: /(?:^|\n)\s*(危険予知)\s*[:：]/g },
+    { key: "countermeasures", re: /(?:^|\n)\s*(対策)\s*[:：]/g },
+    { key: "third", re: /(?:^|\n)\s*(第三者|墓参者)\s*[:：]/g },
+  ];
+
+  const marks: Array<{ idx: number; key: "work" | "hazards" | "countermeasures" | "third"; len: number }> = [];
+  for (const h of headings) {
+    let m: RegExpExecArray | null;
+    h.re.lastIndex = 0;
+    while ((m = h.re.exec(src))) marks.push({ idx: m.index, key: h.key, len: m[0].length });
+  }
+  marks.sort((a, b) => a.idx - b.idx);
+
+  if (!marks.length) return { work: src, hazards: "", countermeasures: "", third: "" };
+
+  const out = { work: "", hazards: "", countermeasures: "", third: "" };
+  for (let i = 0; i < marks.length; i++) {
+    const cur = marks[i];
+    const next = marks[i + 1];
+    const start = cur.idx + cur.len;
+    const end = next ? next.idx : src.length;
+    const chunk = src.slice(start, end).trim();
+    if (!chunk) continue;
+    (out as any)[cur.key] = (out as any)[cur.key] ? `${(out as any)[cur.key]}\n${chunk}` : chunk;
+  }
+  return out;
+}
+
+function isApprovedLike(row: KyRow | null): boolean {
+  if (!row) return false;
+  const a = (row as any)?.approved_at;
+  const b = (row as any)?.approved;
+  const c = (row as any)?.is_approved;
+  if (a) return true;
+  if (b === true) return true;
+  if (c === true) return true;
+  return false;
+}
+
 export default function KyEditClient() {
   const params = useParams();
   const router = useRouter();
@@ -190,6 +256,8 @@ export default function KyEditClient() {
   const [aiHazards, setAiHazards] = useState<string>("");
   const [aiCounter, setAiCounter] = useState<string>("");
   const [aiThird, setAiThird] = useState<string>("");
+
+  const [aiGenerating, setAiGenerating] = useState(false);
 
   const weatherSlots = useMemo(() => parseWeatherSlots(row?.weather_slots), [row?.weather_slots]);
 
@@ -234,7 +302,12 @@ export default function KyEditClient() {
       if (kyErr) throw kyErr;
       if (!ky) throw new Error("KYが見つかりません");
 
-      const { data: proj, error: projErr } = await supabase.from("projects").select("id,name").eq("id", projectId).maybeSingle();
+      // ✅ lat/lon を取得
+      const { data: proj, error: projErr } = await supabase
+        .from("projects")
+        .select("id,name,lat,lon")
+        .eq("id", projectId)
+        .maybeSingle();
       if (projErr) throw projErr;
 
       setRow(ky as any);
@@ -267,6 +340,77 @@ export default function KyEditClient() {
   useEffect(() => {
     load();
   }, [load]);
+
+  const onRegenerateAi = useCallback(async () => {
+    if (isApprovedLike(row)) {
+      setStatus({ type: "error", text: "承認済みのため、AI補足の再生成はできません。" });
+      return;
+    }
+
+    setAiGenerating(true);
+    setStatus({ type: null, text: "AI補足を再生成中..." });
+
+    try {
+      const w = (workDetail ?? "").trim();
+      if (!w) throw new Error("作業内容（必須）が空です");
+
+      const third = normalizeThirdPartyLabel(thirdPartyLevel);
+
+      const slotsForAi = (weatherSlots || []).map((x) => ({
+        hour: x.hour,
+        weather_text: x.weather_text,
+        temperature_c: x.temperature_c ?? null,
+        wind_direction_deg: x.wind_direction_deg ?? null,
+        wind_speed_ms: x.wind_speed_ms ?? null,
+        precipitation_mm: x.precipitation_mm ?? null,
+      }));
+
+      // ✅ lat/lon をpayloadに載せる
+      const lat = project?.lat ?? null;
+      const lon = project?.lon ?? null;
+
+      const payload: any = {
+        work_detail: w,
+        hazards: (hazards ?? "").trim() ? (hazards ?? "").trim() : null,
+        countermeasures: (countermeasures ?? "").trim() ? (countermeasures ?? "").trim() : null,
+        third_party_level: third ? third : null,
+        weather_slots: slotsForAi.length ? slotsForAi : null,
+        lat,
+        lon,
+
+        // 編集画面は写真を扱っていないので null（API側は画像無しでも動く）
+        slope_photo_url: null,
+        slope_prev_photo_url: null,
+        path_photo_url: null,
+        path_prev_photo_url: null,
+      };
+
+      const res = await fetch("/api/ky-ai-supplement", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify(payload),
+      });
+
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j?.error || "AI補足生成に失敗しました");
+
+      const combined = normalizeText(s(j?.ai_supplement));
+      const split = splitAiCombined(combined);
+
+      setAiWork(normalizeText(split.work));
+      setAiHazards(normalizeText(split.hazards));
+      setAiCounter(normalizeText(split.countermeasures));
+      setAiThird(normalizeText(split.third));
+
+      setStatus({ type: "success", text: "AI補足を再生成しました（未保存）" });
+    } catch (e: any) {
+      console.error(e);
+      setStatus({ type: "error", text: e?.message ?? "AI補足生成に失敗しました" });
+    } finally {
+      setAiGenerating(false);
+    }
+  }, [row, project, workDetail, hazards, countermeasures, thirdPartyLevel, weatherSlots]);
 
   const onSave = useCallback(async () => {
     if (!kyId) return;
@@ -319,6 +463,8 @@ export default function KyEditClient() {
       </div>
     );
   }
+
+  const approved = isApprovedLike(row);
 
   return (
     <div className="max-w-5xl mx-auto p-6 space-y-4">
@@ -379,12 +525,13 @@ export default function KyEditClient() {
           <div className="text-sm text-gray-600 mt-1">（気象スロットがありません）</div>
         ) : (
           <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
-            {weatherSlots.map((s) => (
-              <div key={s.hour} className="border rounded p-3 bg-slate-50">
-                <div className="font-semibold">{String(s.hour).padStart(2, "0")}:00</div>
-                <div className="text-sm mt-1">{s.weather_text}</div>
+            {weatherSlots.map((slt) => (
+              <div key={slt.hour} className="border rounded p-3 bg-slate-50">
+                <div className="font-semibold">{String(slt.hour).padStart(2, "0")}:00</div>
+                <div className="text-sm mt-1">{slt.weather_text}</div>
                 <div className="text-xs text-gray-700 mt-1">
-                  気温 {s.temperature_c ?? "—"}℃ / 風向 {degToCompassJa(s.wind_direction_deg)} / 風速 {s.wind_speed_ms ?? "—"}m/s / 雨量 {s.precipitation_mm ?? "—"}mm
+                  気温 {slt.temperature_c ?? "—"}℃ / 風向 {degToCompassJa(slt.wind_direction_deg)} / 風速 {slt.wind_speed_ms ?? "—"}m/s / 雨量{" "}
+                  {slt.precipitation_mm ?? "—"}mm
                 </div>
               </div>
             ))}
@@ -396,7 +543,21 @@ export default function KyEditClient() {
 
       {/* --- AI補足（保存値）--- */}
       <div className="border rounded-xl bg-white">
-        <div className="px-4 py-3 border-b font-semibold">AI補足（保存値）</div>
+        <div className="px-4 py-3 border-b font-semibold flex items-center justify-between gap-3">
+          <div>AI補足（保存値）</div>
+
+          <button
+            type="button"
+            onClick={onRegenerateAi}
+            disabled={aiGenerating || approved}
+            className={`px-3 py-2 rounded border text-sm ${
+              aiGenerating || approved ? "bg-slate-100 text-slate-400 border-slate-200" : "bg-white hover:bg-slate-50 border-slate-300"
+            }`}
+            title={approved ? "承認済みのため再生成不可" : "AI補足を再生成"}
+          >
+            {aiGenerating ? "再生成中..." : approved ? "承認済み" : "AI補足を再生成"}
+          </button>
+        </div>
 
         <div className="p-4 space-y-4">
           <div>
