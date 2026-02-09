@@ -233,6 +233,12 @@ export default function KyReviewClient() {
   const [readLogs, setReadLogs] = useState<ReadLog[]>([]);
   const [readErr, setReadErr] = useState<string>("");
 
+  // ✅ 最新既読時刻（先頭=最新想定）
+  const latestReadAt = useMemo(() => {
+    const t = readLogs?.[0]?.created_at;
+    return t ? fmtDateTimeJp(t) : "";
+  }, [readLogs]);
+
   const statusClass = useMemo(() => {
     if (status.type === "success") return "border border-emerald-200 bg-emerald-50 text-emerald-800";
     if (status.type === "error") return "border border-rose-200 bg-rose-50 text-rose-800";
@@ -673,12 +679,16 @@ export default function KyReviewClient() {
             </div>
           ) : null}
 
-          {/* ✅ 既読一覧（追加） */}
+          {/* ✅ 既読一覧（表示強化：端末列＋最新時刻） */}
           <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2">
             <div className="flex items-center justify-between gap-2">
               <div className="text-sm font-semibold text-slate-800">既読状況</div>
-              <div className="text-sm text-slate-700">
-                既読：<span className="font-semibold">{readLogs.length}</span> 名
+
+              <div className="text-right">
+                <div className="text-sm text-slate-700">
+                  既読：<span className="font-semibold">{readLogs.length}</span> 名
+                </div>
+                {latestReadAt ? <div className="text-xs text-slate-500">最新：{latestReadAt}</div> : null}
               </div>
             </div>
 
@@ -687,15 +697,18 @@ export default function KyReviewClient() {
             {readLogs.length ? (
               <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
                 <div className="grid grid-cols-12 gap-0 border-b border-slate-200 bg-slate-50 text-xs text-slate-600">
-                  <div className="col-span-5 px-3 py-2">氏名</div>
+                  <div className="col-span-4 px-3 py-2">氏名</div>
                   <div className="col-span-2 px-3 py-2">役割</div>
-                  <div className="col-span-5 px-3 py-2">時刻</div>
+                  <div className="col-span-2 px-3 py-2">端末</div>
+                  <div className="col-span-4 px-3 py-2">時刻</div>
                 </div>
+
                 {readLogs.map((r) => (
                   <div key={r.id} className="grid grid-cols-12 gap-0 border-b border-slate-100 text-sm">
-                    <div className="col-span-5 px-3 py-2 text-slate-800">{s(r.reader_name) || "（不明）"}</div>
+                    <div className="col-span-4 px-3 py-2 text-slate-800">{s(r.reader_name) || "（不明）"}</div>
                     <div className="col-span-2 px-3 py-2 text-slate-700">{s(r.reader_role) || "—"}</div>
-                    <div className="col-span-5 px-3 py-2 text-slate-700">{r.created_at ? fmtDateTimeJp(r.created_at) : "—"}</div>
+                    <div className="col-span-2 px-3 py-2 text-slate-700">{s(r.reader_device) || "—"}</div>
+                    <div className="col-span-4 px-3 py-2 text-slate-700">{r.created_at ? fmtDateTimeJp(r.created_at) : "—"}</div>
                   </div>
                 ))}
               </div>
