@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState, useCallback } from "react";
 
 type WeatherSlot = {
   hour: 9 | 12 | 15;
@@ -32,8 +32,6 @@ type Ky = {
 };
 
 type Project = { contractor_name: string | null; name: string | null } | null;
-
-type Status = { type: "success" | "error" | null; text: string };
 
 function s(v: any) {
   if (v == null) return "";
@@ -120,19 +118,14 @@ function splitAiHeadedText(text: string): { work: string; hazards: string; count
   return out;
 }
 
-function dayKeyJst(d = new Date()) {
-  const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
-  return jst.toISOString().slice(0, 10);
-}
-
-function localKeyName() {
-  return "ky_reader_name";
-}
-function localKeyRole() {
-  return "ky_reader_role";
-}
-function localKeyConfirmed(token: string) {
-  return `ky_confirmed:${token}:${dayKeyJst()}`;
+function getDeviceLabel(): string {
+  try {
+    const ua = navigator.userAgent || "";
+    const isMobile = /Mobile|Android|iPhone|iPad/i.test(ua);
+    return isMobile ? "mobile" : "pc";
+  } catch {
+    return "";
+  }
 }
 
 export default function KyPublicClient({ token }: { token: string }) {
@@ -142,26 +135,37 @@ export default function KyPublicClient({ token }: { token: string }) {
   const [ky, setKy] = useState<Ky | null>(null);
   const [project, setProject] = useState<Project>(null);
 
-  // ✅ 既読
-  const [status, setStatus] = useState<Status>({ type: null, text: "" });
-  const [readerName, setReaderName] = useState("");
-  const [readerRole, setReaderRole] = useState<"" | "職長" | "作業員">("");
-  const [confirming, setConfirming] = useState(false);
-  const [confirmed, setConfirmed] = useState(false);
+  // ✅ 既読（確認）UI
+  const storageKeyName = useMemo(() => `ky_reader_name_v1`, []);
+  const storageKeyDone = useMemo(() => `ky_read_done_v1:${token}`, [token]);
+
+  const [readerName, setReaderName] = useState<string>("");
+  const [readDone, setReadDone] = useState<boolean>(false);
+  const [readAt, setReadAt] = useState<string>("");
+  const [readStatus, setReadStatus] = useState<{ type: "success" | "error" | null; text: string }>({ type: null, text: "" });
+  const [readActing, setReadActing] = useState(false);
 
   useEffect(() => {
+    // localStorage復元
     try {
-      const name = s(localStorage.getItem(localKeyName())).trim();
-      const role = s(localStorage.getItem(localKeyRole())).trim();
-      if (name) setReaderName(name);
-      if (role === "職長" || role === "作業員") setReaderRole(role as any);
-
-      const c = localStorage.getItem(localKeyConfirmed(token));
-      if (c === "1") setConfirmed(true);
+      const n = localStorage.getItem(storageKeyName);
+      if (n && !readerName) setReaderName(n);
+      const done = localStorage.getItem(storageKeyDone);
+      if (done) {
+        setReadDone(true);
+        setReadAt(done);
+      }
     } catch {
       // ignore
     }
-  }, [token]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storageKeyName, storageKeyDone]);
+
+  const statusClass = useMemo(() => {
+    if (readStatus.type === "success") return "border border-emerald-200 bg-emerald-50 text-emerald-800";
+    if (readStatus.type === "error") return "border border-rose-200 bg-rose-50 text-rose-800";
+    return "border border-slate-200 bg-slate-50 text-slate-700";
+  }, [readStatus.type]);
 
   useEffect(() => {
     const run = async () => {
@@ -216,31 +220,25 @@ export default function KyPublicClient({ token }: { token: string }) {
     return filtered;
   }, [ky?.weather_slots]);
 
-  const statusClass = useMemo(() => {
-    if (status.type === "success") return "border border-emerald-200 bg-emerald-50 text-emerald-800";
-    if (status.type === "error") return "border border-rose-200 bg-rose-50 text-rose-800";
-    return "border border-slate-200 bg-slate-50 text-slate-700";
-  }, [status.type]);
-
-  const onConfirmRead = async () => {
-    setStatus({ type: null, text: "" });
+  const onConfirmRead = useCallback(async () => {
+    setReadStatus({ type: null, text: "" });
 
     const name = s(readerName).trim();
     if (!name) {
-      setStatus({ type: "error", text: "氏名を入力してください。" });
+      setReadStatus({ type: "error", text: "氏名を入力してください。" });
       return;
     }
 
-    setConfirming(true);
+    setReadActing(true);
     try {
-      // 端末保存
+      // localStorageに氏名保存
       try {
-        localStorage.setItem(localKeyName(), name);
-        if (readerRole) localStorage.setItem(localKeyRole(), readerRole);
+        localStorage.setItem(storageKeyName, name);
       } catch {
         // ignore
       }
 
+      const device = getDeviceLabel();
       const res = await fetch("/api/ky-read", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -248,29 +246,36 @@ export default function KyPublicClient({ token }: { token: string }) {
         body: JSON.stringify({
           token,
           readerName: name,
-          readerRole: readerRole || null,
-          readerDevice: typeof navigator !== "undefined" ? navigator.userAgent : null,
+          readerRole: null,
+          readerDevice: device || null,
         }),
       });
 
       const j = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
 
-      // 当日確認済みとして端末でもマーク（UI即反映）
+      const at = j?.created_at ? String(j.created_at) : new Date().toISOString();
+
+      // 同日重複でもOK扱い（押した人にとっては確認済み）
+      setReadDone(true);
+      setReadAt(at);
+
       try {
-        localStorage.setItem(localKeyConfirmed(token), "1");
+        localStorage.setItem(storageKeyDone, at);
       } catch {
         // ignore
       }
 
-      setConfirmed(true);
-      setStatus({ type: "success", text: j?.duplicated ? "本日は既に確認済みです（再確認）。" : "確認しました（既読登録しました）。" });
+      setReadStatus({
+        type: "success",
+        text: j?.duplicated ? "確認済み（本日はすでに確認済みです）" : "確認しました（既読登録しました）",
+      });
     } catch (e: any) {
-      setStatus({ type: "error", text: e?.message ?? "既読登録に失敗しました" });
+      setReadStatus({ type: "error", text: e?.message ?? "既読登録に失敗しました" });
     } finally {
-      setConfirming(false);
+      setReadActing(false);
     }
-  };
+  }, [readerName, storageKeyName, storageKeyDone, token]);
 
   if (loading) {
     return (
@@ -296,7 +301,44 @@ export default function KyPublicClient({ token }: { token: string }) {
         <div className="mt-1 text-sm text-slate-600">日付：{ky.work_date ? fmtDateJp(ky.work_date) : "（不明）"}</div>
       </div>
 
-      {!!status.text && <div className={`rounded-lg px-3 py-2 text-sm ${statusClass}`}>{status.text}</div>}
+      {/* ✅ 既読（確認） */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="text-sm font-semibold text-slate-800">確認（既読登録）</div>
+
+        {!!readStatus.text && <div className={`rounded-lg px-3 py-2 text-sm ${statusClass}`}>{readStatus.text}</div>}
+
+        <div className="space-y-2">
+          <div className="text-xs text-slate-600">氏名（必須）</div>
+          <input
+            value={readerName}
+            onChange={(e) => setReaderName(e.target.value)}
+            placeholder="例）山田太郎"
+            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+            disabled={readDone || readActing}
+            inputMode="text"
+          />
+        </div>
+
+        <button
+          type="button"
+          onClick={onConfirmRead}
+          disabled={readDone || readActing}
+          className={`w-full rounded-lg px-4 py-2 text-sm text-white ${
+            readDone || readActing ? "bg-slate-400" : "bg-black hover:bg-slate-900"
+          }`}
+        >
+          {readDone ? "確認済み" : readActing ? "送信中..." : "確認しました"}
+        </button>
+
+        {readDone ? (
+          <div className="text-xs text-slate-500">
+            ※この端末では確認済みです{readAt ? `（${readAt}）` : ""}。<br />
+            ※同じ氏名は同日に二重登録されません。
+          </div>
+        ) : (
+          <div className="text-xs text-slate-500">※入力した氏名は次回以降も自動入力されます。</div>
+        )}
+      </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">施工会社（固定）</div>
@@ -363,53 +405,6 @@ export default function KyPublicClient({ token }: { token: string }) {
           <div className="text-xs text-slate-600">第三者（墓参者）の補足</div>
           <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">
             {s(ky.ai_third_party).trim() || "（なし）"}
-          </div>
-        </div>
-      </div>
-
-      {/* ✅ 既読登録ブロック（追加） */}
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
-        <div className="text-sm font-semibold text-slate-800">確認（既読登録）</div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <div className="md:col-span-2">
-            <div className="text-xs text-slate-600 mb-1">氏名（必須）</div>
-            <input
-              value={readerName}
-              onChange={(e) => setReaderName(e.target.value)}
-              placeholder="例：山田 太郎"
-              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-            />
-          </div>
-
-          <div>
-            <div className="text-xs text-slate-600 mb-1">役割（任意）</div>
-            <select
-              value={readerRole}
-              onChange={(e) => setReaderRole(e.target.value as any)}
-              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-            >
-              <option value="">選択なし</option>
-              <option value="職長">職長</option>
-              <option value="作業員">作業員</option>
-            </select>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2 flex-wrap">
-          <button
-            type="button"
-            onClick={onConfirmRead}
-            disabled={confirming}
-            className={`rounded-lg px-4 py-2 text-sm text-white ${
-              confirming ? "bg-slate-400" : confirmed ? "bg-emerald-600 hover:bg-emerald-700" : "bg-black hover:bg-slate-900"
-            }`}
-          >
-            {confirming ? "送信中..." : confirmed ? "確認済み（再確認もOK）" : "確認しました"}
-          </button>
-
-          <div className="text-xs text-slate-500">
-            ※「確認しました」で、所長側のレビュー画面に既読として記録されます。
           </div>
         </div>
       </div>
