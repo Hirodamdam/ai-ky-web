@@ -61,6 +61,14 @@ type ProjectRow = {
   contractor_name: string | null;
 };
 
+type ReadLog = {
+  id: string;
+  reader_name: string | null;
+  reader_role: string | null;
+  reader_device: string | null;
+  created_at: string | null;
+};
+
 function s(v: any) {
   if (v == null) return "";
   return String(v);
@@ -220,11 +228,35 @@ export default function KyReviewClient() {
   const [qrDataUrl, setQrDataUrl] = useState<string>("");
   const [qrOpen, setQrOpen] = useState(false);
 
+  // ✅ 既読一覧
+  const [readLoading, setReadLoading] = useState(false);
+  const [readLogs, setReadLogs] = useState<ReadLog[]>([]);
+  const [readErr, setReadErr] = useState<string>("");
+
   const statusClass = useMemo(() => {
     if (status.type === "success") return "border border-emerald-200 bg-emerald-50 text-emerald-800";
     if (status.type === "error") return "border border-rose-200 bg-rose-50 text-rose-800";
     return "border border-slate-200 bg-slate-50 text-slate-700";
   }, [status.type]);
+
+  const loadReadLogs = useCallback(async () => {
+    setReadErr("");
+    setReadLoading(true);
+    try {
+      const { data } = await supabase.auth.getSession();
+      const accessToken = data?.session?.access_token;
+      if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
+
+      const j = await postJsonTry(["/api/ky-read-list"], { projectId, kyId, accessToken });
+      const arr = Array.isArray(j?.logs) ? (j.logs as ReadLog[]) : [];
+      setReadLogs(arr);
+    } catch (e: any) {
+      setReadErr(e?.message ?? "既読一覧の取得に失敗しました");
+      setReadLogs([]);
+    } finally {
+      setReadLoading(false);
+    }
+  }, [projectId, kyId]);
 
   const load = useCallback(async () => {
     if (!projectId || !kyId) return;
@@ -366,12 +398,20 @@ export default function KyReviewClient() {
       setSlopePrevUrl(slopePrev);
       setPathNowUrl(pathNow);
       setPathPrevUrl(pathPrev);
+
+      // ✅ 承認済みなら既読一覧も更新
+      if (kyData?.is_approved) {
+        await loadReadLogs();
+      } else {
+        setReadLogs([]);
+        setReadErr("");
+      }
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "読み込みに失敗しました" });
     } finally {
       setLoading(false);
     }
-  }, [projectId, kyId]);
+  }, [projectId, kyId, loadReadLogs]);
 
   useEffect(() => {
     load();
@@ -605,6 +645,18 @@ export default function KyReviewClient() {
                 QRを表示
               </button>
             ) : null}
+
+            {/* ✅ 既読一覧 更新 */}
+            <button
+              type="button"
+              onClick={loadReadLogs}
+              disabled={readLoading}
+              className={`rounded-lg border px-4 py-2 text-sm ${
+                readLoading ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
+              }`}
+            >
+              {readLoading ? "既読 更新中..." : "既読を更新"}
+            </button>
           </div>
 
           {qrDataUrl ? (
@@ -620,6 +672,37 @@ export default function KyReviewClient() {
               </div>
             </div>
           ) : null}
+
+          {/* ✅ 既読一覧（追加） */}
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-sm font-semibold text-slate-800">既読状況</div>
+              <div className="text-sm text-slate-700">
+                既読：<span className="font-semibold">{readLogs.length}</span> 名
+              </div>
+            </div>
+
+            {readErr ? <div className="text-xs text-rose-700">{readErr}</div> : null}
+
+            {readLogs.length ? (
+              <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
+                <div className="grid grid-cols-12 gap-0 border-b border-slate-200 bg-slate-50 text-xs text-slate-600">
+                  <div className="col-span-5 px-3 py-2">氏名</div>
+                  <div className="col-span-2 px-3 py-2">役割</div>
+                  <div className="col-span-5 px-3 py-2">時刻</div>
+                </div>
+                {readLogs.map((r) => (
+                  <div key={r.id} className="grid grid-cols-12 gap-0 border-b border-slate-100 text-sm">
+                    <div className="col-span-5 px-3 py-2 text-slate-800">{s(r.reader_name) || "（不明）"}</div>
+                    <div className="col-span-2 px-3 py-2 text-slate-700">{s(r.reader_role) || "—"}</div>
+                    <div className="col-span-5 px-3 py-2 text-slate-700">{r.created_at ? fmtDateTimeJp(r.created_at) : "—"}</div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-sm text-slate-600">（まだ既読がありません）</div>
+            )}
+          </div>
 
           {qrOpen && qrDataUrl ? (
             <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4 no-print" onClick={() => setQrOpen(false)}>

@@ -1,0 +1,74 @@
+import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+
+export const runtime = "nodejs";
+
+type Body = {
+  projectId: string;
+  kyId: string;
+  accessToken: string;
+};
+
+function s(v: any) {
+  return v == null ? "" : String(v);
+}
+
+export async function POST(req: Request) {
+  try {
+    const body = (await req.json()) as Body;
+
+    const projectId = s(body.projectId).trim();
+    const kyId = s(body.kyId).trim();
+    const accessToken = s(body.accessToken).trim();
+
+    const adminUserId = process.env.KY_ADMIN_USER_ID;
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+    if (!adminUserId || !url || !anonKey || !serviceKey) {
+      return NextResponse.json(
+        { error: "Missing env: KY_ADMIN_USER_ID / NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY" },
+        { status: 500 }
+      );
+    }
+    if (!projectId || !kyId || !accessToken) {
+      return NextResponse.json({ error: "projectId/kyId/accessToken required" }, { status: 400 });
+    }
+
+    // admin確認
+    const userClient = createClient(url, anonKey, {
+      global: { headers: { Authorization: `Bearer ${accessToken}` } },
+      auth: { persistSession: false },
+    });
+
+    const { data: userData, error: userErr } = await userClient.auth.getUser();
+    if (userErr || !userData?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    if (userData.user.id !== adminUserId) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+
+    const adminClient = createClient(url, serviceKey, { auth: { persistSession: false } });
+
+    // 整合確認
+    const { data: ky, error: kyErr } = await adminClient
+      .from("ky_entries")
+      .select("id, project_id")
+      .eq("id", kyId)
+      .maybeSingle();
+
+    if (kyErr) return NextResponse.json({ error: kyErr.message }, { status: 500 });
+    if (!ky) return NextResponse.json({ error: "KY not found" }, { status: 404 });
+    if (s(ky.project_id) !== projectId) return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
+
+    const { data: logs, error: logErr } = await adminClient
+      .from("ky_read_logs")
+      .select("id, reader_name, reader_role, reader_device, created_at")
+      .eq("ky_id", kyId)
+      .order("created_at", { ascending: false });
+
+    if (logErr) return NextResponse.json({ error: logErr.message }, { status: 500 });
+
+    return NextResponse.json({ ok: true, logs: logs ?? [] });
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
+  }
+}
