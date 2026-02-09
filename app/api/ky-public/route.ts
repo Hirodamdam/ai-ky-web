@@ -26,16 +26,11 @@ export async function POST(req: Request) {
     const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
     if (!url || !serviceKey) {
-      return NextResponse.json(
-        { error: "Missing env: NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY" },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: "Missing env: NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY" }, { status: 500 });
     }
 
-    // ✅ 公開ページは認証なしで読める必要があるので service role で読む（RLS回避）
     const supabase = createClient(url, serviceKey, { auth: { persistSession: false } });
 
-    // 1) tokenでKYを取得
     const { data: ky, error: kyErr } = await supabase
       .from("ky_entries")
       .select(
@@ -58,43 +53,28 @@ export async function POST(req: Request) {
       .eq("public_token", token)
       .maybeSingle();
 
-    if (kyErr) {
-      return NextResponse.json({ error: kyErr.message }, { status: 500 });
-    }
+    if (kyErr) return NextResponse.json({ error: kyErr.message }, { status: 500 });
+    if (!ky) return NextResponse.json({ ky: null, project: null }, { status: 200 });
 
-    // token不正
-    if (!ky) {
-      return NextResponse.json({ ky: null, project: null }, { status: 200 });
-    }
-
-    // ✅ 承認済みのみ公開（ここが重要）
     if (!ky.is_approved) {
       return NextResponse.json({ ky: null, project: null }, { status: 200 });
     }
 
-    // 2) project を取得（施工会社名など）
     const projectId = s(ky.project_id);
     let project: any = null;
 
     if (projectId) {
-      const { data: p, error: pErr } = await supabase
-        .from("projects")
-        .select("name, contractor_name")
-        .eq("id", projectId)
-        .maybeSingle();
-
-      if (pErr) {
-        // project取得失敗でもKYは返す（公開ページが落ちないように）
-        project = null;
-      } else {
-        project = p ?? null;
-      }
+      const { data: p } = await supabase.from("projects").select("name, contractor_name").eq("id", projectId).maybeSingle();
+      project = p ?? null;
     }
 
-    // 公開側に返す形（KyPublicClient.tsx の型に合わせる）
     return NextResponse.json(
       {
         ky: {
+          // ✅ 追加（互換を壊さない）
+          id: ky.id ?? null,
+          project_id: ky.project_id ?? null,
+
           work_date: ky.work_date ?? null,
           partner_company_name: ky.partner_company_name ?? null,
           third_party_level: ky.third_party_level ?? null,
@@ -109,7 +89,6 @@ export async function POST(req: Request) {
 
           is_approved: ky.is_approved ?? null,
 
-          // ※あなたの型にある public_enabled は使ってないので null にしておく
           public_enabled: null,
         },
         project,

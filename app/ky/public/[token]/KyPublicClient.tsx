@@ -128,6 +128,22 @@ function getDeviceLabel(): string {
   }
 }
 
+function getEntrantNoFromUrl(): string {
+  try {
+    const sp = new URLSearchParams(window.location.search || "");
+    return s(sp.get("eno")).trim();
+  } catch {
+    return "";
+  }
+}
+
+function isValidEntrantNo(v: string): boolean {
+  const x = s(v).trim();
+  if (!x) return false;
+  // 数字/英数字/ハイフン/アンダーバー程度を許容（現場運用のブレ吸収）
+  return /^[0-9A-Za-z_-]{1,32}$/.test(x);
+}
+
 export default function KyPublicClient({ token }: { token: string }) {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string>("");
@@ -135,9 +151,13 @@ export default function KyPublicClient({ token }: { token: string }) {
   const [ky, setKy] = useState<Ky | null>(null);
   const [project, setProject] = useState<Project>(null);
 
+  // ✅ URLのエントリーNo（個人識別）
+  const [entrantNo, setEntrantNo] = useState<string>("");
+
   // ✅ 既読（確認）UI
   const storageKeyName = useMemo(() => `ky_reader_name_v1`, []);
   const storageKeyDone = useMemo(() => `ky_read_done_v1:${token}`, [token]);
+  const storageKeyDoneByNo = useMemo(() => `ky_read_done_v1:${token}:eno:${entrantNo || "none"}`, [token, entrantNo]);
 
   const [readerName, setReaderName] = useState<string>("");
   const [readDone, setReadDone] = useState<boolean>(false);
@@ -145,12 +165,21 @@ export default function KyPublicClient({ token }: { token: string }) {
   const [readStatus, setReadStatus] = useState<{ type: "success" | "error" | null; text: string }>({ type: null, text: "" });
   const [readActing, setReadActing] = useState(false);
 
+  // URLからenoを取得（初回のみ）
+  useEffect(() => {
+    const eno = getEntrantNoFromUrl();
+    if (eno) setEntrantNo(eno);
+  }, []);
+
   useEffect(() => {
     // localStorage復元
     try {
       const n = localStorage.getItem(storageKeyName);
       if (n && !readerName) setReaderName(n);
-      const done = localStorage.getItem(storageKeyDone);
+
+      // ✅ enoがある場合は「eno単位」で既読済みを判定（端末単位の誤判定を避ける）
+      const key = isValidEntrantNo(entrantNo) ? storageKeyDoneByNo : storageKeyDone;
+      const done = localStorage.getItem(key);
       if (done) {
         setReadDone(true);
         setReadAt(done);
@@ -159,7 +188,7 @@ export default function KyPublicClient({ token }: { token: string }) {
       // ignore
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [storageKeyName, storageKeyDone]);
+  }, [storageKeyName, storageKeyDone, storageKeyDoneByNo, entrantNo]);
 
   const statusClass = useMemo(() => {
     if (readStatus.type === "success") return "border border-emerald-200 bg-emerald-50 text-emerald-800";
@@ -220,62 +249,104 @@ export default function KyPublicClient({ token }: { token: string }) {
     return filtered;
   }, [ky?.weather_slots]);
 
-  const onConfirmRead = useCallback(async () => {
-    setReadStatus({ type: null, text: "" });
+  const onConfirmRead = useCallback(
+    async (opts?: { forceNameMode?: boolean }) => {
+      setReadStatus({ type: null, text: "" });
 
-    const name = s(readerName).trim();
-    if (!name) {
-      setReadStatus({ type: "error", text: "氏名を入力してください。" });
-      return;
-    }
+      const eno = s(entrantNo).trim();
+      const enoOk = isValidEntrantNo(eno);
+      const forceNameMode = !!opts?.forceNameMode;
 
-    setReadActing(true);
+      // ✅ enoがある場合：氏名入力不要（個人Noで既読）
+      // ✅ enoが無い場合：従来通り氏名必須
+      const name = s(readerName).trim();
+
+      if (!enoOk || forceNameMode) {
+        if (!name) {
+          setReadStatus({ type: "error", text: "氏名を入力してください。" });
+          return;
+        }
+      }
+
+      setReadActing(true);
+      try {
+        // localStorageに氏名保存（eno運用でも、将来の保険）
+        if (name) {
+          try {
+            localStorage.setItem(storageKeyName, name);
+          } catch {
+            // ignore
+          }
+        }
+
+        const device = getDeviceLabel();
+        const res = await fetch("/api/ky-read", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          cache: "no-store",
+          body: JSON.stringify({
+            token,
+            entrantNo: enoOk && !forceNameMode ? eno : null,
+            // 互換：enoが無い/強制氏名モードの場合は氏名で登録
+            readerName: !enoOk || forceNameMode ? name : "",
+            readerRole: null,
+            readerDevice: device || null,
+          }),
+        });
+
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
+
+        const at = new Date().toISOString();
+
+        setReadDone(true);
+        setReadAt(at);
+
+        try {
+          const key = enoOk && !forceNameMode ? storageKeyDoneByNo : storageKeyDone;
+          localStorage.setItem(key, at);
+        } catch {
+          // ignore
+        }
+
+        setReadStatus({
+          type: "success",
+          text: enoOk && !forceNameMode ? "確認しました（個人Noで既読登録しました）" : "確認しました（既読登録しました）",
+        });
+      } catch (e: any) {
+        setReadStatus({ type: "error", text: e?.message ?? "既読登録に失敗しました" });
+      } finally {
+        setReadActing(false);
+      }
+    },
+    [entrantNo, readerName, storageKeyName, storageKeyDone, storageKeyDoneByNo, token]
+  );
+
+  // ✅ enoが有効なら「自動既読」（完成形を崩さず、裏で1回だけ実行）
+  useEffect(() => {
+    if (!ky) return;
+    if (!ky.is_approved) return;
+    if (readDone) return;
+
+    const eno = s(entrantNo).trim();
+    if (!isValidEntrantNo(eno)) return;
+
+    // localStorageに既に入っていればスキップ
     try {
-      // localStorageに氏名保存
-      try {
-        localStorage.setItem(storageKeyName, name);
-      } catch {
-        // ignore
+      const done = localStorage.getItem(storageKeyDoneByNo);
+      if (done) {
+        setReadDone(true);
+        setReadAt(done);
+        return;
       }
-
-      const device = getDeviceLabel();
-      const res = await fetch("/api/ky-read", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({
-          token,
-          readerName: name,
-          readerRole: null,
-          readerDevice: device || null,
-        }),
-      });
-
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
-
-      const at = j?.created_at ? String(j.created_at) : new Date().toISOString();
-
-      // 同日重複でもOK扱い（押した人にとっては確認済み）
-      setReadDone(true);
-      setReadAt(at);
-
-      try {
-        localStorage.setItem(storageKeyDone, at);
-      } catch {
-        // ignore
-      }
-
-      setReadStatus({
-        type: "success",
-        text: j?.duplicated ? "確認済み（本日はすでに確認済みです）" : "確認しました（既読登録しました）",
-      });
-    } catch (e: any) {
-      setReadStatus({ type: "error", text: e?.message ?? "既読登録に失敗しました" });
-    } finally {
-      setReadActing(false);
+    } catch {
+      // ignore
     }
-  }, [readerName, storageKeyName, storageKeyDone, token]);
+
+    // 1回だけ自動送信
+    onConfirmRead().catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ky, entrantNo, readDone, storageKeyDoneByNo]);
 
   if (loading) {
     return (
@@ -294,6 +365,8 @@ export default function KyPublicClient({ token }: { token: string }) {
     );
   }
 
+  const enoOk = isValidEntrantNo(entrantNo);
+
   return (
     <div className="p-4 space-y-4">
       <div>
@@ -303,37 +376,56 @@ export default function KyPublicClient({ token }: { token: string }) {
 
       {/* ✅ 既読（確認） */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
-        <div className="text-sm font-semibold text-slate-800">確認（既読登録）</div>
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-sm font-semibold text-slate-800">確認（既読登録）</div>
+
+          {enoOk ? (
+            <div className="text-xs text-slate-600">
+              個人No：<span className="font-semibold">{entrantNo}</span>
+            </div>
+          ) : null}
+        </div>
 
         {!!readStatus.text && <div className={`rounded-lg px-3 py-2 text-sm ${statusClass}`}>{readStatus.text}</div>}
 
-        <div className="space-y-2">
-          <div className="text-xs text-slate-600">氏名（必須）</div>
-          <input
-            value={readerName}
-            onChange={(e) => setReaderName(e.target.value)}
-            placeholder="例）山田太郎"
-            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
-            disabled={readDone || readActing}
-            inputMode="text"
-          />
-        </div>
+        {/* ✅ enoがある場合：氏名入力を非表示（完成形は維持、枠は残す） */}
+        {!enoOk ? (
+          <div className="space-y-2">
+            <div className="text-xs text-slate-600">氏名（必須）</div>
+            <input
+              value={readerName}
+              onChange={(e) => setReaderName(e.target.value)}
+              placeholder="例）山田太郎"
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+              disabled={readDone || readActing}
+              inputMode="text"
+            />
+          </div>
+        ) : (
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+            このリンクは「個人No」で管理されています。氏名入力なしで自動的に既読登録されます。
+          </div>
+        )}
 
         <button
           type="button"
-          onClick={onConfirmRead}
-          disabled={readDone || readActing}
+          onClick={() => onConfirmRead(enoOk ? undefined : { forceNameMode: true })}
+          disabled={readDone || readActing || (enoOk && !readDone)} // enoOk時は自動送信中の二重押し防止
           className={`w-full rounded-lg px-4 py-2 text-sm text-white ${
             readDone || readActing ? "bg-slate-400" : "bg-black hover:bg-slate-900"
           }`}
         >
-          {readDone ? "確認済み" : readActing ? "送信中..." : "確認しました"}
+          {readDone ? "確認済み" : readActing ? "送信中..." : enoOk ? "確認中..." : "確認しました"}
         </button>
 
         {readDone ? (
           <div className="text-xs text-slate-500">
-            ※この端末では確認済みです{readAt ? `（${readAt}）` : ""}。<br />
-            ※同じ氏名は同日に二重登録されません。
+            ※この端末では確認済みです{readAt ? `（${readAt}）` : ""}。
+          </div>
+        ) : enoOk ? (
+          <div className="text-xs text-slate-500">
+            ※個人No（{entrantNo}）で既読登録します。<br />
+            ※表示が更新されない場合は再読み込みしてください。
           </div>
         ) : (
           <div className="text-xs text-slate-500">※入力した氏名は次回以降も自動入力されます。</div>
@@ -365,7 +457,8 @@ export default function KyPublicClient({ token }: { token: string }) {
                 <div className="mt-2 text-xs text-slate-600 space-y-1">
                   <div>気温：{slot.temperature_c ?? "—"} ℃</div>
                   <div>
-                    風：{degToDirJp(slot.wind_direction_deg)} {slot.wind_speed_ms != null ? `${slot.wind_speed_ms} m/s` : "—"}
+                    風：{degToDirJp(slot.wind_direction_deg)}{" "}
+                    {slot.wind_speed_ms != null ? `${slot.wind_speed_ms} m/s` : "—"}
                   </div>
                   <div>降水：{slot.precipitation_mm ?? "—"} mm</div>
                 </div>

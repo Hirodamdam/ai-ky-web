@@ -14,17 +14,15 @@ function s(v: any) {
   return v == null ? "" : String(v);
 }
 
-function pickFirst(row: any, keys: string[]): string {
-  for (const k of keys) {
-    const v = s(row?.[k]).trim();
-    if (v) return v;
-  }
-  return "";
+function normEntrantNo(v: any): string {
+  return s(v).trim();
 }
 
-function uniq(arr: string[]) {
-  return Array.from(new Set(arr.map((x) => s(x).trim()).filter(Boolean)));
-}
+type UnreadEntry = {
+  entrant_no: string;
+  entrant_name: string | null;
+  partner_company_name: string | null;
+};
 
 export async function POST(req: Request) {
   try {
@@ -49,7 +47,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "projectId/kyId/accessToken required" }, { status: 400 });
     }
 
-    // admin確認（tokenからuser取得）
+    // admin確認
     const userClient = createClient(url, anonKey, {
       global: { headers: { Authorization: `Bearer ${accessToken}` } },
       auth: { persistSession: false },
@@ -61,87 +59,76 @@ export async function POST(req: Request) {
 
     const adminClient = createClient(url, serviceKey, { auth: { persistSession: false } });
 
-    // 整合確認（ky.project_id と projectId）
-    const { data: ky, error: kyErr } = await adminClient.from("ky_entries").select("id, project_id").eq("id", kyId).maybeSingle();
+    // KY整合確認
+    const { data: ky, error: kyErr } = await adminClient
+      .from("ky_entries")
+      .select("id, project_id")
+      .eq("id", kyId)
+      .maybeSingle();
+
     if (kyErr) return NextResponse.json({ error: kyErr.message }, { status: 500 });
     if (!ky) return NextResponse.json({ error: "KY not found" }, { status: 404 });
     if (s(ky.project_id) !== projectId) return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
 
-    // 既読ログ（氏名/会社が列名違いでも拾う）
-    const { data: logs, error: logErr } = await adminClient
-      .from("ky_read_logs")
-      .select("*")
-      .eq("ky_id", kyId)
-      .order("created_at", { ascending: false });
-
-    if (logErr) return NextResponse.json({ error: logErr.message }, { status: 500 });
-
-    const readPersons = uniq(
-      (logs ?? []).map((r: any) => pickFirst(r, ["reader_name", "name", "person_name", "worker_name"])).filter(Boolean)
-    );
-    const readCompanies = uniq(
-      (logs ?? []).map((r: any) => pickFirst(r, ["reader_company_name", "company_name", "partner_company_name"])).filter(Boolean)
-    );
-
-    // 入場登録（project_partner_entries）から “読むべき対象” を取る
-    // ※ テーブルが無い/列が違う場合でも落とさず empty を返す
+    // ✅ 期待対象（入場登録：個人No）
+    // テーブル名は「project_entrant_entries」を想定（あなたの運用に合わせ）
     const { data: entrants, error: entErr } = await adminClient
-      .from("project_partner_entries")
-      .select("*")
+      .from("project_entrant_entries")
+      .select("entrant_no, entrant_name, partner_company_name, created_at")
       .eq("project_id", projectId)
-      .order("created_at", { ascending: false });
+      .order("created_at", { ascending: false })
+      .limit(2000);
 
     if (entErr) {
       return NextResponse.json({
         ok: true,
         mode: "none",
-        expected_persons: [],
-        expected_companies: [],
-        read_persons: readPersons,
-        read_companies: readCompanies,
         unread: [],
-        note: "project_partner_entries not available or query failed",
+        unread_entries: [],
+        note: "project_entrant_entries not available",
       });
     }
 
-    const expectedPersons = uniq(
-      (entrants ?? [])
-        .map((e: any) => pickFirst(e, ["worker_name", "person_name", "entrant_name", "contact_name", "user_name", "name"]))
+    const expected: UnreadEntry[] = (Array.isArray(entrants) ? entrants : [])
+      .map((e: any) => ({
+        entrant_no: normEntrantNo(e?.entrant_no),
+        entrant_name: s(e?.entrant_name).trim() || null,
+        partner_company_name: s(e?.partner_company_name).trim() || null,
+      }))
+      .filter((x) => !!x.entrant_no);
+
+    // ✅ 既読（entrant_no が入っているものだけ）
+    const { data: logs, error: logErr } = await adminClient
+      .from("ky_read_logs")
+      .select("entrant_no, created_at")
+      .eq("ky_id", kyId)
+      .order("created_at", { ascending: false })
+      .limit(5000);
+
+    if (logErr) return NextResponse.json({ error: logErr.message }, { status: 500 });
+
+    const readSet = new Set(
+      (Array.isArray(logs) ? logs : [])
+        .map((r: any) => normEntrantNo(r?.entrant_no))
         .filter(Boolean)
     );
 
-    const expectedCompanies = uniq(
-      (entrants ?? []).map((e: any) => pickFirst(e, ["partner_company_name", "company_name", "partner_name"])).filter(Boolean)
-    );
+    const unreadEntries = expected.filter((e) => !readSet.has(e.entrant_no));
 
-    // ルール：
-    // - 個人名が取れる現場 → 個人名で未読を出す（最優先）
-    // - 個人名が取れない現場 → 会社名で未読を出す（会社単位）
-    if (expectedPersons.length) {
-      const readSet = new Set(readPersons);
-      const unread = expectedPersons.filter((x) => !readSet.has(x));
-      return NextResponse.json({
-        ok: true,
-        mode: "person",
-        expected_persons: expectedPersons,
-        expected_companies: expectedCompanies,
-        read_persons: readPersons,
-        read_companies: readCompanies,
-        unread,
-      });
-    } else {
-      const readSet = new Set(readCompanies);
-      const unread = expectedCompanies.filter((x) => !readSet.has(x));
-      return NextResponse.json({
-        ok: true,
-        mode: "company",
-        expected_persons: expectedPersons,
-        expected_companies: expectedCompanies,
-        read_persons: readPersons,
-        read_companies: readCompanies,
-        unread,
-      });
-    }
+    // 互換：従来の unread:string[] も返す（UIが崩れない）
+    const unreadLegacy = unreadEntries.map((e) => e.entrant_no);
+
+    return NextResponse.json({
+      ok: true,
+      mode: "person", // 互換
+      unread: unreadLegacy,
+      unread_entries: unreadEntries, // ✅ 本命（eno + 氏名 + 会社）
+      counts: {
+        expected: expected.length,
+        read: readSet.size,
+        unread: unreadEntries.length,
+      },
+    });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
   }

@@ -1,3 +1,4 @@
+// app/api/ky-read/route.ts
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
@@ -5,9 +6,12 @@ export const runtime = "nodejs";
 
 type Body = {
   token: string;
-  readerName: string;
+  readerName?: string | null;
   readerRole?: string | null;
   readerDevice?: string | null;
+
+  // ✅ 個人（新規入場者教育のエントリーNo）
+  entrantNo?: string | null;
 };
 
 function s(v: any) {
@@ -19,21 +23,30 @@ function dayKeyJst(d = new Date()) {
   return jst.toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
+function normEntrantNo(v: any): string | null {
+  const x = s(v).trim();
+  if (!x) return null;
+  // 数字/英数字/ハイフン/アンダーバー程度（運用ブレ吸収）
+  if (!/^[0-9A-Za-z_-]{1,32}$/.test(x)) return null;
+  return x;
+}
+
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as Body;
+    const body = (await req.json().catch(() => ({}))) as Body;
 
     const token = s(body.token).trim();
     const readerName = s(body.readerName).trim();
     const readerRole = s(body.readerRole).trim() || null;
     const readerDevice = s(body.readerDevice).trim() || null;
 
-    if (!token || !readerName) {
-      return NextResponse.json({ error: "token/readerName required" }, { status: 400 });
-    }
+    const entrantNo = normEntrantNo(body.entrantNo);
+
+    if (!token) return NextResponse.json({ error: "token required" }, { status: 400 });
 
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
     if (!url || !serviceKey) {
       return NextResponse.json(
         { error: "Missing env: NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY" },
@@ -41,56 +54,64 @@ export async function POST(req: Request) {
       );
     }
 
-    const adminClient = createClient(url, serviceKey, { auth: { persistSession: false } });
+    const supabase = createClient(url, serviceKey, { auth: { persistSession: false } });
 
-    // token検証（承認済みのみ）
-    const { data: ky, error: kyErr } = await adminClient
+    // 1) token から ky を特定
+    const { data: ky, error: kyErr } = await supabase
       .from("ky_entries")
-      .select("id, project_id, is_approved, public_token, work_date")
+      .select("id, project_id, is_approved")
       .eq("public_token", token)
       .maybeSingle();
 
     if (kyErr) return NextResponse.json({ error: kyErr.message }, { status: 500 });
-    if (!ky || !ky.is_approved) {
-      return NextResponse.json({ error: "invalid token or not approved" }, { status: 404 });
-    }
+    if (!ky) return NextResponse.json({ error: "Invalid token" }, { status: 404 });
+    if (!ky.is_approved) return NextResponse.json({ error: "Not approved" }, { status: 403 });
 
-    const kyId = s(ky.id);
-    const projectId = s(ky.project_id);
+    const kyId = s(ky.id).trim();
     const today = dayKeyJst();
 
-    // 同日・同KY・同氏名は二重登録抑止
-    const start = `${today}T00:00:00+09:00`;
-    const end = `${today}T23:59:59+09:00`;
+    // ✅ 重複防止キー：eno がある場合は eno、無い場合は氏名
+    const dedupeKey = entrantNo ? `ENO:${entrantNo}` : `NAME:${readerName}`;
 
-    const { data: existing, error: exErr } = await adminClient
+    if (!entrantNo && !readerName) {
+      return NextResponse.json({ error: "readerName required (or provide entrantNo)" }, { status: 400 });
+    }
+
+    // 2) 同日重複チェック（ky_id + day + dedupeKey）
+    const { data: dup, error: dupErr } = await supabase
       .from("ky_read_logs")
       .select("id, created_at")
       .eq("ky_id", kyId)
-      .eq("reader_name", readerName)
-      .gte("created_at", start)
-      .lte("created_at", end)
-      .order("created_at", { ascending: false })
-      .limit(1);
+      .eq("day_key", today)
+      .eq("dedupe_key", dedupeKey)
+      .maybeSingle();
 
-    if (exErr) return NextResponse.json({ error: exErr.message }, { status: 500 });
-
-    if (existing && existing.length > 0) {
-      return NextResponse.json({ ok: true, duplicated: true, created_at: existing[0].created_at });
+    if (dupErr) return NextResponse.json({ error: dupErr.message }, { status: 500 });
+    if (dup?.id) {
+      return NextResponse.json({ ok: true, duplicated: true, created_at: dup.created_at }, { status: 200 });
     }
 
-    const { error: insErr } = await adminClient.from("ky_read_logs").insert({
-      project_id: projectId,
-      ky_id: kyId,
-      public_token: token,
-      reader_name: readerName,
-      reader_role: readerRole,
-      reader_device: readerDevice,
-    });
+    // 3) 追加
+    const { data: ins, error: insErr } = await supabase
+      .from("ky_read_logs")
+      .insert({
+        ky_id: kyId,
+        project_id: ky.project_id ?? null,
+
+        reader_name: entrantNo ? null : readerName || null,
+        reader_role: readerRole,
+        reader_device: readerDevice,
+
+        entrant_no: entrantNo, // ✅ ここが個人キー
+        day_key: today,
+        dedupe_key: dedupeKey,
+      })
+      .select("id, created_at")
+      .maybeSingle();
 
     if (insErr) return NextResponse.json({ error: insErr.message }, { status: 500 });
 
-    return NextResponse.json({ ok: true, duplicated: false });
+    return NextResponse.json({ ok: true, created_at: ins?.created_at ?? new Date().toISOString() }, { status: 200 });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
   }
