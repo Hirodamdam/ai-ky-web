@@ -22,14 +22,8 @@ function pickFirst(row: any, keys: string[]): string {
   return "";
 }
 
-function makeLabel(company: string, person: string, role: string) {
-  const c = s(company).trim();
-  const p = s(person).trim();
-  const r = s(role).trim();
-  if (c && p) return r ? `${c} ${p}（${r}）` : `${c} ${p}`;
-  if (c) return c;
-  if (p) return r ? `${p}（${r}）` : p;
-  return "";
+function uniq(arr: string[]) {
+  return Array.from(new Set(arr.map((x) => s(x).trim()).filter(Boolean)));
 }
 
 export async function POST(req: Request) {
@@ -55,24 +49,25 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "projectId/kyId/accessToken required" }, { status: 400 });
     }
 
-    // admin確認
+    // admin確認（tokenからuser取得）
     const userClient = createClient(url, anonKey, {
       global: { headers: { Authorization: `Bearer ${accessToken}` } },
       auth: { persistSession: false },
     });
+
     const { data: userData, error: userErr } = await userClient.auth.getUser();
     if (userErr || !userData?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     if (userData.user.id !== adminUserId) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
     const adminClient = createClient(url, serviceKey, { auth: { persistSession: false } });
 
-    // 整合確認
+    // 整合確認（ky.project_id と projectId）
     const { data: ky, error: kyErr } = await adminClient.from("ky_entries").select("id, project_id").eq("id", kyId).maybeSingle();
     if (kyErr) return NextResponse.json({ error: kyErr.message }, { status: 500 });
     if (!ky) return NextResponse.json({ error: "KY not found" }, { status: 404 });
     if (s(ky.project_id) !== projectId) return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
 
-    // 1) 既読ログ（誰が読んだか）
+    // 既読ログ（氏名/会社が列名違いでも拾う）
     const { data: logs, error: logErr } = await adminClient
       .from("ky_read_logs")
       .select("*")
@@ -81,18 +76,15 @@ export async function POST(req: Request) {
 
     if (logErr) return NextResponse.json({ error: logErr.message }, { status: 500 });
 
-    const readLabels: string[] = [];
-    for (const r of (logs ?? []) as any[]) {
-      const name = pickFirst(r, ["reader_name", "name", "person_name", "worker_name"]);
-      const role = pickFirst(r, ["reader_role", "role"]);
-      const company = pickFirst(r, ["reader_company_name", "company_name", "partner_company_name"]);
-      const label = makeLabel(company, name, role);
-      if (label) readLabels.push(label);
-      else if (name) readLabels.push(name);
-    }
+    const readPersons = uniq(
+      (logs ?? []).map((r: any) => pickFirst(r, ["reader_name", "name", "person_name", "worker_name"])).filter(Boolean)
+    );
+    const readCompanies = uniq(
+      (logs ?? []).map((r: any) => pickFirst(r, ["reader_company_name", "company_name", "partner_company_name"])).filter(Boolean)
+    );
 
-    // 2) 「読むべき人/会社」候補：入場登録（協力会社・入場者）
-    // ※ テーブル列名差を吸収：会社名/氏名がどこにあっても拾う
+    // 入場登録（project_partner_entries）から “読むべき対象” を取る
+    // ※ テーブルが無い/列が違う場合でも落とさず empty を返す
     const { data: entrants, error: entErr } = await adminClient
       .from("project_partner_entries")
       .select("*")
@@ -100,36 +92,56 @@ export async function POST(req: Request) {
       .order("created_at", { ascending: false });
 
     if (entErr) {
-      // project_partner_entries が無い/使ってない現場でも落とさない
       return NextResponse.json({
         ok: true,
-        expected: [],
-        read: readLabels,
+        mode: "none",
+        expected_persons: [],
+        expected_companies: [],
+        read_persons: readPersons,
+        read_companies: readCompanies,
         unread: [],
         note: "project_partner_entries not available or query failed",
       });
     }
 
-    const expectedLabels: string[] = [];
-    for (const e of (entrants ?? []) as any[]) {
-      const company = pickFirst(e, ["partner_company_name", "company_name", "partner_name", "name"]);
-      const person = pickFirst(e, ["worker_name", "person_name", "entrant_name", "contact_name", "user_name", "name"]);
-      const role = pickFirst(e, ["role", "worker_role", "reader_role"]);
-      const label = makeLabel(company, person, role) || company || person;
-      if (label) expectedLabels.push(label);
+    const expectedPersons = uniq(
+      (entrants ?? [])
+        .map((e: any) => pickFirst(e, ["worker_name", "person_name", "entrant_name", "contact_name", "user_name", "name"]))
+        .filter(Boolean)
+    );
+
+    const expectedCompanies = uniq(
+      (entrants ?? []).map((e: any) => pickFirst(e, ["partner_company_name", "company_name", "partner_name"])).filter(Boolean)
+    );
+
+    // ルール：
+    // - 個人名が取れる現場 → 個人名で未読を出す（最優先）
+    // - 個人名が取れない現場 → 会社名で未読を出す（会社単位）
+    if (expectedPersons.length) {
+      const readSet = new Set(readPersons);
+      const unread = expectedPersons.filter((x) => !readSet.has(x));
+      return NextResponse.json({
+        ok: true,
+        mode: "person",
+        expected_persons: expectedPersons,
+        expected_companies: expectedCompanies,
+        read_persons: readPersons,
+        read_companies: readCompanies,
+        unread,
+      });
+    } else {
+      const readSet = new Set(readCompanies);
+      const unread = expectedCompanies.filter((x) => !readSet.has(x));
+      return NextResponse.json({
+        ok: true,
+        mode: "company",
+        expected_persons: expectedPersons,
+        expected_companies: expectedCompanies,
+        read_persons: readPersons,
+        read_companies: readCompanies,
+        unread,
+      });
     }
-
-    // uniq
-    const uniq = (arr: string[]) => Array.from(new Set(arr.map((x) => s(x).trim()).filter(Boolean)));
-
-    const expected = uniq(expectedLabels);
-    const read = uniq(readLabels);
-
-    // 未読 = expected - read（完全一致）
-    const readSet = new Set(read);
-    const unread = expected.filter((x) => !readSet.has(x));
-
-    return NextResponse.json({ ok: true, expected, read, unread });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
   }
