@@ -233,17 +233,22 @@ export default function KyReviewClient() {
   const [readLogs, setReadLogs] = useState<ReadLog[]>([]);
   const [readErr, setReadErr] = useState<string>("");
 
-  // ✅ 最新既読時刻（先頭=最新想定）
-  const latestReadAt = useMemo(() => {
-    const t = readLogs?.[0]?.created_at;
-    return t ? fmtDateTimeJp(t) : "";
-  }, [readLogs]);
+  // ✅ 未読（入場登録ベース）…追加（枠追加のみ）
+  const [unreadLoading, setUnreadLoading] = useState(false);
+  const [unreadList, setUnreadList] = useState<string[]>([]);
+  const [unreadMode, setUnreadMode] = useState<"person" | "company" | "none">("none");
+  const [unreadErr, setUnreadErr] = useState<string>("");
 
   const statusClass = useMemo(() => {
     if (status.type === "success") return "border border-emerald-200 bg-emerald-50 text-emerald-800";
     if (status.type === "error") return "border border-rose-200 bg-rose-50 text-rose-800";
     return "border border-slate-200 bg-slate-50 text-slate-700";
   }, [status.type]);
+
+  const latestReadAt = useMemo(() => {
+    const t = readLogs?.[0]?.created_at;
+    return t ? fmtDateTimeJp(t) : "";
+  }, [readLogs]);
 
   const loadReadLogs = useCallback(async () => {
     setReadErr("");
@@ -261,6 +266,31 @@ export default function KyReviewClient() {
       setReadLogs([]);
     } finally {
       setReadLoading(false);
+    }
+  }, [projectId, kyId]);
+
+  const loadUnread = useCallback(async () => {
+    setUnreadErr("");
+    setUnreadLoading(true);
+    try {
+      const { data } = await supabase.auth.getSession();
+      const accessToken = data?.session?.access_token;
+      if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
+
+      const j = await postJsonTry(["/api/ky-unread-list"], { projectId, kyId, accessToken });
+
+      const mode = s(j?.mode).trim();
+      if (mode === "person" || mode === "company" || mode === "none") setUnreadMode(mode);
+      else setUnreadMode("none");
+
+      const arr = Array.isArray(j?.unread) ? (j.unread as string[]) : [];
+      setUnreadList(arr.map((x) => s(x).trim()).filter(Boolean));
+    } catch (e: any) {
+      setUnreadErr(e?.message ?? "未読一覧の取得に失敗しました");
+      setUnreadList([]);
+      setUnreadMode("none");
+    } finally {
+      setUnreadLoading(false);
     }
   }, [projectId, kyId]);
 
@@ -324,11 +354,7 @@ export default function KyReviewClient() {
       setKy(kyData);
 
       const projectTargetId = kyData?.project_id || projectId;
-      const { data: pRow, error: pErr } = await supabase
-        .from("projects")
-        .select("id,name,contractor_name")
-        .eq("id", projectTargetId)
-        .maybeSingle();
+      const { data: pRow, error: pErr } = await supabase.from("projects").select("id,name,contractor_name").eq("id", projectTargetId).maybeSingle();
       if (pErr) throw pErr;
       setProject((pRow as any) ?? null);
 
@@ -405,19 +431,23 @@ export default function KyReviewClient() {
       setPathNowUrl(pathNow);
       setPathPrevUrl(pathPrev);
 
-      // ✅ 承認済みなら既読一覧も更新
+      // ✅ 承認済みなら既読/未読も読みに行く（完成形は崩さず、追加で取得）
       if (kyData?.is_approved) {
         await loadReadLogs();
+        await loadUnread();
       } else {
         setReadLogs([]);
         setReadErr("");
+        setUnreadList([]);
+        setUnreadErr("");
+        setUnreadMode("none");
       }
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "読み込みに失敗しました" });
     } finally {
       setLoading(false);
     }
-  }, [projectId, kyId, loadReadLogs]);
+  }, [projectId, kyId, loadReadLogs, loadUnread]);
 
   useEffect(() => {
     load();
@@ -631,11 +661,7 @@ export default function KyReviewClient() {
           <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm break-all">{publicUrl}</div>
 
           <div className="flex items-center gap-3 flex-wrap no-print">
-            <button
-              type="button"
-              onClick={onCopyPublicUrl}
-              className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
-            >
+            <button type="button" onClick={onCopyPublicUrl} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50">
               コピー
             </button>
             <a className="text-sm text-blue-600 underline" href={publicUrl} target="_blank" rel="noreferrer">
@@ -652,7 +678,7 @@ export default function KyReviewClient() {
               </button>
             ) : null}
 
-            {/* ✅ 既読一覧 更新 */}
+            {/* ✅ 既読一覧 更新（既存） */}
             <button
               type="button"
               onClick={loadReadLogs}
@@ -662,6 +688,18 @@ export default function KyReviewClient() {
               }`}
             >
               {readLoading ? "既読 更新中..." : "既読を更新"}
+            </button>
+
+            {/* ✅ 未読一覧 更新（追加：枠追加だけ） */}
+            <button
+              type="button"
+              onClick={loadUnread}
+              disabled={unreadLoading}
+              className={`rounded-lg border px-4 py-2 text-sm ${
+                unreadLoading ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
+              }`}
+            >
+              {unreadLoading ? "未読 更新中..." : "未読を更新"}
             </button>
           </div>
 
@@ -679,11 +717,10 @@ export default function KyReviewClient() {
             </div>
           ) : null}
 
-          {/* ✅ 既読一覧（表示強化：端末列＋最新時刻） */}
+          {/* ✅ 既読一覧（既存枠） */}
           <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2">
             <div className="flex items-center justify-between gap-2">
               <div className="text-sm font-semibold text-slate-800">既読状況</div>
-
               <div className="text-right">
                 <div className="text-sm text-slate-700">
                   既読：<span className="font-semibold">{readLogs.length}</span> 名
@@ -697,23 +734,48 @@ export default function KyReviewClient() {
             {readLogs.length ? (
               <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
                 <div className="grid grid-cols-12 gap-0 border-b border-slate-200 bg-slate-50 text-xs text-slate-600">
-                  <div className="col-span-4 px-3 py-2">氏名</div>
+                  <div className="col-span-5 px-3 py-2">氏名</div>
                   <div className="col-span-2 px-3 py-2">役割</div>
-                  <div className="col-span-2 px-3 py-2">端末</div>
-                  <div className="col-span-4 px-3 py-2">時刻</div>
+                  <div className="col-span-5 px-3 py-2">時刻</div>
                 </div>
-
                 {readLogs.map((r) => (
                   <div key={r.id} className="grid grid-cols-12 gap-0 border-b border-slate-100 text-sm">
-                    <div className="col-span-4 px-3 py-2 text-slate-800">{s(r.reader_name) || "（不明）"}</div>
+                    <div className="col-span-5 px-3 py-2 text-slate-800">{s(r.reader_name) || "（不明）"}</div>
                     <div className="col-span-2 px-3 py-2 text-slate-700">{s(r.reader_role) || "—"}</div>
-                    <div className="col-span-2 px-3 py-2 text-slate-700">{s(r.reader_device) || "—"}</div>
-                    <div className="col-span-4 px-3 py-2 text-slate-700">{r.created_at ? fmtDateTimeJp(r.created_at) : "—"}</div>
+                    <div className="col-span-5 px-3 py-2 text-slate-700">{r.created_at ? fmtDateTimeJp(r.created_at) : "—"}</div>
                   </div>
                 ))}
               </div>
             ) : (
               <div className="text-sm text-slate-600">（まだ既読がありません）</div>
+            )}
+          </div>
+
+          {/* ✅ 未読一覧（追加枠：完成形は崩さずカードを1枚追加） */}
+          <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-sm font-semibold text-rose-800">
+                未読状況（入場登録ベース）{unreadMode === "company" ? "：会社単位" : unreadMode === "person" ? "：個人単位" : ""}
+              </div>
+              <div className="text-sm text-rose-800">
+                未読：<span className="font-semibold">{unreadList.length}</span>
+              </div>
+            </div>
+
+            {unreadErr ? <div className="text-xs text-rose-700">{unreadErr}</div> : null}
+
+            {unreadLoading ? (
+              <div className="text-sm text-rose-700">（未読一覧 更新中...）</div>
+            ) : unreadList.length ? (
+              <div className="rounded-lg border border-rose-200 bg-white p-3">
+                <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                  {unreadList.map((x, i) => (
+                    <li key={`${x}-${i}`}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <div className="text-sm text-rose-700">（未読はありません）</div>
             )}
           </div>
 
@@ -845,9 +907,7 @@ export default function KyReviewClient() {
             onClick={onRegenerateAi}
             disabled={aiGenerating || acting || !!ky?.is_approved}
             className={`rounded-lg border px-4 py-2 text-sm no-print ${
-              aiGenerating || acting || !!ky?.is_approved
-                ? "border-slate-300 bg-slate-100 text-slate-400"
-                : "border-slate-300 bg-white hover:bg-slate-50"
+              aiGenerating || acting || !!ky?.is_approved ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
             }`}
           >
             {!!ky?.is_approved ? "承認済み（再生成不可）" : aiGenerating ? "AI補足 生成中..." : "AI補足 再生成"}
