@@ -35,6 +35,7 @@ export default function ProjectsPage() {
   const [loading, setLoading] = useState(false);
   const [rows, setRows] = useState<Project[]>([]);
   const [status, setStatus] = useState<Status>({ type: null, text: "" });
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -42,6 +43,17 @@ export default function ProjectsPage() {
     async function load() {
       setLoading(true);
       setStatus({ type: null, text: "" });
+
+      // ✅ ログイン状態チェック（未ログインなら最上部で注意を出す）
+      const { data: sessData, error: sessErr } = await supabase.auth.getSession();
+      if (cancelled) return;
+
+      if (sessErr) {
+        // セッション取得失敗は一旦「未ログイン扱い」にして注意表示
+        setIsLoggedIn(false);
+      } else {
+        setIsLoggedIn(!!sessData.session);
+      }
 
       const { data, error } = await supabase
         .from("projects")
@@ -82,6 +94,44 @@ export default function ProjectsPage() {
           {loading ? "読み込み中..." : `${rows.length}件（稼働 ${activeCount}件）`}
         </div>
       </div>
+
+      {isLoggedIn === false && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: 12,
+            border: "1px solid #ffeeba",
+            borderRadius: 12,
+            background: "#fff3cd",
+          }}
+        >
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <p style={{ margin: 0, color: "#856404", fontWeight: 700 }}>
+              ⚠ ログインしていません。編集・保存はできません。
+            </p>
+            <div style={{ marginLeft: "auto" }}>
+              <Link
+                href="/login"
+                style={{
+                  padding: "8px 10px",
+                  borderRadius: 12,
+                  border: "1px solid #ddd",
+                  textDecoration: "none",
+                  background: "#fff",
+                  color: "#111",
+                  fontWeight: 700,
+                  fontSize: 12,
+                }}
+              >
+                ログインへ
+              </Link>
+            </div>
+          </div>
+          <p style={{ margin: "6px 0 0 0", color: "#856404", fontSize: 12, opacity: 0.9 }}>
+            右上の「ログイン」からもログインできます。
+          </p>
+        </div>
+      )}
 
       {status.type && (
         <div
