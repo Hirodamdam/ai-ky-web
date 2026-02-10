@@ -233,7 +233,7 @@ export default function KyReviewClient() {
   const [readLogs, setReadLogs] = useState<ReadLog[]>([]);
   const [readErr, setReadErr] = useState<string>("");
 
-  // ✅ 未読（入場登録ベース）…追加（枠追加のみ）
+  // ✅ 未読（入場登録ベース）
   const [unreadLoading, setUnreadLoading] = useState(false);
   const [unreadList, setUnreadList] = useState<string[]>([]);
   const [unreadMode, setUnreadMode] = useState<"person" | "company" | "none">("none");
@@ -354,7 +354,11 @@ export default function KyReviewClient() {
       setKy(kyData);
 
       const projectTargetId = kyData?.project_id || projectId;
-      const { data: pRow, error: pErr } = await supabase.from("projects").select("id,name,contractor_name").eq("id", projectTargetId).maybeSingle();
+      const { data: pRow, error: pErr } = await supabase
+        .from("projects")
+        .select("id,name,contractor_name")
+        .eq("id", projectTargetId)
+        .maybeSingle();
       if (pErr) throw pErr;
       setProject((pRow as any) ?? null);
 
@@ -431,7 +435,7 @@ export default function KyReviewClient() {
       setPathNowUrl(pathNow);
       setPathPrevUrl(pathPrev);
 
-      // ✅ 承認済みなら既読/未読も読みに行く（完成形は崩さず、追加で取得）
+      // ✅ 承認済みなら既読/未読も読みに行く
       if (kyData?.is_approved) {
         await loadReadLogs();
         await loadUnread();
@@ -465,6 +469,7 @@ export default function KyReviewClient() {
     window.print();
   }, []);
 
+  // ✅ 承認 → 公開リンク発行 → LINEへ共有遷移
   const onApprove = useCallback(async () => {
     setStatus({ type: null, text: "" });
     setActing(true);
@@ -473,16 +478,44 @@ export default function KyReviewClient() {
       const accessToken = data?.session?.access_token;
       if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
 
-      await postJsonTry(["/api/ky-approve"], { projectId, kyId, accessToken });
+      // 承認（公開トークン発行）
+      const j = await postJsonTry(["/api/ky-approve"], { projectId, kyId, accessToken });
 
-      setStatus({ type: "success", text: "承認しました（公開リンクを発行しました）" });
+      // APIが token を返す場合はそれを優先
+      let token = s(j?.public_token || j?.token || j?.publicToken).trim();
+
+      // 返ってこない実装でも確実に拾う（DBから取り直す）
+      if (!token) {
+        const { data: row, error } = await supabase
+          .from("ky_entries")
+          .select("public_token")
+          .eq("id", kyId)
+          .maybeSingle();
+        if (error) throw error;
+        token = s((row as any)?.public_token).trim();
+      }
+
+      if (!token) throw new Error("公開トークンが取得できませんでした（public_tokenが空です）。");
+
+      const origin = typeof window !== "undefined" ? window.location.origin : "";
+      const url = `${origin}/ky/public/${token}`;
+
+      const msg = `KY承認しました\n${project?.name ? `工事：${project.name}\n` : ""}${url}`;
+      const lineUrl = `https://line.me/R/msg/text/?${encodeURIComponent(msg)}`;
+
+      setStatus({ type: "success", text: "承認しました（LINEを開きます）" });
+
+      // 戻ってきた時用に画面も最新化
       await load();
+
+      // ✅ 最後に遷移
+      window.location.href = lineUrl;
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "承認に失敗しました" });
     } finally {
       setActing(false);
     }
-  }, [projectId, kyId, load]);
+  }, [projectId, kyId, load, project?.name]);
 
   const onUnapprove = useCallback(async () => {
     setStatus({ type: null, text: "" });
@@ -678,7 +711,6 @@ export default function KyReviewClient() {
               </button>
             ) : null}
 
-            {/* ✅ 既読一覧 更新（既存） */}
             <button
               type="button"
               onClick={loadReadLogs}
@@ -690,7 +722,6 @@ export default function KyReviewClient() {
               {readLoading ? "既読 更新中..." : "既読を更新"}
             </button>
 
-            {/* ✅ 未読一覧 更新（追加：枠追加だけ） */}
             <button
               type="button"
               onClick={loadUnread}
@@ -717,7 +748,6 @@ export default function KyReviewClient() {
             </div>
           ) : null}
 
-          {/* ✅ 既読一覧（既存枠） */}
           <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2">
             <div className="flex items-center justify-between gap-2">
               <div className="text-sm font-semibold text-slate-800">既読状況</div>
@@ -751,7 +781,6 @@ export default function KyReviewClient() {
             )}
           </div>
 
-          {/* ✅ 未読一覧（追加枠：完成形は崩さずカードを1枚追加） */}
           <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 space-y-2">
             <div className="flex items-center justify-between gap-2">
               <div className="text-sm font-semibold text-rose-800">
@@ -838,7 +867,6 @@ export default function KyReviewClient() {
         )}
       </div>
 
-      {/* ✅ 2ページ目へ（写真ブロックを2ページ目に固定） */}
       <div className="print-page-break" />
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
@@ -895,7 +923,6 @@ export default function KyReviewClient() {
         </div>
       </div>
 
-      {/* ✅ 3ページ目へ（AI補足ブロックを3ページ目に固定） */}
       <div className="print-page-break" />
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">

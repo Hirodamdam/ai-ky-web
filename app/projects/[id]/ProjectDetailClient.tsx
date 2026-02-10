@@ -28,6 +28,15 @@ type PartnerRow = {
   created_at: string | null;
 };
 
+type EntrantRow = {
+  id: string;
+  project_id: string | null;
+  partner_entry_id: string | null;
+  entrant_no: string | null;
+  entrant_name: string | null;
+  created_at?: string | null;
+};
+
 function fmtDateTime(iso: string | null | undefined): string {
   if (!iso) return "";
   try {
@@ -70,6 +79,17 @@ export default function ProjectDetailClient() {
   const [partners, setPartners] = useState<PartnerRow[]>([]);
   const [partnerInput, setPartnerInput] = useState("");
 
+  // ✅ 個人入場者（会社別）
+  const [selectedPartnerEntryId, setSelectedPartnerEntryId] = useState<string>("");
+  const [entrants, setEntrants] = useState<EntrantRow[]>([]);
+  const [entrantName, setEntrantName] = useState("");
+  const [entrantNo, setEntrantNo] = useState("");
+  const [entrantLoading, setEntrantLoading] = useState(false);
+
+  const selectedPartner = useMemo(() => {
+    return partners.find((p) => p.id === selectedPartnerEntryId) ?? null;
+  }, [partners, selectedPartnerEntryId]);
+
   const refetch = useCallback(async () => {
     if (!projectId) {
       if (mountedRef.current) setLoading(false);
@@ -110,9 +130,63 @@ export default function ProjectDetailClient() {
     }
   }, [projectId]);
 
+  const fetchEntrants = useCallback(
+    async (partnerEntryId: string) => {
+      if (!projectId || !partnerEntryId) {
+        if (mountedRef.current) setEntrants([]);
+        return;
+      }
+      if (mountedRef.current) setEntrantLoading(true);
+      try {
+        const { data, error } = await (supabase as any)
+          .from("project_entrant_entries")
+          .select("id,project_id,partner_entry_id,entrant_no,entrant_name,created_at")
+          .eq("project_id", projectId)
+          .eq("partner_entry_id", partnerEntryId)
+          .order("created_at", { ascending: false });
+
+        if (error) throw error;
+
+        const safe = Array.isArray(data) ? (data as EntrantRow[]) : [];
+        if (mountedRef.current) setEntrants(safe);
+      } catch (e: any) {
+        if (mountedRef.current) {
+          setEntrants([]);
+          setStatus({ type: "error", text: e?.message ?? "入場者の読み込みに失敗しました" });
+        }
+      } finally {
+        if (mountedRef.current) setEntrantLoading(false);
+      }
+    },
+    [projectId]
+  );
+
   useEffect(() => {
     refetch();
   }, [refetch]);
+
+  // ✅ 会社一覧が変わったら、選択会社を自動セット（未選択時のみ）
+  useEffect(() => {
+    if (!mountedRef.current) return;
+    if (!partners.length) {
+      setSelectedPartnerEntryId("");
+      setEntrants([]);
+      return;
+    }
+    if (!selectedPartnerEntryId) {
+      const firstId = partners[0]?.id ?? "";
+      setSelectedPartnerEntryId(firstId);
+      if (firstId) fetchEntrants(firstId);
+      return;
+    }
+    // 選択中の会社が消えた場合
+    const exists = partners.some((p) => p.id === selectedPartnerEntryId);
+    if (!exists) {
+      const firstId = partners[0]?.id ?? "";
+      setSelectedPartnerEntryId(firstId);
+      if (firstId) fetchEntrants(firstId);
+    }
+  }, [partners, selectedPartnerEntryId, fetchEntrants]);
 
   const onRegisterPartner = useCallback(async () => {
     setStatus({ type: null, text: "" });
@@ -123,24 +197,107 @@ export default function ProjectDetailClient() {
     }
 
     try {
-      const { error } = await (supabase as any).from("project_partner_entries").insert({
-        project_id: projectId,
-        partner_company_name: name,
-      });
+      const { data, error } = await (supabase as any)
+        .from("project_partner_entries")
+        .insert({
+          project_id: projectId,
+          partner_company_name: name,
+        })
+        .select("id")
+        .maybeSingle();
 
       if (error) throw error;
 
       setPartnerInput("");
-      setStatus({ type: "success", text: "入場登録しました" });
+      setStatus({ type: "success", text: "協力会社を入場登録しました" });
       await refetch();
+
+      // ✅ 追加した会社を選択状態に（取れた場合）
+      const newId = s((data as any)?.id).trim();
+      if (newId) {
+        setSelectedPartnerEntryId(newId);
+        await fetchEntrants(newId);
+      }
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "入場登録に失敗しました" });
     }
-  }, [partnerInput, projectId, refetch]);
+  }, [partnerInput, projectId, refetch, fetchEntrants]);
 
   const onReload = useCallback(async () => {
     await refetch();
-  }, [refetch]);
+    if (selectedPartnerEntryId) await fetchEntrants(selectedPartnerEntryId);
+  }, [refetch, selectedPartnerEntryId, fetchEntrants]);
+
+  const onChangeSelectedPartner = useCallback(
+    async (nextId: string) => {
+      setSelectedPartnerEntryId(nextId);
+      setStatus({ type: null, text: "" });
+      await fetchEntrants(nextId);
+    },
+    [fetchEntrants]
+  );
+
+  const onAddEntrant = useCallback(async () => {
+    setStatus({ type: null, text: "" });
+
+    const pid = selectedPartnerEntryId;
+    if (!pid) {
+      setStatus({ type: "error", text: "協力会社を選択してください" });
+      return;
+    }
+
+    const name = entrantName.trim();
+    const no = entrantNo.trim();
+
+    if (!name) {
+      setStatus({ type: "error", text: "入場者氏名を入力してください" });
+      return;
+    }
+
+    try {
+      const { error } = await (supabase as any).from("project_entrant_entries").insert({
+        project_id: projectId,
+        partner_entry_id: pid,
+        entrant_name: name,
+        entrant_no: no || null,
+      });
+      if (error) throw error;
+
+      setEntrantName("");
+      setEntrantNo("");
+      setStatus({ type: "success", text: "入場者を登録しました" });
+      await fetchEntrants(pid);
+    } catch (e: any) {
+      setStatus({ type: "error", text: e?.message ?? "入場者登録に失敗しました" });
+    }
+  }, [projectId, selectedPartnerEntryId, entrantName, entrantNo, fetchEntrants]);
+
+  const onDeleteEntrant = useCallback(
+    async (entrantId: string) => {
+      setStatus({ type: null, text: "" });
+      const pid = selectedPartnerEntryId;
+      if (!pid) return;
+
+      const ok = window.confirm("この入場者を削除しますか？");
+      if (!ok) return;
+
+      try {
+        const { error } = await (supabase as any)
+          .from("project_entrant_entries")
+          .delete()
+          .eq("id", entrantId)
+          .eq("project_id", projectId);
+
+        if (error) throw error;
+
+        setStatus({ type: "success", text: "入場者を削除しました" });
+        await fetchEntrants(pid);
+      } catch (e: any) {
+        setStatus({ type: "error", text: e?.message ?? "削除に失敗しました" });
+      }
+    },
+    [projectId, selectedPartnerEntryId, fetchEntrants]
+  );
 
   if (loading) {
     return (
@@ -253,9 +410,7 @@ export default function ProjectDetailClient() {
           </div>
         </div>
 
-        <div className="text-xs text-slate-500">
-          ※ 写真の登録は「工事情報編集」で行います（ここは表示のみ）。
-        </div>
+        <div className="text-xs text-slate-500">※ 写真の登録は「工事情報編集」で行います（ここは表示のみ）。</div>
       </div>
 
       {/* 入場済み協力会社 */}
@@ -310,6 +465,136 @@ export default function ProjectDetailClient() {
         </div>
 
         <div className="mt-2 text-xs text-slate-500">※ DBの列は partner_company_name です（company_name は存在しません）。</div>
+      </div>
+
+      {/* ✅ 会社別：入場者（個人）登録 */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="text-sm font-semibold text-slate-800">入場者（作業員）登録（会社別）</div>
+
+        <div className="grid grid-cols-1 md:grid-cols-[220px_1fr] gap-3 items-start">
+          <div className="space-y-2">
+            <div className="text-xs text-slate-600 font-semibold">協力会社を選択</div>
+            <select
+              value={selectedPartnerEntryId}
+              onChange={(e) => onChangeSelectedPartner(e.target.value)}
+              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+              disabled={!partners.length}
+            >
+              {!partners.length ? (
+                <option value="">（先に協力会社を入場登録してください）</option>
+              ) : (
+                partners.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.partner_company_name ?? "（不明）"}
+                  </option>
+                ))
+              )}
+            </select>
+
+            <div className="text-xs text-slate-500">
+              選択中：{selectedPartner?.partner_company_name ?? "（未選択）"}
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <div className="text-xs text-slate-600 font-semibold">入場者を追加</div>
+
+            <div className="grid grid-cols-1 md:grid-cols-[1fr_160px_120px] gap-2">
+              <input
+                value={entrantName}
+                onChange={(e) => setEntrantName(e.target.value)}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                placeholder="氏名（例：山田 太郎）"
+                disabled={!selectedPartnerEntryId}
+              />
+              <input
+                value={entrantNo}
+                onChange={(e) => setEntrantNo(e.target.value)}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                placeholder="番号（任意）"
+                disabled={!selectedPartnerEntryId}
+              />
+              <button
+                onClick={onAddEntrant}
+                className="rounded-lg bg-black px-4 py-2 text-sm text-white hover:bg-slate-900 disabled:opacity-50"
+                disabled={!selectedPartnerEntryId}
+              >
+                追加
+              </button>
+            </div>
+
+            <div className="text-xs text-slate-500">
+              ※ 会社を選んだ状態で、氏名を入れて「追加」。会社別に一覧管理します。
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-sm font-semibold text-slate-800">
+              入場者一覧（{selectedPartner?.partner_company_name ?? "未選択"}）
+            </div>
+            <button
+              onClick={() => selectedPartnerEntryId && fetchEntrants(selectedPartnerEntryId)}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs hover:bg-slate-50 disabled:opacity-50"
+              disabled={!selectedPartnerEntryId}
+            >
+              一覧を再読込
+            </button>
+          </div>
+
+          <div className="mt-2 overflow-x-auto">
+            <table className="min-w-full text-sm">
+              <thead>
+                <tr className="border-b border-slate-200">
+                  <th className="py-2 text-left text-slate-600 font-semibold">氏名</th>
+                  <th className="py-2 text-left text-slate-600 font-semibold">番号</th>
+                  <th className="py-2 text-left text-slate-600 font-semibold">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {!selectedPartnerEntryId ? (
+                  <tr>
+                    <td className="py-3 text-slate-500" colSpan={3}>
+                      （協力会社を選択してください）
+                    </td>
+                  </tr>
+                ) : entrantLoading ? (
+                  <tr>
+                    <td className="py-3 text-slate-500" colSpan={3}>
+                      （読み込み中…）
+                    </td>
+                  </tr>
+                ) : entrants.length ? (
+                  entrants.map((r) => (
+                    <tr key={r.id} className="border-b border-slate-200/60">
+                      <td className="py-2 text-slate-900">{r.entrant_name ?? "（不明）"}</td>
+                      <td className="py-2 text-slate-700">{r.entrant_no ?? "—"}</td>
+                      <td className="py-2">
+                        <button
+                          onClick={() => onDeleteEntrant(r.id)}
+                          className="rounded-lg border border-rose-300 bg-white px-3 py-1.5 text-xs text-rose-700 hover:bg-rose-50"
+                        >
+                          削除
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td className="py-3 text-slate-500" colSpan={3}>
+                      （この会社の入場者がまだいません）
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="mt-2 text-xs text-slate-500">
+            ※ DB: project_entrant_entries（partner_entry_idで会社別に紐付け）
+          </div>
+        </div>
       </div>
 
       <div className="flex items-center gap-2">
