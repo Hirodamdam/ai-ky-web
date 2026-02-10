@@ -58,7 +58,7 @@ function degToDirJp(deg: number | null | undefined): string {
   return dirs[idx];
 }
 
-// ✅ JSTのYYYY-MM-DD（api/weather が date 必須の実装に対応）
+// ✅ JSTのYYYY-MM-DD
 function ymdJst(d: Date): string {
   const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
   const y = jst.getUTCFullYear();
@@ -102,6 +102,49 @@ export default function ProjectEditClient() {
   const [status, setStatus] = useState<Status>({ type: null, text: "" });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+
+  // ✅ ログイン状態
+  const [authChecked, setAuthChecked] = useState(false);
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [userLabel, setUserLabel] = useState<string>("");
+
+  useEffect(() => {
+    let unsub: any = null;
+
+    async function loadSession() {
+      try {
+        const { data } = await supabase.auth.getSession();
+        const user = data?.session?.user ?? null;
+        if (mountedRef.current) {
+          setIsLoggedIn(!!user);
+          setUserLabel(user?.email || user?.id || "");
+          setAuthChecked(true);
+        }
+      } catch {
+        if (mountedRef.current) {
+          setIsLoggedIn(false);
+          setUserLabel("");
+          setAuthChecked(true);
+        }
+      }
+
+      // 状態変化も追従
+      const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+        const user = session?.user ?? null;
+        setIsLoggedIn(!!user);
+        setUserLabel(user?.email || user?.id || "");
+      });
+      unsub = sub?.subscription;
+    }
+
+    loadSession();
+
+    return () => {
+      try {
+        unsub?.unsubscribe?.();
+      } catch {}
+    };
+  }, []);
 
   // 既存項目
   const [name, setName] = useState("");
@@ -191,12 +234,20 @@ export default function ProjectEditClient() {
   );
 
   const onPickSlopeFile = useCallback(async () => {
+    if (!isLoggedIn) {
+      setStatus({ type: "error", text: "ログインしてください（未ログインのためアップロードできません）" });
+      return;
+    }
     fileSlopeRef.current?.click();
-  }, []);
+  }, [isLoggedIn]);
 
   const onPickPathFile = useCallback(async () => {
+    if (!isLoggedIn) {
+      setStatus({ type: "error", text: "ログインしてください（未ログインのためアップロードできません）" });
+      return;
+    }
     filePathRef.current?.click();
-  }, []);
+  }, [isLoggedIn]);
 
   const onSlopeFileChange = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -261,7 +312,6 @@ export default function ProjectEditClient() {
     }
   }, []);
 
-  // ✅ /api/weather が「date必須」でも落ちない呼び方に統一（POST→別payload→GET の順で試す）
   const fetchWeatherPreview = useCallback(
     async (lat: number, lon: number) => {
       const date = ymdJst(new Date());
@@ -273,15 +323,12 @@ export default function ProjectEditClient() {
         let j: any = null;
         const bodyBase = { lat, lon, date };
 
-        // 1) まずは最小（lat/lon/date）
         try {
           j = await postJson("/api/weather", bodyBase);
         } catch {
-          // 2) projectId を要求する実装への保険
           try {
             j = await postJson("/api/weather", { ...bodyBase, projectId });
           } catch {
-            // 3) GET実装への保険（date必須）
             const qs = new URLSearchParams({
               lat: String(lat),
               lon: String(lon),
@@ -313,7 +360,6 @@ export default function ProjectEditClient() {
     [projectId]
   );
 
-  // 緯度経度が両方入ったら自動更新（デバウンス）
   useEffect(() => {
     const lat = toNumOrNull(latText);
     const lon = toNumOrNull(lonText);
@@ -351,10 +397,11 @@ export default function ProjectEditClient() {
   const onSave = useCallback(async () => {
     setStatus({ type: null, text: "" });
 
-    // ✅ 未ログイン保存を明確にブロック（現場で混乱しないようにする）
-    const { data: sessData, error: sessErr } = await supabase.auth.getSession();
-    if (sessErr || !sessData?.session) {
-      setStatus({ type: "error", text: "ログインしてから保存してください（未ログインのため保存できません）" });
+    // ✅ 保存直前に必ずセッション再確認（「ログイン状態が不明」を潰す）
+    const { data } = await supabase.auth.getSession();
+    const user = data?.session?.user ?? null;
+    if (!user) {
+      setStatus({ type: "error", text: "ログインしていません。右上の「ログイン」からログインしてください。" });
       return;
     }
 
@@ -370,10 +417,8 @@ export default function ProjectEditClient() {
       name: name.trim() || null,
       contractor_name: contractorName.trim() || null,
       address: address.trim() || null,
-
       lat,
       lon,
-
       slope_camera_snapshot_url: slopeUrl.trim() || null,
       path_camera_snapshot_url: pathUrl.trim() || null,
     };
@@ -405,27 +450,44 @@ export default function ProjectEditClient() {
     );
   }
 
+  const canEdit = authChecked ? isLoggedIn : false;
+
   return (
     <div className="p-4 space-y-4">
       <div className="flex items-start justify-between gap-3">
         <div>
           <div className="text-lg font-bold text-slate-900">工事情報編集</div>
           <div className="mt-1 text-sm text-slate-600">プロジェクトID：{projectId}</div>
+          <div className="mt-1 text-xs text-slate-500">
+            ログイン状態：{authChecked ? (isLoggedIn ? `ログイン中（${userLabel || "user"}）` : "未ログイン") : "確認中..."}
+          </div>
         </div>
 
         <div className="flex items-center gap-2">
-          <Link href={`/projects/${projectId}`} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+          <Link
+            href={`/projects/${projectId}`}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+          >
             戻る
           </Link>
           <button
             onClick={onSave}
-            disabled={saving}
-            className={`rounded-lg px-3 py-2 text-sm text-white ${saving ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}
+            disabled={saving || !canEdit}
+            className={`rounded-lg px-3 py-2 text-sm text-white ${
+              saving || !canEdit ? "bg-slate-400" : "bg-black hover:bg-slate-900"
+            }`}
+            title={!canEdit ? "未ログインのため保存できません" : undefined}
           >
             {saving ? "保存中..." : "保存"}
           </button>
         </div>
       </div>
+
+      {!canEdit && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+          ⚠ ログインしていません。編集・保存はできません。右上の「ログイン」からログインしてください。
+        </div>
+      )}
 
       {status.type && (
         <div
@@ -445,7 +507,12 @@ export default function ProjectEditClient() {
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">工事名</div>
-          <input value={name} onChange={(e) => setName(e.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            disabled={!canEdit}
+            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+          />
         </div>
 
         <div className="space-y-2">
@@ -453,13 +520,19 @@ export default function ProjectEditClient() {
           <input
             value={contractorName}
             onChange={(e) => setContractorName(e.target.value)}
+            disabled={!canEdit}
             className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
           />
         </div>
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">場所（住所）</div>
-          <input value={address} onChange={(e) => setAddress(e.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+          <input
+            value={address}
+            onChange={(e) => setAddress(e.target.value)}
+            disabled={!canEdit}
+            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+          />
         </div>
       </div>
 
@@ -477,6 +550,7 @@ export default function ProjectEditClient() {
               <input
                 value={latText}
                 onChange={(e) => setLatText(e.target.value)}
+                disabled={!canEdit}
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
                 placeholder="例：31.590123"
                 inputMode="decimal"
@@ -488,6 +562,7 @@ export default function ProjectEditClient() {
               <input
                 value={lonText}
                 onChange={(e) => setLonText(e.target.value)}
+                disabled={!canEdit}
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
                 placeholder="例：130.551234"
                 inputMode="decimal"
@@ -499,15 +574,18 @@ export default function ProjectEditClient() {
             <button
               type="button"
               onClick={onUseCurrentLocation}
-              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+              disabled={!canEdit}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
             >
               現在地から入力
             </button>
             <button
               type="button"
               onClick={onManualWeatherFetch}
-              disabled={weatherLoading}
-              className={`rounded-lg px-3 py-2 text-sm text-white ${weatherLoading ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}
+              disabled={weatherLoading || !canEdit}
+              className={`rounded-lg px-3 py-2 text-sm text-white ${
+                weatherLoading || !canEdit ? "bg-slate-400" : "bg-black hover:bg-slate-900"
+              }`}
             >
               {weatherLoading ? "取得中..." : "気象を確認"}
             </button>
@@ -516,8 +594,7 @@ export default function ProjectEditClient() {
 
         <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
           <div className="text-xs text-slate-600 mb-2">
-            気象プレビュー（9/12/15）{" "}
-            <span className="text-slate-500">（date: {ymdJst(new Date())}）</span>
+            気象プレビュー（9/12/15） <span className="text-slate-500">（date: {ymdJst(new Date())}）</span>
           </div>
 
           {weatherSlots.length ? (
@@ -529,7 +606,8 @@ export default function ProjectEditClient() {
                   <div className="mt-2 text-xs text-slate-600 space-y-1">
                     <div>気温：{slot.temperature_c ?? "—"} ℃</div>
                     <div>
-                      風：{degToDirJp(slot.wind_direction_deg)} {slot.wind_speed_ms != null ? `${slot.wind_speed_ms} m/s` : "—"}
+                      風：{degToDirJp(slot.wind_direction_deg)}{" "}
+                      {slot.wind_speed_ms != null ? `${slot.wind_speed_ms} m/s` : "—"}
                     </div>
                     <div>降水：{slot.precipitation_mm ?? "—"} mm</div>
                   </div>
@@ -562,13 +640,18 @@ export default function ProjectEditClient() {
               <input
                 value={slopeUrl}
                 onChange={(e) => setSlopeUrl(e.target.value)}
+                disabled={!canEdit}
                 placeholder="https://...（未設置なら空欄OK）"
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm bg-white"
               />
             </div>
 
             <div className="flex gap-2">
-              <button onClick={onPickSlopeFile} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+              <button
+                onClick={onPickSlopeFile}
+                disabled={!canEdit}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+              >
                 写真をアップロード
               </button>
             </div>
@@ -595,13 +678,18 @@ export default function ProjectEditClient() {
               <input
                 value={pathUrl}
                 onChange={(e) => setPathUrl(e.target.value)}
+                disabled={!canEdit}
                 placeholder="https://...（未設置なら空欄OK）"
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm bg-white"
               />
             </div>
 
             <div className="flex gap-2">
-              <button onClick={onPickPathFile} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+              <button
+                onClick={onPickPathFile}
+                disabled={!canEdit}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+              >
                 写真をアップロード
               </button>
             </div>
