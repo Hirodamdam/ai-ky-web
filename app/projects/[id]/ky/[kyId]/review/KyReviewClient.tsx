@@ -435,7 +435,6 @@ export default function KyReviewClient() {
       setPathNowUrl(pathNow);
       setPathPrevUrl(pathPrev);
 
-      // ✅ 承認済みなら既読/未読も読みに行く
       if (kyData?.is_approved) {
         await loadReadLogs();
         await loadUnread();
@@ -469,7 +468,7 @@ export default function KyReviewClient() {
     window.print();
   }, []);
 
-  // ✅ 承認 → 公開リンク発行 → LINEへ共有遷移
+  // ✅ 承認 → 公開リンク発行 → LINE共有へ
   const onApprove = useCallback(async () => {
     setStatus({ type: null, text: "" });
     setActing(true);
@@ -478,23 +477,14 @@ export default function KyReviewClient() {
       const accessToken = data?.session?.access_token;
       if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
 
-      // 承認（公開トークン発行）
       const j = await postJsonTry(["/api/ky-approve"], { projectId, kyId, accessToken });
 
-      // APIが token を返す場合はそれを優先
       let token = s(j?.public_token || j?.token || j?.publicToken).trim();
-
-      // 返ってこない実装でも確実に拾う（DBから取り直す）
       if (!token) {
-        const { data: row, error } = await supabase
-          .from("ky_entries")
-          .select("public_token")
-          .eq("id", kyId)
-          .maybeSingle();
+        const { data: row, error } = await supabase.from("ky_entries").select("public_token").eq("id", kyId).maybeSingle();
         if (error) throw error;
         token = s((row as any)?.public_token).trim();
       }
-
       if (!token) throw new Error("公開トークンが取得できませんでした（public_tokenが空です）。");
 
       const origin = typeof window !== "undefined" ? window.location.origin : "";
@@ -504,11 +494,7 @@ export default function KyReviewClient() {
       const lineUrl = `https://line.me/R/msg/text/?${encodeURIComponent(msg)}`;
 
       setStatus({ type: "success", text: "承認しました（LINEを開きます）" });
-
-      // 戻ってきた時用に画面も最新化
       await load();
-
-      // ✅ 最後に遷移
       window.location.href = lineUrl;
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "承認に失敗しました" });
@@ -844,6 +830,27 @@ export default function KyReviewClient() {
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.partner_company_name ?? "（未入力）"}</div>
       </div>
 
+      {/* ✅ 人が入力した本文（追加：ここが「作業内容が出ない」原因だった） */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
+        <div className="text-sm font-semibold text-slate-800">作業内容</div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.work_detail).trim() || "（未入力）"}</div>
+      </div>
+
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
+        <div className="text-sm font-semibold text-slate-800">危険予知</div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.hazards).trim() || "（未入力）"}</div>
+      </div>
+
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
+        <div className="text-sm font-semibold text-slate-800">対策</div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.countermeasures).trim() || "（未入力）"}</div>
+      </div>
+
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
+        <div className="text-sm font-semibold text-slate-800">第三者（墓参者）</div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.third_party_level).trim() || "（未入力）"}</div>
+      </div>
+
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
         <div className="text-sm font-semibold text-slate-800">気象（9/12/15）</div>
         {weatherSlots.length ? (
@@ -867,6 +874,7 @@ export default function KyReviewClient() {
         )}
       </div>
 
+      {/* ✅ 2ページ目へ（写真ブロックを2ページ目に固定） */}
       <div className="print-page-break" />
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
@@ -923,6 +931,7 @@ export default function KyReviewClient() {
         </div>
       </div>
 
+      {/* ✅ 3ページ目へ（AI補足ブロックを3ページ目に固定） */}
       <div className="print-page-break" />
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
