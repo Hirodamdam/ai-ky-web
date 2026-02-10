@@ -49,7 +49,7 @@ function fmtDateTime(iso: string | null | undefined): string {
     const ss = String(d.getSeconds()).padStart(2, "0");
     return `${y}/${m}/${day} ${hh}:${mm}:${ss}`;
   } catch {
-    return iso;
+    return String(iso ?? "");
   }
 }
 
@@ -78,6 +78,9 @@ export default function ProjectDetailClient() {
   const [project, setProject] = useState<Project | null>(null);
   const [partners, setPartners] = useState<PartnerRow[]>([]);
   const [partnerInput, setPartnerInput] = useState("");
+
+  // ✅ 協力会社削除状態
+  const [deletingPartnerId, setDeletingPartnerId] = useState<string | null>(null);
 
   // ✅ 個人入場者（会社別）
   const [selectedPartnerEntryId, setSelectedPartnerEntryId] = useState<string>("");
@@ -299,6 +302,56 @@ export default function ProjectDetailClient() {
     [projectId, selectedPartnerEntryId, fetchEntrants]
   );
 
+  // ✅ 協力会社（入場登録）の削除
+  const onDeletePartner = useCallback(
+    async (partnerEntryId: string) => {
+      setStatus({ type: null, text: "" });
+
+      // 念のためログイン確認（未ログインでの削除事故防止）
+      const { data: sess } = await supabase.auth.getSession();
+      if (!sess?.session?.user) {
+        setStatus({ type: "error", text: "ログインしてください（未ログインのため削除できません）" });
+        return;
+      }
+
+      const target = partners.find((p) => p.id === partnerEntryId);
+      const label = target?.partner_company_name ?? "この協力会社";
+
+      const ok = window.confirm(`${label} の入場登録を削除しますか？（運用前の整理用）`);
+      if (!ok) return;
+
+      setDeletingPartnerId(partnerEntryId);
+      try {
+        const { error } = await (supabase as any)
+          .from("project_partner_entries")
+          .delete()
+          .eq("id", partnerEntryId)
+          .eq("project_id", projectId);
+
+        if (error) throw error;
+
+        // 表示整合：選択中会社を削除したら、入場者一覧も含めて切替
+        const wasSelected = selectedPartnerEntryId === partnerEntryId;
+
+        setStatus({ type: "success", text: "協力会社の入場登録を削除しました" });
+        await refetch();
+
+        if (wasSelected) {
+          // refetch後の最新partnersから先頭へ
+          const nextId = (partners.filter((p) => p.id !== partnerEntryId)[0]?.id ?? "").trim();
+          setSelectedPartnerEntryId(nextId);
+          if (nextId) await fetchEntrants(nextId);
+          else setEntrants([]);
+        }
+      } catch (e: any) {
+        setStatus({ type: "error", text: e?.message ?? "削除に失敗しました" });
+      } finally {
+        setDeletingPartnerId(null);
+      }
+    },
+    [partners, projectId, refetch, selectedPartnerEntryId, fetchEntrants]
+  );
+
   if (loading) {
     return (
       <div className="p-4">
@@ -443,6 +496,7 @@ export default function ProjectDetailClient() {
               <tr className="border-b border-slate-200">
                 <th className="py-2 text-left text-slate-600 font-semibold">協力会社</th>
                 <th className="py-2 text-left text-slate-600 font-semibold">登録日時</th>
+                <th className="py-2 text-left text-slate-600 font-semibold">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -451,11 +505,21 @@ export default function ProjectDetailClient() {
                   <tr key={r.id} className="border-b border-slate-100">
                     <td className="py-2 text-slate-900">{r.partner_company_name ?? "（不明）"}</td>
                     <td className="py-2 text-slate-700">{fmtDateTime(r.created_at)}</td>
+                    <td className="py-2">
+                      <button
+                        onClick={() => onDeletePartner(r.id)}
+                        disabled={deletingPartnerId === r.id}
+                        className="rounded-lg border border-rose-300 bg-white px-3 py-1.5 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                        title="運用前の誤登録を削除できます"
+                      >
+                        {deletingPartnerId === r.id ? "削除中..." : "削除"}
+                      </button>
+                    </td>
                   </tr>
                 ))
               ) : (
                 <tr>
-                  <td className="py-3 text-slate-500" colSpan={2}>
+                  <td className="py-3 text-slate-500" colSpan={3}>
                     （入場済み協力会社がありません）
                   </td>
                 </tr>
@@ -491,9 +555,7 @@ export default function ProjectDetailClient() {
               )}
             </select>
 
-            <div className="text-xs text-slate-500">
-              選択中：{selectedPartner?.partner_company_name ?? "（未選択）"}
-            </div>
+            <div className="text-xs text-slate-500">選択中：{selectedPartner?.partner_company_name ?? "（未選択）"}</div>
           </div>
 
           <div className="space-y-2">
@@ -523,17 +585,13 @@ export default function ProjectDetailClient() {
               </button>
             </div>
 
-            <div className="text-xs text-slate-500">
-              ※ 会社を選んだ状態で、氏名を入れて「追加」。会社別に一覧管理します。
-            </div>
+            <div className="text-xs text-slate-500">※ 会社を選んだ状態で、氏名を入れて「追加」。会社別に一覧管理します。</div>
           </div>
         </div>
 
         <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
           <div className="flex items-center justify-between gap-2">
-            <div className="text-sm font-semibold text-slate-800">
-              入場者一覧（{selectedPartner?.partner_company_name ?? "未選択"}）
-            </div>
+            <div className="text-sm font-semibold text-slate-800">入場者一覧（{selectedPartner?.partner_company_name ?? "未選択"}）</div>
             <button
               onClick={() => selectedPartnerEntryId && fetchEntrants(selectedPartnerEntryId)}
               className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs hover:bg-slate-50 disabled:opacity-50"
@@ -591,9 +649,7 @@ export default function ProjectDetailClient() {
             </table>
           </div>
 
-          <div className="mt-2 text-xs text-slate-500">
-            ※ DB: project_entrant_entries（partner_entry_idで会社別に紐付け）
-          </div>
+          <div className="mt-2 text-xs text-slate-500">※ DB: project_entrant_entries（partner_entry_idで会社別に紐付け）</div>
         </div>
       </div>
 
