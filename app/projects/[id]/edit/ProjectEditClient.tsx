@@ -351,6 +351,13 @@ export default function ProjectEditClient() {
   const onSave = useCallback(async () => {
     setStatus({ type: null, text: "" });
 
+    // ✅ 未ログイン保存を明確にブロック（現場で混乱しないようにする）
+    const { data: sessData, error: sessErr } = await supabase.auth.getSession();
+    if (sessErr || !sessData?.session) {
+      setStatus({ type: "error", text: "ログインしてから保存してください（未ログインのため保存できません）" });
+      return;
+    }
+
     const lat = toNumOrNull(latText);
     const lon = toNumOrNull(lonText);
 
