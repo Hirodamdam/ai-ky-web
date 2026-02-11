@@ -35,25 +35,56 @@ export default function ProjectsPage() {
   const [loading, setLoading] = useState(false);
   const [rows, setRows] = useState<Project[]>([]);
   const [status, setStatus] = useState<Status>({ type: null, text: "" });
-  const [isLoggedIn, setIsLoggedIn] = useState<boolean | null>(null);
 
+  // ✅ ログイン状態（null=確認中）
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean | null>(null);
+  const [userLabel, setUserLabel] = useState<string>("");
+
+  // ✅ ログイン状態は「1回取得 + 変化追従」
+  useEffect(() => {
+    let cancelled = false;
+    let unsub: any = null;
+
+    async function initAuth() {
+      try {
+        const { data } = await supabase.auth.getSession();
+        if (cancelled) return;
+
+        const user = data?.session?.user ?? null;
+        setIsLoggedIn(!!user);
+        setUserLabel(user?.email || user?.id || "");
+      } catch {
+        if (cancelled) return;
+        setIsLoggedIn(false);
+        setUserLabel("");
+      }
+
+      const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+        const user = session?.user ?? null;
+        setIsLoggedIn(!!user);
+        setUserLabel(user?.email || user?.id || "");
+      });
+
+      unsub = sub?.subscription;
+    }
+
+    initAuth();
+
+    return () => {
+      cancelled = true;
+      try {
+        unsub?.unsubscribe?.();
+      } catch {}
+    };
+  }, []);
+
+  // ✅ projects 読み込み（ログイン有無は関係なく表示はする）
   useEffect(() => {
     let cancelled = false;
 
     async function load() {
       setLoading(true);
       setStatus({ type: null, text: "" });
-
-      // ✅ ログイン状態チェック（未ログインなら最上部で注意を出す）
-      const { data: sessData, error: sessErr } = await supabase.auth.getSession();
-      if (cancelled) return;
-
-      if (sessErr) {
-        // セッション取得失敗は一旦「未ログイン扱い」にして注意表示
-        setIsLoggedIn(false);
-      } else {
-        setIsLoggedIn(!!sessData.session);
-      }
 
       const { data, error } = await supabase
         .from("projects")
@@ -90,8 +121,46 @@ export default function ProjectsPage() {
         <h1 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>
           プロジェクト一覧
         </h1>
-        <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.7 }}>
-          {loading ? "読み込み中..." : `${rows.length}件（稼働 ${activeCount}件）`}
+
+        <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.7, textAlign: "right" }}>
+          <div>
+            {loading ? "読み込み中..." : `${rows.length}件（稼働 ${activeCount}件）`}
+          </div>
+          <div style={{ marginTop: 4 }}>
+            {isLoggedIn === null ? (
+              "ログイン状態：確認中..."
+            ) : isLoggedIn ? (
+              <span>
+                ログイン中{userLabel ? `（${userLabel}）` : ""}
+                {" / "}
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await supabase.auth.signOut();
+                    location.reload();
+                  }}
+                  style={{
+                    border: "none",
+                    background: "transparent",
+                    padding: 0,
+                    cursor: "pointer",
+                    color: "#b91c1c",
+                    textDecoration: "underline",
+                    fontSize: 12,
+                  }}
+                >
+                  ログアウト
+                </button>
+              </span>
+            ) : (
+              <span>
+                未ログイン{" / "}
+                <Link href="/login" style={{ textDecoration: "underline" }}>
+                  ログイン
+                </Link>
+              </span>
+            )}
+          </div>
         </div>
       </div>
 
@@ -128,7 +197,7 @@ export default function ProjectsPage() {
             </div>
           </div>
           <p style={{ margin: "6px 0 0 0", color: "#856404", fontSize: 12, opacity: 0.9 }}>
-            右上の「ログイン」からもログインできます。
+            右上の「ログイン」表示が残る場合でも、このページ右上の「ログイン中/未ログイン」が真の状態です。
           </p>
         </div>
       )}
