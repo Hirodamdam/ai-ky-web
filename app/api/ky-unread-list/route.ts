@@ -24,6 +24,11 @@ type UnreadEntry = {
   partner_company_name: string | null;
 };
 
+function displayName(e: UnreadEntry): string {
+  // ✅ 表示は「氏名」優先。無ければ会社名。最後に番号。
+  return s(e.entrant_name).trim() || s(e.partner_company_name).trim() || s(e.entrant_no).trim() || "（不明）";
+}
+
 export async function POST(req: Request) {
   try {
     const body = (await req.json()) as Body;
@@ -39,7 +44,10 @@ export async function POST(req: Request) {
 
     if (!adminUserId || !url || !anonKey || !serviceKey) {
       return NextResponse.json(
-        { error: "Missing env: KY_ADMIN_USER_ID / NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY" },
+        {
+          error:
+            "Missing env: KY_ADMIN_USER_ID / NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY",
+        },
         { status: 500 }
       );
     }
@@ -71,7 +79,6 @@ export async function POST(req: Request) {
     if (s(ky.project_id) !== projectId) return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
 
     // ✅ 期待対象（入場登録：個人No）
-    // テーブル名は「project_entrant_entries」を想定（あなたの運用に合わせ）
     const { data: entrants, error: entErr } = await adminClient
       .from("project_entrant_entries")
       .select("entrant_no, entrant_name, partner_company_name, created_at")
@@ -115,13 +122,13 @@ export async function POST(req: Request) {
 
     const unreadEntries = expected.filter((e) => !readSet.has(e.entrant_no));
 
-    // 互換：従来の unread:string[] も返す（UIが崩れない）
-    const unreadLegacy = unreadEntries.map((e) => e.entrant_no);
+    // ✅ 互換：従来の unread:string[] は「表示用」にする（番号だけ表示になるのを防ぐ）
+    const unreadLegacy = unreadEntries.map(displayName);
 
     return NextResponse.json({
       ok: true,
       mode: "person", // 互換
-      unread: unreadLegacy,
+      unread: unreadLegacy, // ✅ ここが「氏名」表示になる
       unread_entries: unreadEntries, // ✅ 本命（eno + 氏名 + 会社）
       counts: {
         expected: expected.length,
