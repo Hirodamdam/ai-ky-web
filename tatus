@@ -1,0 +1,82 @@
+[1mdiff --git a/app/ky/public/[token]/KyPublicClient.tsx b/app/ky/public/[token]/KyPublicClient.tsx[m
+[1mindex f3f479e..ff70fb2 100644[m
+[1m--- a/app/ky/public/[token]/KyPublicClient.tsx[m
+[1m+++ b/app/ky/public/[token]/KyPublicClient.tsx[m
+[36m@@ -1,3 +1,4 @@[m
+[32m+[m[32m// app/ky/public/[token]/KyPublicClient.tsx[m
+ "use client";[m
+ [m
+ import React, { useEffect, useMemo, useState, useCallback } from "react";[m
+[36m@@ -18,8 +19,8 @@[m [mtype Ky = {[m
+   partner_company_name: string | null;[m
+   third_party_level?: string | null;[m
+ [m
+[31m-  // ✅ 追加：本日の作業員数[m
+[31m-  worker_count?: number | null;[m
+[32m+[m[32m  // ✅ 作業員数（APIが返す列名に合わせる）[m
+[32m+[m[32m  workers?: number | null;[m
+ [m
+   weather_slots?: WeatherSlot[] | null;[m
+ [m
+[36m@@ -197,7 +198,6 @@[m [mexport default function KyPublicClient({ token }: { token: string }) {[m
+ [m
+   // ✅ 既読（確認）UI[m
+   const storageKeyName = useMemo(() => `ky_reader_name_v1`, []);[m
+[31m-  const storageKeyDone = useMemo(() => `ky_read_done_v1:${token}`, [token]);[m
+   const storageKeyDoneByNo = useMemo(() => `ky_read_done_v1:${token}:eno:${entrantNo || "none"}`, [token, entrantNo]);[m
+ [m
+   const [readerName, setReaderName] = useState<string>("");[m
+[36m@@ -218,8 +218,7 @@[m [mexport default function KyPublicClient({ token }: { token: string }) {[m
+       const n = localStorage.getItem(storageKeyName);[m
+       if (n && !readerName) setReaderName(n);[m
+ [m
+[31m-      const key = isValidEntrantNo(entrantNo) ? storageKeyDoneByNo : storageKeyDone;[m
+[31m-      const done = localStorage.getItem(key);[m
+[32m+[m[32m      const done = localStorage.getItem(storageKeyDoneByNo);[m
+       if (done) {[m
+         setReadDone(true);[m
+         setReadAt(done);[m
+[36m@@ -228,7 +227,7 @@[m [mexport default function KyPublicClient({ token }: { token: string }) {[m
+       // ignore[m
+     }[m
+     // eslint-disable-next-line react-hooks/exhaustive-deps[m
+[31m-  }, [storageKeyName, storageKeyDone, storageKeyDoneByNo, entrantNo]);[m
+[32m+[m[32m  }, [storageKeyName, storageKeyDoneByNo, entrantNo]);[m
+ [m
+   const statusClass = useMemo(() => {[m
+     if (readStatus.type === "success") return "border border-emerald-200 bg-emerald-50 text-emerald-800";[m
+[36m@@ -325,12 +324,15 @@[m [mexport default function KyPublicClient({ token }: { token: string }) {[m
+     setSelectedEntrantId("");[m
+   }, [selectedPartnerEntryId]);[m
+ [m
+[31m-  // 個人が選択されたら entrantNo を自動セット（URLenoが既にあっても上書きする：現場操作優先）[m
+[32m+[m[32m  // 個人が選択されたら entrantNo を自動セット（現場操作優先）[m
+   useEffect(() => {[m
+     if (!selectedEntrantId) return;[m
+     const e = entrantsAll.find((x) => x.id === selectedEntrantId);[m
+     const no = s(e?.entrant_no).trim();[m
+[32m+[m[32m    const nm = s(e?.entrant_name).trim();[m
+[32m+[m
+     if (isValidEntrantNo(no)) setEntrantNo(no);[m
+[32m+[m[32m    if (nm) setReaderName(nm); // ✅ 既読一覧に氏名が残せるよう補助[m
+   }, [selectedEntrantId, entrantsAll]);[m
+ [m
+   const weatherSlots = useMemo(() => {[m
+[36m@@ -341,76 +343,63 @@[m [mexport default function KyPublicClient({ token }: { token: string }) {[m
+     return filtered;[m
+   }, [ky?.weather_slots]);[m
+ [m
+[31m-  const onConfirmRead = useCallback([m
+[31m-    async (opts?: { forceNameMode?: boolean }) => {[m
+[31m-      setReadStatus({ type: null, text: "" });[m
+[32m+[m[32m  const onConfirmRead = useCallback(async () => {[m
+[32m+[m[32m    setReadStatus({ type: null, text: "" });[m
+ [m
+[31m-      const eno = s(entrantNo).trim();[m
+[31m-      const enoOk = isValidEntrantNo(eno);[m
+[31m-      const forceNameMode = !!opts?.forceNameMode;[m
+[32m+[m[32m    const eno = s(entrantNo).trim();[m
+[32m+[m[32m    const enoOk = isValidEntrantNo(eno);[m
+[32m+[m[32m    const name = s(readerName).trim();[m
+ [m
+[31m-      const na

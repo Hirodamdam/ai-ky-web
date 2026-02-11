@@ -1,3 +1,4 @@
+// app/ky/public/[token]/KyPublicClient.tsx
 "use client";
 
 import React, { useEffect, useMemo, useState, useCallback } from "react";
@@ -18,8 +19,8 @@ type Ky = {
   partner_company_name: string | null;
   third_party_level?: string | null;
 
-  // ✅ 追加：本日の作業員数
-  worker_count?: number | null;
+  // ✅ 作業員数（APIが返す列名に合わせる）
+  workers?: number | null;
 
   weather_slots?: WeatherSlot[] | null;
 
@@ -197,7 +198,6 @@ export default function KyPublicClient({ token }: { token: string }) {
 
   // ✅ 既読（確認）UI
   const storageKeyName = useMemo(() => `ky_reader_name_v1`, []);
-  const storageKeyDone = useMemo(() => `ky_read_done_v1:${token}`, [token]);
   const storageKeyDoneByNo = useMemo(() => `ky_read_done_v1:${token}:eno:${entrantNo || "none"}`, [token, entrantNo]);
 
   const [readerName, setReaderName] = useState<string>("");
@@ -218,8 +218,7 @@ export default function KyPublicClient({ token }: { token: string }) {
       const n = localStorage.getItem(storageKeyName);
       if (n && !readerName) setReaderName(n);
 
-      const key = isValidEntrantNo(entrantNo) ? storageKeyDoneByNo : storageKeyDone;
-      const done = localStorage.getItem(key);
+      const done = localStorage.getItem(storageKeyDoneByNo);
       if (done) {
         setReadDone(true);
         setReadAt(done);
@@ -228,7 +227,7 @@ export default function KyPublicClient({ token }: { token: string }) {
       // ignore
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [storageKeyName, storageKeyDone, storageKeyDoneByNo, entrantNo]);
+  }, [storageKeyName, storageKeyDoneByNo, entrantNo]);
 
   const statusClass = useMemo(() => {
     if (readStatus.type === "success") return "border border-emerald-200 bg-emerald-50 text-emerald-800";
@@ -325,12 +324,15 @@ export default function KyPublicClient({ token }: { token: string }) {
     setSelectedEntrantId("");
   }, [selectedPartnerEntryId]);
 
-  // 個人が選択されたら entrantNo を自動セット（URLenoが既にあっても上書きする：現場操作優先）
+  // 個人が選択されたら entrantNo を自動セット（現場操作優先）
   useEffect(() => {
     if (!selectedEntrantId) return;
     const e = entrantsAll.find((x) => x.id === selectedEntrantId);
     const no = s(e?.entrant_no).trim();
+    const nm = s(e?.entrant_name).trim();
+
     if (isValidEntrantNo(no)) setEntrantNo(no);
+    if (nm) setReaderName(nm); // ✅ 既読一覧に氏名が残せるよう補助
   }, [selectedEntrantId, entrantsAll]);
 
   const weatherSlots = useMemo(() => {
@@ -341,76 +343,63 @@ export default function KyPublicClient({ token }: { token: string }) {
     return filtered;
   }, [ky?.weather_slots]);
 
-  const onConfirmRead = useCallback(
-    async (opts?: { forceNameMode?: boolean }) => {
-      setReadStatus({ type: null, text: "" });
+  const onConfirmRead = useCallback(async () => {
+    setReadStatus({ type: null, text: "" });
 
-      const eno = s(entrantNo).trim();
-      const enoOk = isValidEntrantNo(eno);
-      const forceNameMode = !!opts?.forceNameMode;
+    const eno = s(entrantNo).trim();
+    const enoOk = isValidEntrantNo(eno);
+    const name = s(readerName).trim();
 
-      const name = s(readerName).trim();
+    if (!enoOk && !name) {
+      setReadStatus({ type: "error", text: "氏名を入力してください（または個人Noを選択してください）。" });
+      return;
+    }
 
-      if (!enoOk || forceNameMode) {
-        if (!name) {
-          setReadStatus({ type: "error", text: "氏名を入力してください。" });
-          return;
-        }
-      }
-
-      setReadActing(true);
-      try {
-        // 氏名保存（eno運用でも保険）
-        if (name) {
-          try {
-            localStorage.setItem(storageKeyName, name);
-          } catch {
-            // ignore
-          }
-        }
-
-        const device = getDeviceLabel();
-        const res = await fetch("/api/ky-read", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          cache: "no-store",
-          body: JSON.stringify({
-            token,
-            entrantNo: enoOk && !forceNameMode ? eno : null,
-            readerName: !enoOk || forceNameMode ? name : "",
-            readerRole: null,
-            readerDevice: device || null,
-          }),
-        });
-
-        const j = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
-
-        const at = new Date().toISOString();
-        setReadDone(true);
-        setReadAt(at);
-
+    setReadActing(true);
+    try {
+      if (name) {
         try {
-          const key = enoOk && !forceNameMode ? storageKeyDoneByNo : storageKeyDone;
-          localStorage.setItem(key, at);
-        } catch {
-          // ignore
-        }
-
-        setReadStatus({
-          type: "success",
-          text: enoOk && !forceNameMode ? "確認しました（個人Noで既読登録しました）" : "確認しました（既読登録しました）",
-        });
-      } catch (e: any) {
-        setReadStatus({ type: "error", text: e?.message ?? "既読登録に失敗しました" });
-      } finally {
-        setReadActing(false);
+          localStorage.setItem(storageKeyName, name);
+        } catch {}
       }
-    },
-    [entrantNo, readerName, storageKeyName, storageKeyDone, storageKeyDoneByNo, token]
-  );
 
-  // ✅ entrantNo が有効なら「自動既読」
+      const device = getDeviceLabel();
+      const res = await fetch("/api/ky-read", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({
+          token,
+          entrantNo: enoOk ? eno : null,
+          readerName: name || null, // ✅ eno運用でも氏名を送る（一覧表示のため）
+          readerRole: null,
+          readerDevice: device || null,
+        }),
+      });
+
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
+
+      const at = new Date().toISOString();
+      setReadDone(true);
+      setReadAt(at);
+
+      try {
+        localStorage.setItem(storageKeyDoneByNo, at);
+      } catch {}
+
+      setReadStatus({
+        type: "success",
+        text: enoOk ? "確認しました（個人Noで既読登録しました）" : "確認しました（既読登録しました）",
+      });
+    } catch (e: any) {
+      setReadStatus({ type: "error", text: e?.message ?? "既読登録に失敗しました" });
+    } finally {
+      setReadActing(false);
+    }
+  }, [entrantNo, readerName, storageKeyName, storageKeyDoneByNo, token]);
+
+  // ✅ entrantNo が有効なら「自動既読」（失敗しても手動で押せる設計に）
   useEffect(() => {
     if (!ky) return;
     if (!ky.is_approved) return;
@@ -426,9 +415,7 @@ export default function KyPublicClient({ token }: { token: string }) {
         setReadAt(done);
         return;
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     onConfirmRead().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -473,16 +460,15 @@ export default function KyPublicClient({ token }: { token: string }) {
 
         {!!readStatus.text && <div className={`rounded-lg px-3 py-2 text-sm ${statusClass}`}>{readStatus.text}</div>}
 
-        {/* ✅ 会社→個人選択（ここが本命） */}
         <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2">
           <div className="flex items-center justify-between gap-2">
             <div className="text-xs text-slate-700 font-semibold">会社・入場者を選択（おすすめ）</div>
             <button
               type="button"
               onClick={loadRoster}
-              disabled={rosterLoading || readDone || readActing}
+              disabled={rosterLoading || readActing}
               className={`rounded-lg border px-3 py-1.5 text-xs ${
-                rosterLoading || readDone || readActing ? "border-slate-200 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
+                rosterLoading || readActing ? "border-slate-200 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
               }`}
             >
               {rosterLoading ? "更新中..." : "名簿を更新"}
@@ -498,7 +484,7 @@ export default function KyPublicClient({ token }: { token: string }) {
                 value={selectedPartnerEntryId}
                 onChange={(e) => setSelectedPartnerEntryId(e.target.value)}
                 className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-                disabled={!partners.length || rosterLoading || readDone || readActing}
+                disabled={!partners.length || rosterLoading || readActing}
               >
                 {!partners.length ? <option value="">（協力会社が未登録です）</option> : null}
                 {partners.map((p) => (
@@ -516,7 +502,7 @@ export default function KyPublicClient({ token }: { token: string }) {
                 value={selectedEntrantId}
                 onChange={(e) => setSelectedEntrantId(e.target.value)}
                 className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-                disabled={!selectedPartnerEntryId || rosterLoading || readDone || readActing}
+                disabled={!selectedPartnerEntryId || rosterLoading || readActing}
               >
                 <option value="">（選択）</option>
                 {entrants.map((e) => (
@@ -530,42 +516,29 @@ export default function KyPublicClient({ token }: { token: string }) {
           </div>
         </div>
 
-        {/* ✅ enoがある場合：氏名入力を非表示 */}
-        {!enoOk ? (
-          <div className="space-y-2">
-            <div className="text-xs text-slate-600">氏名（必須：個人Noが無い場合）</div>
-            <input
-              value={readerName}
-              onChange={(e) => setReaderName(e.target.value)}
-              placeholder="例）山田太郎"
-              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
-              disabled={readDone || readActing}
-              inputMode="text"
-            />
-          </div>
-        ) : (
-          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">個人Noで既読登録します（氏名入力は不要）。</div>
-        )}
+        {/* 氏名（保険） */}
+        <div className="space-y-2">
+          <div className="text-xs text-slate-600">氏名（名簿選択時は自動入力されます）</div>
+          <input
+            value={readerName}
+            onChange={(e) => setReaderName(e.target.value)}
+            placeholder="例）山田太郎"
+            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
+            disabled={readDone || readActing}
+            inputMode="text"
+          />
+        </div>
 
         <button
           type="button"
-          onClick={() => onConfirmRead(enoOk ? undefined : { forceNameMode: true })}
-          disabled={readDone || readActing || (enoOk && !readDone)}
+          onClick={onConfirmRead}
+          disabled={readDone || readActing}
           className={`w-full rounded-lg px-4 py-2 text-sm text-white ${readDone || readActing ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}
         >
-          {readDone ? "確認済み" : readActing ? "送信中..." : enoOk ? "確認中..." : "確認しました"}
+          {readDone ? "確認済み" : readActing ? "送信中..." : "確認しました"}
         </button>
 
-        {readDone ? (
-          <div className="text-xs text-slate-500">※この端末では確認済みです{readAt ? `（${readAt}）` : ""}。</div>
-        ) : enoOk ? (
-          <div className="text-xs text-slate-500">
-            ※個人No（{entrantNo}）で既読登録します。<br />
-            ※表示が更新されない場合は再読み込みしてください。
-          </div>
-        ) : (
-          <div className="text-xs text-slate-500">※入力した氏名は次回以降も自動入力されます。</div>
-        )}
+        {readDone ? <div className="text-xs text-slate-500">※この端末では確認済みです{readAt ? `（${readAt}）` : ""}。</div> : null}
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
@@ -578,10 +551,12 @@ export default function KyPublicClient({ token }: { token: string }) {
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky.partner_company_name ?? "（未入力）"}</div>
       </div>
 
-      {/* ✅ 追加：本日の作業員数（公開にも表示） */}
+      {/* ✅ 作業員数 */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky.worker_count != null ? `${ky.worker_count} 名` : "（未入力）"}</div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
+          {ky.workers != null ? `${ky.workers} 名` : "（未入力）"}
+        </div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
