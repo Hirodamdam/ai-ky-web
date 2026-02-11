@@ -654,13 +654,11 @@ export default function KyReviewClient() {
           <div className="mt-1 text-sm text-slate-600">日付：{ky?.work_date ? fmtDateJp(ky.work_date) : "（不明）"}</div>
         </div>
         <div className="flex flex-col gap-2 shrink-0">
-          <Link className="text-sm text-blue-600 underline text-right" href="/login">
-            ログイン
-          </Link>
-          <Link className="text-sm text-blue-600 underline text-right" href={`/projects/${projectId}/ky`}>
-            KY一覧へ
-          </Link>
-        </div>
+  <Link className="text-sm text-blue-600 underline text-right" href={`/projects/${projectId}/ky`}>
+    KY一覧へ
+  </Link>
+</div>
+
       </div>
 
       {!!status.text && <div className={`rounded-lg px-3 py-2 text-sm ${statusClass} no-print`}>{status.text}</div>}
