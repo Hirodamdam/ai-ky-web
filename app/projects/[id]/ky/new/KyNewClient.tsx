@@ -439,7 +439,6 @@ export default function KyNewClient() {
     uploadToStorage,
     slopePrevUrl,
     pathPrevUrl,
-    // ✅ 追加（依存）
     project?.lat,
     project?.lon,
   ]);
@@ -654,10 +653,9 @@ export default function KyNewClient() {
           <div className="text-lg font-bold text-slate-900">KY 新規作成</div>
           <div className="mt-1 text-sm text-slate-600">工事件名：{project?.name ?? "（不明）"}</div>
         </div>
+
+        {/* ✅ ここを修正：ページ右上の「ログイン」リンクは削除（共通ヘッダーに統一） */}
         <div className="flex flex-col gap-2 shrink-0">
-          <Link className="text-sm text-blue-600 underline text-right" href="/login">
-            ログイン
-          </Link>
           <Link className="text-sm text-blue-600 underline text-right" href={`/projects/${projectId}/ky`}>
             KY一覧へ
           </Link>
