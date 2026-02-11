@@ -15,7 +15,22 @@ function s(v: any) {
 }
 
 function normEntrantNo(v: any): string {
-  return s(v).trim();
+  return s(v).trim().toUpperCase();
+}
+
+// ✅ 既読/未読の表記ゆれ対策（半角/全角空白・タブ除去）
+function normName(v: any): string {
+  return s(v).replace(/[ 　\t]/g, "").trim();
+}
+
+// entrant_no 列が無い環境のエラーを吸収（PostgREST / PG の文言差があるので広め）
+function isMissingColumnErr(err: any, col: string): boolean {
+  const msg = s(err?.message || err?.details || err?.hint);
+  const code = s(err?.code);
+  if (code === "42703") return true; // PG undefined_column
+  if (msg.includes(col) && (msg.includes("does not exist") || msg.includes("not exist") || msg.includes("Unknown column"))) return true;
+  if (msg.includes(col) && msg.includes("column")) return true;
+  return false;
 }
 
 type UnreadEntry = {
@@ -31,7 +46,7 @@ function displayName(e: UnreadEntry): string {
 
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as Body;
+    const body = (await req.json().catch(() => ({}))) as Body;
 
     const projectId = s(body.projectId).trim();
     const kyId = s(body.kyId).trim();
@@ -104,36 +119,80 @@ export async function POST(req: Request) {
       }))
       .filter((x) => !!x.entrant_no);
 
-    // ✅ 既読（entrant_no が入っているものだけ）
-    const { data: logs, error: logErr } = await adminClient
+    // ✅ 既読ログ取得（entrant_no列があれば使う。無ければ reader_name だけで突合する）
+    let logs: any[] = [];
+    let hasEntrantNoColumn = true;
+
+    const q1 = await adminClient
       .from("ky_read_logs")
-      .select("entrant_no, created_at")
+      .select("entrant_no, reader_name, created_at")
       .eq("ky_id", kyId)
       .order("created_at", { ascending: false })
       .limit(5000);
 
-    if (logErr) return NextResponse.json({ error: logErr.message }, { status: 500 });
+    if (q1.error) {
+      if (isMissingColumnErr(q1.error, "entrant_no")) {
+        hasEntrantNoColumn = false;
 
-    const readSet = new Set(
-      (Array.isArray(logs) ? logs : [])
-        .map((r: any) => normEntrantNo(r?.entrant_no))
-        .filter(Boolean)
+        const q2 = await adminClient
+          .from("ky_read_logs")
+          .select("reader_name, created_at")
+          .eq("ky_id", kyId)
+          .order("created_at", { ascending: false })
+          .limit(5000);
+
+        if (q2.error) return NextResponse.json({ error: q2.error.message }, { status: 500 });
+        logs = Array.isArray(q2.data) ? (q2.data as any[]) : [];
+      } else {
+        return NextResponse.json({ error: q1.error.message }, { status: 500 });
+      }
+    } else {
+      logs = Array.isArray(q1.data) ? (q1.data as any[]) : [];
+    }
+
+    // entrant_no 既読（列がある場合のみ）
+    const readEntrantSet = new Set(
+      hasEntrantNoColumn
+        ? logs.map((r: any) => normEntrantNo(r?.entrant_no)).filter(Boolean)
+        : []
     );
 
-    const unreadEntries = expected.filter((e) => !readSet.has(e.entrant_no));
+    // reader_name 既読（必ず使う）
+    const readNameSet = new Set(logs.map((r: any) => normName(r?.reader_name)).filter(Boolean));
 
-    // ✅ 互換：従来の unread:string[] は「表示用」にする（番号だけ表示になるのを防ぐ）
+    // ✅ 未読判定
+    // 1) entrant_no が既読なら除外（列がある場合）
+    // 2) entrant_name が既読者名と一致（空白除去後）なら除外
+    // 3) 会社名が既読者名と一致（空白除去後）なら除外（公開側が会社名保存のケース）
+    // 4) 「No:XXXX」表記で保存されているケースも吸収
+    const unreadEntries = expected.filter((e) => {
+      if (hasEntrantNoColumn && readEntrantSet.has(e.entrant_no)) return false;
+
+      const en = normName(e.entrant_name);
+      if (en && readNameSet.has(en)) return false;
+
+      const cn = normName(e.partner_company_name);
+      if (cn && readNameSet.has(cn)) return false;
+
+      const noLabel = normName(`No:${e.entrant_no}`);
+      if (noLabel && readNameSet.has(noLabel)) return false;
+
+      return true;
+    });
+
     const unreadLegacy = unreadEntries.map(displayName);
 
     return NextResponse.json({
       ok: true,
-      mode: "person", // 互換
-      unread: unreadLegacy, // ✅ ここが「氏名」表示になる
-      unread_entries: unreadEntries, // ✅ 本命（eno + 氏名 + 会社）
+      mode: "person",
+      unread: unreadLegacy,
+      unread_entries: unreadEntries,
       counts: {
         expected: expected.length,
-        read: readSet.size,
+        read_entrant: hasEntrantNoColumn ? readEntrantSet.size : null,
+        read_name: readNameSet.size,
         unread: unreadEntries.length,
+        has_entrant_no_column: hasEntrantNoColumn,
       },
     });
   } catch (e: any) {

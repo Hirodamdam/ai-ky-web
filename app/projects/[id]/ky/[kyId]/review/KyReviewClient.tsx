@@ -77,6 +77,16 @@ function s(v: any) {
   return String(v);
 }
 
+function normalizeName(v: any): string {
+  // ✅ 既読/未読の表記ゆれ対策（空白・全角空白・タブ除去）
+  return s(v).replace(/[ 　\t]/g, "").trim();
+}
+
+function normEntrantNoLoose(v: any): string {
+  // 入場Noの大小無視（英字を含む可能性があるため）
+  return s(v).trim().toUpperCase();
+}
+
 function fmtDateJp(iso: string): string {
   const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (!m) return iso;
@@ -187,25 +197,6 @@ function splitAiHeadedText(text: string): { work: string; hazards: string; count
   return out;
 }
 
-function normalizeText(text: string): string {
-  return (text || "").replace(/\r\n/g, "\n").replace(/\u3000/g, " ").trim();
-}
-
-function buildAiCombinedFromParts(parts: { work: string; hazards: string; counter: string; third: string }): string {
-  const w = normalizeText(parts.work);
-  const h = normalizeText(parts.hazards);
-  const c = normalizeText(parts.counter);
-  const t = normalizeText(parts.third);
-
-  const lines: string[] = [];
-  if (w) lines.push("【AI補足｜作業内容】", w);
-  if (h) lines.push("【AI補足｜危険予知】", h);
-  if (c) lines.push("【AI補足｜対策】", c);
-  if (t) lines.push("【AI補足｜第三者】", t);
-
-  return lines.join("\n").trim();
-}
-
 async function postJsonTry(urls: string[], body: any): Promise<any> {
   let lastErr: any = null;
   for (const url of urls) {
@@ -260,6 +251,42 @@ export default function KyReviewClient() {
   const [unreadList, setUnreadList] = useState<string[]>([]);
   const [unreadMode, setUnreadMode] = useState<"person" | "company" | "none">("none");
   const [unreadErr, setUnreadErr] = useState<string>("");
+
+  // ✅ 表示用：既読者を未読から除外（表記ゆれ対策）
+  const unreadFiltered = useMemo(() => {
+    // 既読：名前正規化セット
+    const readNameSet = new Set(readLogs.map((r) => normalizeName(r.reader_name)));
+
+    // 既読：No:XXXX 形式もセットに入れる（公開側がNo保存のケース）
+    const readNoSet = new Set(
+      readLogs
+        .map((r) => normalizeName(r.reader_name))
+        .filter(Boolean)
+        .map((x) => {
+          const m = x.match(/^No:([0-9A-Za-z_-]{1,32})$/i);
+          if (!m) return "";
+          return `No:${normEntrantNoLoose(m[1])}`;
+        })
+        .filter(Boolean)
+    );
+
+    return (unreadList || []).filter((name) => {
+      const n = normalizeName(name);
+      if (!n) return false;
+
+      // 1) 名前一致で除外
+      if (readNameSet.has(n)) return false;
+
+      // 2) 未読側が「No:xxxx」表記の場合も吸収
+      const m = n.match(/^No:([0-9A-Za-z_-]{1,32})$/i);
+      if (m) {
+        const key = `No:${normEntrantNoLoose(m[1])}`;
+        if (readNoSet.has(key)) return false;
+      }
+
+      return true;
+    });
+  }, [unreadList, readLogs]);
 
   const statusClass = useMemo(() => {
     if (status.type === "success") return "border border-emerald-200 bg-emerald-50 text-emerald-800";
@@ -579,22 +606,13 @@ export default function KyReviewClient() {
 
       const data = await postJsonTry(["/api/ky-ai-supplement"], payload);
 
-      const w = normalizeText(s(data?.ai_work_detail).trim());
-      const h = normalizeText(s(data?.ai_hazards).trim());
-      const c = normalizeText(s(data?.ai_countermeasures).trim());
-      const t = normalizeText(s(data?.ai_third_party).trim());
-
-      if (!w && !h && !c && !t) throw new Error("AIの出力が空でした（入力内容を増やして再実行してください）");
-
-      const combined = buildAiCombinedFromParts({ work: w, hazards: h, counter: c, third: t });
-
       const next: KyEntryRow = {
         ...ky,
-        ai_work_detail: w || null,
-        ai_hazards: h || null,
-        ai_countermeasures: c || null,
-        ai_third_party: t || null,
-        ai_supplement: combined ? combined : null,
+        ai_work_detail: s(data?.ai_work_detail).trim(),
+        ai_hazards: s(data?.ai_hazards).trim(),
+        ai_countermeasures: s(data?.ai_countermeasures).trim(),
+        ai_third_party: s(data?.ai_third_party).trim(),
+        ai_supplement: s(data?.ai_supplement).trim() || ky.ai_supplement || null,
       };
 
       setKy(next);
@@ -768,7 +786,7 @@ export default function KyReviewClient() {
             </div>
           ) : null}
 
-          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2">
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2 no-print">
             <div className="flex items-center justify-between gap-2">
               <div className="text-sm font-semibold text-slate-800">既読状況</div>
               <div className="text-right">
@@ -801,13 +819,14 @@ export default function KyReviewClient() {
             )}
           </div>
 
-          <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 space-y-2">
+          {/* ✅ 未読ブロックは印刷に出さない（no-print） */}
+          <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 space-y-2 no-print">
             <div className="flex items-center justify-between gap-2">
               <div className="text-sm font-semibold text-rose-800">
                 未読状況（入場登録ベース）{unreadMode === "company" ? "：会社単位" : unreadMode === "person" ? "：個人単位" : ""}
               </div>
               <div className="text-sm text-rose-800">
-                未読：<span className="font-semibold">{unreadList.length}</span>
+                未読：<span className="font-semibold">{unreadFiltered.length}</span>
               </div>
             </div>
 
@@ -815,10 +834,10 @@ export default function KyReviewClient() {
 
             {unreadLoading ? (
               <div className="text-sm text-rose-700">（未読一覧 更新中...）</div>
-            ) : unreadList.length ? (
+            ) : unreadFiltered.length ? (
               <div className="rounded-lg border border-rose-200 bg-white p-3">
                 <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                  {unreadList.map((x, i) => (
+                  {unreadFiltered.map((x, i) => (
                     <li key={`${x}-${i}`}>{x}</li>
                   ))}
                 </ul>
