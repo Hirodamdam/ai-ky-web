@@ -4,9 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
-type Body = {
-  token?: string;
-};
+type Body = { token?: string };
 
 function s(v: any) {
   if (v == null) return "";
@@ -18,15 +16,15 @@ export async function POST(req: Request) {
     const body = (await req.json().catch(() => ({}))) as Body;
     const token = s(body?.token).trim();
 
-    if (!token) {
-      return NextResponse.json({ error: "Missing token" }, { status: 400 });
-    }
+    if (!token) return NextResponse.json({ error: "Missing token" }, { status: 400 });
 
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
     if (!url || !serviceKey) {
-      return NextResponse.json({ error: "Missing env: NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY" }, { status: 500 });
+      return NextResponse.json(
+        { error: "Missing env: NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY" },
+        { status: 500 }
+      );
     }
 
     const supabase = createClient(url, serviceKey, { auth: { persistSession: false } });
@@ -40,6 +38,7 @@ export async function POST(req: Request) {
         work_date,
         partner_company_name,
         third_party_level,
+        worker_count,
         weather_slots,
         ai_work_detail,
         ai_hazards,
@@ -47,49 +46,64 @@ export async function POST(req: Request) {
         ai_third_party,
         ai_supplement,
         is_approved,
-        public_token
+        public_token,
+        public_enabled
       `
       )
       .eq("public_token", token)
       .maybeSingle();
 
     if (kyErr) return NextResponse.json({ error: kyErr.message }, { status: 500 });
-    if (!ky) return NextResponse.json({ ky: null, project: null }, { status: 200 });
+    if (!ky) return NextResponse.json({ ky: null, project: null }, { status: 200, headers: { "Cache-Control": "no-store" } });
 
-    if (!ky.is_approved) {
-      return NextResponse.json({ ky: null, project: null }, { status: 200 });
+    // ✅ 承認 + 公開ON 以外は「無効」
+    if (!ky.is_approved || ky.public_enabled !== true) {
+      return NextResponse.json(
+        {
+          ky: {
+            is_approved: ky.is_approved ?? null,
+            public_enabled: ky.public_enabled ?? null,
+          },
+          project: null,
+        },
+        { status: 200, headers: { "Cache-Control": "no-store" } }
+      );
     }
 
-    const projectId = s(ky.project_id);
+    const projectId = s(ky.project_id).trim();
     let project: any = null;
-
     if (projectId) {
       const { data: p } = await supabase.from("projects").select("name, contractor_name").eq("id", projectId).maybeSingle();
       project = p ?? null;
     }
 
+    const wc = (ky as any)?.worker_count ?? null;
+
     return NextResponse.json(
       {
         ky: {
-          // ✅ 追加（互換を壊さない）
           id: ky.id ?? null,
           project_id: ky.project_id ?? null,
 
           work_date: ky.work_date ?? null,
           partner_company_name: ky.partner_company_name ?? null,
           third_party_level: ky.third_party_level ?? null,
+
+          // ✅ worker_count を返す（＋互換で workers も返す）
+          worker_count: wc,
+          workers: wc,
+
           weather_slots: ky.weather_slots ?? null,
 
           ai_work_detail: ky.ai_work_detail ?? null,
           ai_hazards: ky.ai_hazards ?? null,
           ai_countermeasures: ky.ai_countermeasures ?? null,
           ai_third_party: ky.ai_third_party ?? null,
-
           ai_supplement: ky.ai_supplement ?? null,
 
           is_approved: ky.is_approved ?? null,
-
-          public_enabled: null,
+          public_token: ky.public_token ?? null,
+          public_enabled: ky.public_enabled ?? null,
         },
         project,
       },

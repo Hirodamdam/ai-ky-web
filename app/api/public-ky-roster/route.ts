@@ -1,3 +1,4 @@
+// app/api/public-ky-roster/route.ts
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
@@ -35,8 +36,10 @@ export async function POST(req: Request) {
 
     if (kyErr) return NextResponse.json({ error: kyErr.message }, { status: 500 });
     if (!ky) return NextResponse.json({ error: "Invalid token" }, { status: 404 });
-    if (!ky.is_approved) return NextResponse.json({ error: "Not approved" }, { status: 403 });
-    if (ky.public_enabled === false) return NextResponse.json({ error: "Public disabled" }, { status: 403 });
+
+    // ✅ 公開の定義を統一：approved + public_enabled=true 以外はNG
+    if (ky.is_approved !== true) return NextResponse.json({ error: "Not approved" }, { status: 403 });
+    if (ky.public_enabled !== true) return NextResponse.json({ error: "Public disabled" }, { status: 403 });
 
     const projectId = s(ky.project_id).trim();
     if (!projectId) return NextResponse.json({ error: "ky.project_id is empty" }, { status: 500 });
@@ -66,7 +69,7 @@ export async function POST(req: Request) {
         partners: Array.isArray(partners) ? partners : [],
         entrants: Array.isArray(entrants) ? entrants : [],
       },
-      { status: 200 }
+      { status: 200, headers: { "Cache-Control": "no-store" } }
     );
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });

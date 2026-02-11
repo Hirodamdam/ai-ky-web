@@ -27,9 +27,9 @@ export async function POST(req: Request) {
   try {
     const body = (await req.json()) as Body;
 
-    const projectId = s(body.projectId);
-    const kyId = s(body.kyId);
-    const accessToken = s(body.accessToken);
+    const projectId = s(body.projectId).trim();
+    const kyId = s(body.kyId).trim();
+    const accessToken = s(body.accessToken).trim();
     const action: "approve" | "unapprove" = body.action ?? "approve";
 
     const adminUserId = process.env.KY_ADMIN_USER_ID;
@@ -47,10 +47,7 @@ export async function POST(req: Request) {
       );
     }
     if (!projectId || !kyId || !accessToken) {
-      return NextResponse.json(
-        { error: "Missing body: projectId / kyId / accessToken" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Missing body: projectId / kyId / accessToken" }, { status: 400 });
     }
 
     // 1) ログインユーザー確認（accessTokenで認証）
@@ -70,67 +67,61 @@ export async function POST(req: Request) {
     // 2) 管理クライアント（service role）で更新
     const adminClient = createClient(url, serviceKey, { auth: { persistSession: false } });
 
-    // 対象KYの現状取得（public_token が既にあるか確認）
+    // 対象KYの現状取得
     const { data: current, error: curErr } = await adminClient
       .from("ky_entries")
-      .select("id, project_id, is_approved, public_token, work_date")
+      .select("id, project_id, is_approved, public_token, public_enabled, work_date")
       .eq("id", kyId)
       .maybeSingle();
 
-    if (curErr) {
-      return NextResponse.json({ error: `Fetch ky failed: ${curErr.message}` }, { status: 500 });
-    }
-    if (!current) {
-      return NextResponse.json({ error: "KY not found" }, { status: 404 });
-    }
-    if (s(current.project_id) !== projectId) {
-      return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
-    }
+    if (curErr) return NextResponse.json({ error: `Fetch ky failed: ${curErr.message}` }, { status: 500 });
+    if (!current) return NextResponse.json({ error: "KY not found" }, { status: 404 });
+    if (s(current.project_id).trim() !== projectId) return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
 
     // 参考：工事名も通知に入れる（取れなければ空でOK）
-    const { data: proj } = await adminClient
-      .from("projects")
-      .select("name")
-      .eq("id", projectId)
-      .maybeSingle();
+    const { data: proj } = await adminClient.from("projects").select("name").eq("id", projectId).maybeSingle();
+    const projectName = s(proj?.name).trim();
+    const workDate = s((current as any)?.work_date).trim();
 
-    const projectName = s(proj?.name);
-    const workDate = s((current as any)?.work_date);
-
-    const baseUrl = getBaseUrl(req); // 例: https://ai-ky-web.vercel.app
+    const baseUrl = getBaseUrl(req);
 
     if (action === "unapprove") {
-      // 安全優先：承認解除＝公開停止（トークンも無効化）
+      // ✅ 承認解除＝公開停止（重要：public_enabled を false にする）
       const { error: updErr } = await adminClient
         .from("ky_entries")
         .update({
           is_approved: false,
+          approved_at: null,
+          approved_by: null,
+          public_enabled: false,
+          public_enabled_at: null,
           public_token: null,
         })
         .eq("id", kyId);
 
-      if (updErr) {
-        return NextResponse.json({ error: `Unapprove failed: ${updErr.message}` }, { status: 500 });
-      }
+      if (updErr) return NextResponse.json({ error: `Unapprove failed: ${updErr.message}` }, { status: 500 });
 
-      // ★（任意）承認解除もLINEに流したい場合はここで送信（今は送らない設計）
       return NextResponse.json({ ok: true, action: "unapprove" });
     }
 
     // approve
-    const token = current.public_token || crypto.randomUUID();
+    const token = s((current as any)?.public_token).trim() || crypto.randomUUID();
+    const nowIso = new Date().toISOString();
 
+    // ✅ 承認＝公開ON（重要：public_enabled を true にする）
     const { error: updErr } = await adminClient
       .from("ky_entries")
       .update({
         is_approved: true,
+        approved_at: nowIso,
+        approved_by: adminUserId,
         public_token: token,
+        public_enabled: true,
+        public_enabled_at: nowIso,
       })
       .eq("id", kyId);
 
-    if (updErr) {
-      return NextResponse.json({ error: `Approve failed: ${updErr.message}` }, { status: 500 });
-    }
+    if (updErr) return NextResponse.json({ error: `Approve failed: ${updErr.message}` }, { status: 500 });
 
     const publicPath = `/ky/public/${token}`;
     const publicUrl = baseUrl ? `${baseUrl}${publicPath}` : publicPath;
@@ -142,7 +133,6 @@ export async function POST(req: Request) {
     try {
       const pushSecret = process.env.LINE_PUSH_SECRET || "";
       if (!pushSecret) {
-        // 環境変数が未設定なら送らない（承認は成功）
         lineOk = null;
         lineError = "LINE_PUSH_SECRET missing (skip)";
       } else {
@@ -157,10 +147,7 @@ export async function POST(req: Request) {
             "Content-Type": "application/json",
             "x-line-push-secret": pushSecret,
           },
-          body: JSON.stringify({
-            title,
-            url: publicUrl,
-          }),
+          body: JSON.stringify({ title, url: publicUrl }),
         });
 
         const txt = await res.text();
@@ -178,6 +165,7 @@ export async function POST(req: Request) {
       public_token: token,
       public_path: publicPath,
       public_url: publicUrl,
+      public_enabled: true,
       line_ok: lineOk,
       line_error: lineError,
     });

@@ -19,7 +19,8 @@ type Ky = {
   partner_company_name: string | null;
   third_party_level?: string | null;
 
-  // ✅ 作業員数（APIが返す列名に合わせる）
+  // ✅ worker_count / workers 両対応（APIの揺れ吸収）
+  worker_count?: number | null;
   workers?: number | null;
 
   weather_slots?: WeatherSlot[] | null;
@@ -223,9 +224,7 @@ export default function KyPublicClient({ token }: { token: string }) {
         setReadDone(true);
         setReadAt(done);
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storageKeyName, storageKeyDoneByNo, entrantNo]);
 
@@ -281,7 +280,13 @@ export default function KyPublicClient({ token }: { token: string }) {
     run();
   }, [token]);
 
-  // ✅ 名簿を取得（承認済みの公開でだけ）
+  const publicDisabled = useMemo(() => {
+    if (!ky) return false;
+    // ✅ 承認済み + public_enabled=true だけを「有効」とみなす
+    return !(ky.is_approved && ky.public_enabled === true);
+  }, [ky]);
+
+  // ✅ 名簿を取得（承認済み＆公開ONのときだけ）
   const loadRoster = useCallback(async () => {
     setRosterErr("");
     setRosterLoading(true);
@@ -301,7 +306,6 @@ export default function KyPublicClient({ token }: { token: string }) {
       setPartners(ps);
       setEntrantsAll(es);
 
-      // 初期選択：未選択なら先頭会社
       if (!selectedPartnerEntryId && ps.length) {
         setSelectedPartnerEntryId(s(ps[0]?.id).trim());
       }
@@ -315,16 +319,17 @@ export default function KyPublicClient({ token }: { token: string }) {
   }, [token, selectedPartnerEntryId]);
 
   useEffect(() => {
-    if (!ky?.is_approved) return;
+    if (!ky) return;
+    if (publicDisabled) return;
     loadRoster();
-  }, [ky?.is_approved, loadRoster]);
+  }, [ky, publicDisabled, loadRoster]);
 
   // 会社が変わったら個人選択をリセット
   useEffect(() => {
     setSelectedEntrantId("");
   }, [selectedPartnerEntryId]);
 
-  // 個人が選択されたら entrantNo を自動セット（現場操作優先）
+  // 個人が選択されたら entrantNo を自動セット
   useEffect(() => {
     if (!selectedEntrantId) return;
     const e = entrantsAll.find((x) => x.id === selectedEntrantId);
@@ -332,7 +337,7 @@ export default function KyPublicClient({ token }: { token: string }) {
     const nm = s(e?.entrant_name).trim();
 
     if (isValidEntrantNo(no)) setEntrantNo(no);
-    if (nm) setReaderName(nm); // ✅ 既読一覧に氏名が残せるよう補助
+    if (nm) setReaderName(nm);
   }, [selectedEntrantId, entrantsAll]);
 
   const weatherSlots = useMemo(() => {
@@ -345,6 +350,11 @@ export default function KyPublicClient({ token }: { token: string }) {
 
   const onConfirmRead = useCallback(async () => {
     setReadStatus({ type: null, text: "" });
+
+    if (publicDisabled) {
+      setReadStatus({ type: "error", text: "Public disabled（公開停止）です。所長側で承認・公開を有効化してください。" });
+      return;
+    }
 
     const eno = s(entrantNo).trim();
     const enoOk = isValidEntrantNo(eno);
@@ -371,7 +381,7 @@ export default function KyPublicClient({ token }: { token: string }) {
         body: JSON.stringify({
           token,
           entrantNo: enoOk ? eno : null,
-          readerName: name || null, // ✅ eno運用でも氏名を送る（一覧表示のため）
+          readerName: name || null,
           readerRole: null,
           readerDevice: device || null,
         }),
@@ -397,12 +407,12 @@ export default function KyPublicClient({ token }: { token: string }) {
     } finally {
       setReadActing(false);
     }
-  }, [entrantNo, readerName, storageKeyName, storageKeyDoneByNo, token]);
+  }, [entrantNo, readerName, storageKeyName, storageKeyDoneByNo, token, publicDisabled]);
 
-  // ✅ entrantNo が有効なら「自動既読」（失敗しても手動で押せる設計に）
+  // ✅ entrantNo が有効なら「自動既読」
   useEffect(() => {
     if (!ky) return;
-    if (!ky.is_approved) return;
+    if (publicDisabled) return;
     if (readDone) return;
 
     const eno = s(entrantNo).trim();
@@ -419,7 +429,7 @@ export default function KyPublicClient({ token }: { token: string }) {
 
     onConfirmRead().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ky, entrantNo, readDone, storageKeyDoneByNo]);
+  }, [ky, entrantNo, readDone, storageKeyDoneByNo, publicDisabled]);
 
   if (loading) {
     return (
@@ -439,6 +449,8 @@ export default function KyPublicClient({ token }: { token: string }) {
   }
 
   const enoOk = isValidEntrantNo(entrantNo);
+  const workersVal =
+    ky.worker_count != null ? ky.worker_count : ky.workers != null ? ky.workers : null;
 
   return (
     <div className="p-4 space-y-4">
@@ -446,6 +458,12 @@ export default function KyPublicClient({ token }: { token: string }) {
         <div className="text-lg font-bold text-slate-900">KY（公開）</div>
         <div className="mt-1 text-sm text-slate-600">日付：{ky.work_date ? fmtDateJp(ky.work_date) : "（不明）"}</div>
       </div>
+
+      {publicDisabled ? (
+        <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800">
+          Public disabled（公開停止）
+        </div>
+      ) : null}
 
       {/* ✅ 既読（確認） */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
@@ -466,9 +484,11 @@ export default function KyPublicClient({ token }: { token: string }) {
             <button
               type="button"
               onClick={loadRoster}
-              disabled={rosterLoading || readActing}
+              disabled={publicDisabled || rosterLoading || readActing}
               className={`rounded-lg border px-3 py-1.5 text-xs ${
-                rosterLoading || readActing ? "border-slate-200 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
+                publicDisabled || rosterLoading || readActing
+                  ? "border-slate-200 bg-slate-100 text-slate-400"
+                  : "border-slate-300 bg-white hover:bg-slate-50"
               }`}
             >
               {rosterLoading ? "更新中..." : "名簿を更新"}
@@ -484,7 +504,7 @@ export default function KyPublicClient({ token }: { token: string }) {
                 value={selectedPartnerEntryId}
                 onChange={(e) => setSelectedPartnerEntryId(e.target.value)}
                 className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-                disabled={!partners.length || rosterLoading || readActing}
+                disabled={publicDisabled || !partners.length || rosterLoading || readActing}
               >
                 {!partners.length ? <option value="">（協力会社が未登録です）</option> : null}
                 {partners.map((p) => (
@@ -502,7 +522,7 @@ export default function KyPublicClient({ token }: { token: string }) {
                 value={selectedEntrantId}
                 onChange={(e) => setSelectedEntrantId(e.target.value)}
                 className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-                disabled={!selectedPartnerEntryId || rosterLoading || readActing}
+                disabled={publicDisabled || !selectedPartnerEntryId || rosterLoading || readActing}
               >
                 <option value="">（選択）</option>
                 {entrants.map((e) => (
@@ -524,7 +544,7 @@ export default function KyPublicClient({ token }: { token: string }) {
             onChange={(e) => setReaderName(e.target.value)}
             placeholder="例）山田太郎"
             className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900"
-            disabled={readDone || readActing}
+            disabled={publicDisabled || readDone || readActing}
             inputMode="text"
           />
         </div>
@@ -532,8 +552,10 @@ export default function KyPublicClient({ token }: { token: string }) {
         <button
           type="button"
           onClick={onConfirmRead}
-          disabled={readDone || readActing}
-          className={`w-full rounded-lg px-4 py-2 text-sm text-white ${readDone || readActing ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}
+          disabled={publicDisabled || readDone || readActing}
+          className={`w-full rounded-lg px-4 py-2 text-sm text-white ${
+            publicDisabled || readDone || readActing ? "bg-slate-400" : "bg-black hover:bg-slate-900"
+          }`}
         >
           {readDone ? "確認済み" : readActing ? "送信中..." : "確認しました"}
         </button>
@@ -555,7 +577,7 @@ export default function KyPublicClient({ token }: { token: string }) {
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
-          {ky.workers != null ? `${ky.workers} 名` : "（未入力）"}
+          {workersVal != null ? `${workersVal} 名` : "（未入力）"}
         </div>
       </div>
 
