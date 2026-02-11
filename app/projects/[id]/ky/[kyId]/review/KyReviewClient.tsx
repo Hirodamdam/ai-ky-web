@@ -26,6 +26,9 @@ type KyEntryRow = {
 
   work_date: string | null;
 
+  // ✅ 追加：本日の作業員数
+  worker_count?: number | null;
+
   work_detail: string | null;
   hazards: string | null;
   countermeasures: string | null;
@@ -94,19 +97,11 @@ function degToDirJp(deg: number | null | undefined): string {
   return dirs[idx];
 }
 
-// ky_photos の列名差を吸収
 function pickKind(row: any): string {
   return s(row?.photo_kind).trim() || s(row?.kind).trim() || s(row?.type).trim() || s(row?.category).trim() || "";
 }
 function pickUrl(row: any): string {
-  return (
-    s(row?.image_url).trim() ||
-    s(row?.photo_url).trim() ||
-    s(row?.url).trim() ||
-    s(row?.photo_path).trim() ||
-    s(row?.path).trim() ||
-    ""
-  );
+  return s(row?.image_url).trim() || s(row?.photo_url).trim() || s(row?.url).trim() || s(row?.photo_path).trim() || s(row?.path).trim() || "";
 }
 function canonicalKind(kindRaw: string): "slope" | "path" | "" {
   const k = s(kindRaw).trim();
@@ -163,9 +158,7 @@ function splitAiHeadedText(text: string): { work: string; hazards: string; count
   for (const p of patterns) {
     let m: RegExpExecArray | null;
     p.re.lastIndex = 0;
-    while ((m = p.re.exec(src2))) {
-      marks.push({ idx: m.index, key: p.key, len: m[0].length });
-    }
+    while ((m = p.re.exec(src2))) marks.push({ idx: m.index, key: p.key, len: m[0].length });
   }
   marks.sort((a, b) => a.idx - b.idx);
 
@@ -228,12 +221,10 @@ export default function KyReviewClient() {
   const [qrDataUrl, setQrDataUrl] = useState<string>("");
   const [qrOpen, setQrOpen] = useState(false);
 
-  // ✅ 既読一覧
   const [readLoading, setReadLoading] = useState(false);
   const [readLogs, setReadLogs] = useState<ReadLog[]>([]);
   const [readErr, setReadErr] = useState<string>("");
 
-  // ✅ 未読（入場登録ベース）
   const [unreadLoading, setUnreadLoading] = useState(false);
   const [unreadList, setUnreadList] = useState<string[]>([]);
   const [unreadMode, setUnreadMode] = useState<"person" | "company" | "none">("none");
@@ -308,6 +299,7 @@ export default function KyReviewClient() {
             "id",
             "project_id",
             "work_date",
+            "worker_count",
             "work_detail",
             "hazards",
             "countermeasures",
@@ -354,23 +346,13 @@ export default function KyReviewClient() {
       setKy(kyData);
 
       const projectTargetId = kyData?.project_id || projectId;
-      const { data: pRow, error: pErr } = await supabase
-        .from("projects")
-        .select("id,name,contractor_name")
-        .eq("id", projectTargetId)
-        .maybeSingle();
+      const { data: pRow, error: pErr } = await supabase.from("projects").select("id,name,contractor_name").eq("id", projectTargetId).maybeSingle();
       if (pErr) throw pErr;
       setProject((pRow as any) ?? null);
 
       const photoProjectId = kyData?.project_id || projectId;
 
-      const { data: photos, error: phErr } = await supabase
-        .from("ky_photos")
-        .select("*")
-        .eq("project_id", photoProjectId)
-        .order("created_at", { ascending: false })
-        .limit(200);
-
+      const { data: photos, error: phErr } = await supabase.from("ky_photos").select("*").eq("project_id", photoProjectId).order("created_at", { ascending: false }).limit(200);
       if (phErr) throw phErr;
 
       let slopeNow = "";
@@ -468,7 +450,6 @@ export default function KyReviewClient() {
     window.print();
   }, []);
 
-  // ✅ 承認 → 公開リンク発行 → LINE共有へ
   const onApprove = useCallback(async () => {
     setStatus({ type: null, text: "" });
     setActing(true);
@@ -544,6 +525,7 @@ export default function KyReviewClient() {
         slope_prev_photo_url: slopePrevUrl || null,
         path_photo_url: pathNowUrl || null,
         path_prev_photo_url: pathPrevUrl || null,
+        // worker_count をAIに渡したい場合はAPI側対応後に追加
       };
 
       const data = await postJsonTry(["/api/ky-ai-supplement"], payload);
@@ -598,11 +580,7 @@ export default function KyReviewClient() {
         return;
       }
       try {
-        const dataUrl = await QRCode.toDataURL(publicUrl, {
-          errorCorrectionLevel: "M",
-          margin: 2,
-          width: 320,
-        });
+        const dataUrl = await QRCode.toDataURL(publicUrl, { errorCorrectionLevel: "M", margin: 2, width: 320 });
         if (!cancelled) setQrDataUrl(dataUrl);
       } catch {
         if (!cancelled) setQrDataUrl("");
@@ -620,9 +598,8 @@ export default function KyReviewClient() {
     if (!url) return;
 
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(url);
-      } else {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(url);
+      else {
         const ta = document.createElement("textarea");
         ta.value = url;
         ta.style.position = "fixed";
@@ -654,11 +631,10 @@ export default function KyReviewClient() {
           <div className="mt-1 text-sm text-slate-600">日付：{ky?.work_date ? fmtDateJp(ky.work_date) : "（不明）"}</div>
         </div>
         <div className="flex flex-col gap-2 shrink-0">
-  <Link className="text-sm text-blue-600 underline text-right" href={`/projects/${projectId}/ky`}>
-    KY一覧へ
-  </Link>
-</div>
-
+          <Link className="text-sm text-blue-600 underline text-right" href={`/projects/${projectId}/ky`}>
+            KY一覧へ
+          </Link>
+        </div>
       </div>
 
       {!!status.text && <div className={`rounded-lg px-3 py-2 text-sm ${statusClass} no-print`}>{status.text}</div>}
@@ -686,11 +662,7 @@ export default function KyReviewClient() {
             </a>
 
             {qrDataUrl ? (
-              <button
-                type="button"
-                onClick={() => setQrOpen(true)}
-                className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
-              >
+              <button type="button" onClick={() => setQrOpen(true)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50">
                 QRを表示
               </button>
             ) : null}
@@ -828,7 +800,14 @@ export default function KyReviewClient() {
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.partner_company_name ?? "（未入力）"}</div>
       </div>
 
-      {/* ✅ 人が入力した本文（追加：ここが「作業内容が出ない」原因だった） */}
+      {/* ✅ 追加：本日の作業員数 */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
+        <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
+          {ky?.worker_count != null ? `${ky.worker_count} 名` : "（未入力）"}
+        </div>
+      </div>
+
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
         <div className="text-sm font-semibold text-slate-800">作業内容</div>
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.work_detail).trim() || "（未入力）"}</div>
@@ -872,7 +851,6 @@ export default function KyReviewClient() {
         )}
       </div>
 
-      {/* ✅ 2ページ目へ（写真ブロックを2ページ目に固定） */}
       <div className="print-page-break" />
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
@@ -929,7 +907,6 @@ export default function KyReviewClient() {
         </div>
       </div>
 
-      {/* ✅ 3ページ目へ（AI補足ブロックを3ページ目に固定） */}
       <div className="print-page-break" />
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
@@ -970,11 +947,7 @@ export default function KyReviewClient() {
       </div>
 
       <div className="flex items-center justify-between gap-3 no-print">
-        <button
-          type="button"
-          onClick={() => router.push(`/projects/${projectId}/ky`)}
-          className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
-        >
+        <button type="button" onClick={() => router.push(`/projects/${projectId}/ky`)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50">
           戻る
         </button>
 
@@ -988,19 +961,12 @@ export default function KyReviewClient() {
               type="button"
               disabled={acting}
               onClick={onUnapprove}
-              className={`rounded-lg border px-4 py-2 text-sm ${
-                acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
-              }`}
+              className={`rounded-lg border px-4 py-2 text-sm ${acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
             >
               承認解除
             </button>
           ) : (
-            <button
-              type="button"
-              disabled={acting}
-              onClick={onApprove}
-              className={`rounded-lg px-4 py-2 text-sm text-white ${acting ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}
-            >
+            <button type="button" disabled={acting} onClick={onApprove} className={`rounded-lg px-4 py-2 text-sm text-white ${acting ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}>
               承認
             </button>
           )}
@@ -1009,9 +975,7 @@ export default function KyReviewClient() {
             type="button"
             onClick={() => load()}
             disabled={acting}
-            className={`rounded-lg border px-4 py-2 text-sm ${
-              acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
-            }`}
+            className={`rounded-lg border px-4 py-2 text-sm ${acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
           >
             再読み込み
           </button>
