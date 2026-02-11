@@ -187,6 +187,25 @@ function splitAiHeadedText(text: string): { work: string; hazards: string; count
   return out;
 }
 
+function normalizeText(text: string): string {
+  return (text || "").replace(/\r\n/g, "\n").replace(/\u3000/g, " ").trim();
+}
+
+function buildAiCombinedFromParts(parts: { work: string; hazards: string; counter: string; third: string }): string {
+  const w = normalizeText(parts.work);
+  const h = normalizeText(parts.hazards);
+  const c = normalizeText(parts.counter);
+  const t = normalizeText(parts.third);
+
+  const lines: string[] = [];
+  if (w) lines.push("【AI補足｜作業内容】", w);
+  if (h) lines.push("【AI補足｜危険予知】", h);
+  if (c) lines.push("【AI補足｜対策】", c);
+  if (t) lines.push("【AI補足｜第三者】", t);
+
+  return lines.join("\n").trim();
+}
+
 async function postJsonTry(urls: string[], body: any): Promise<any> {
   let lastErr: any = null;
   for (const url of urls) {
@@ -560,13 +579,22 @@ export default function KyReviewClient() {
 
       const data = await postJsonTry(["/api/ky-ai-supplement"], payload);
 
+      const w = normalizeText(s(data?.ai_work_detail).trim());
+      const h = normalizeText(s(data?.ai_hazards).trim());
+      const c = normalizeText(s(data?.ai_countermeasures).trim());
+      const t = normalizeText(s(data?.ai_third_party).trim());
+
+      if (!w && !h && !c && !t) throw new Error("AIの出力が空でした（入力内容を増やして再実行してください）");
+
+      const combined = buildAiCombinedFromParts({ work: w, hazards: h, counter: c, third: t });
+
       const next: KyEntryRow = {
         ...ky,
-        ai_work_detail: s(data?.ai_work_detail).trim(),
-        ai_hazards: s(data?.ai_hazards).trim(),
-        ai_countermeasures: s(data?.ai_countermeasures).trim(),
-        ai_third_party: s(data?.ai_third_party).trim(),
-        ai_supplement: s(data?.ai_supplement).trim() || ky.ai_supplement || null,
+        ai_work_detail: w || null,
+        ai_hazards: h || null,
+        ai_countermeasures: c || null,
+        ai_third_party: t || null,
+        ai_supplement: combined ? combined : null,
       };
 
       setKy(next);
