@@ -18,6 +18,9 @@ type Ky = {
   partner_company_name: string | null;
   third_party_level?: string | null;
 
+  // ✅ 追加：本日の作業員数
+  worker_count?: number | null;
+
   weather_slots?: WeatherSlot[] | null;
 
   ai_work_detail?: string | null;
@@ -541,9 +544,7 @@ export default function KyPublicClient({ token }: { token: string }) {
             />
           </div>
         ) : (
-          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
-            個人Noで既読登録します（氏名入力は不要）。
-          </div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">個人Noで既読登録します（氏名入力は不要）。</div>
         )}
 
         <button
@@ -575,6 +576,12 @@ export default function KyPublicClient({ token }: { token: string }) {
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">協力会社</div>
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky.partner_company_name ?? "（未入力）"}</div>
+      </div>
+
+      {/* ✅ 追加：本日の作業員数（公開にも表示） */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
+        <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky.worker_count != null ? `${ky.worker_count} 名` : "（未入力）"}</div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
