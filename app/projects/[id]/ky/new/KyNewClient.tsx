@@ -103,21 +103,6 @@ function splitAiCombined(text: string): { work: string; hazards: string; counter
   return out;
 }
 
-function buildAiCombinedFromParts(parts: { work: string; hazards: string; counter: string; third: string }): string {
-  const w = normalizeText(parts.work);
-  const h = normalizeText(parts.hazards);
-  const c = normalizeText(parts.counter);
-  const t = normalizeText(parts.third);
-
-  const lines: string[] = [];
-  if (w) lines.push("【AI補足｜作業内容】", w);
-  if (h) lines.push("【AI補足｜危険予知】", h);
-  if (c) lines.push("【AI補足｜対策】", c);
-  if (t) lines.push("【AI補足｜第三者】", t);
-
-  return lines.join("\n").trim();
-}
-
 function extFromName(name: string): string {
   const m = name.toLowerCase().match(/\.([a-z0-9]+)$/);
   return m ? m[1] : "jpg";
@@ -429,7 +414,7 @@ export default function KyNewClient() {
       countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
       third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
 
-      // ✅（高度化用に残してOK：API側が無視しても問題ない）
+      // ✅ 追加：作業員数（AIへ渡す）
       worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
 
       lat,
@@ -446,6 +431,7 @@ export default function KyNewClient() {
     hazards,
     countermeasures,
     thirdPartyLevel,
+    workerCount,
     weatherSlots,
     slopeMode,
     pathMode,
@@ -458,7 +444,6 @@ export default function KyNewClient() {
     pathPrevUrl,
     project?.lat,
     project?.lon,
-    workerCount,
   ]);
 
   const onGenerateAi = useCallback(async () => {
@@ -478,37 +463,27 @@ export default function KyNewClient() {
       const j = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(j?.error || "AI補足生成に失敗しました");
 
-      // ✅ 新仕様（JSON）
+      // ✅ 新API（JSON）優先：4項目をそのまま反映
       const w = normalizeText(s(j?.ai_work_detail));
       const h = normalizeText(s(j?.ai_hazards));
       const c = normalizeText(s(j?.ai_countermeasures));
       const t = normalizeText(s(j?.ai_third_party));
 
-      // ✅ 旧仕様互換（ai_supplement 文字列）も拾う
-      if (!w && !h && !c && !t) {
+      if (w || h || c || t) {
+        setAiWork(w);
+        setAiHazards(h);
+        setAiCounter(c);
+        setAiThird(t);
+      } else {
+        // ✅ 互換：旧API（ai_supplement 1本）も拾う
         const combined = normalizeText(s(j?.ai_supplement));
         const split = splitAiCombined(combined);
-        const w2 = normalizeText(split.work);
-        const h2 = normalizeText(split.hazards);
-        const c2 = normalizeText(split.countermeasures);
-        const t2 = normalizeText(split.third);
 
-        if (!w2 && !h2 && !c2 && !t2) throw new Error("AIの出力が空でした（入力内容を増やして再実行してください）");
-
-        setAiWork(w2);
-        setAiHazards(h2);
-        setAiCounter(c2);
-        setAiThird(t2);
-        setStatus({ type: "success", text: "AI補足を生成しました" });
-        return;
+        setAiWork(normalizeText(split.work));
+        setAiHazards(normalizeText(split.hazards));
+        setAiCounter(normalizeText(split.countermeasures));
+        setAiThird(normalizeText(split.third));
       }
-
-      if (!w && !h && !c && !t) throw new Error("AIの出力が空でした（入力内容を増やして再実行してください）");
-
-      setAiWork(w);
-      setAiHazards(h);
-      setAiCounter(c);
-      setAiThird(t);
 
       setStatus({ type: "success", text: "AI補足を生成しました" });
     } catch (e: any) {
@@ -541,13 +516,6 @@ export default function KyNewClient() {
       if (pathMode === "file" && pathFile) pathSavedUrl = await uploadToStorage(pathFile, "path");
       else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;
 
-      const aiCombined = buildAiCombinedFromParts({
-        work: aiWork,
-        hazards: aiHazards,
-        counter: aiCounter,
-        third: aiThird,
-      });
-
       const insertPayload: any = {
         project_id: projectId,
         work_date: workDate,
@@ -561,14 +529,22 @@ export default function KyNewClient() {
         // ✅ 本日の作業員数（worker_count）
         worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
 
-        // ✅ AI（JSON保持）
         ai_work_detail: aiWork.trim() ? aiWork.trim() : null,
         ai_hazards: aiHazards.trim() ? aiHazards.trim() : null,
         ai_countermeasures: aiCounter.trim() ? aiCounter.trim() : null,
         ai_third_party: aiThird.trim() ? aiThird.trim() : null,
-
-        // ✅ 旧互換（見出し付き結合）
-        ai_supplement: aiCombined ? aiCombined : null,
+        ai_supplement: [
+          "【AI補足｜作業内容】",
+          aiWork.trim(),
+          "【AI補足｜危険予知】",
+          aiHazards.trim(),
+          "【AI補足｜対策】",
+          aiCounter.trim(),
+          "【AI補足｜第三者】",
+          aiThird.trim(),
+        ]
+          .filter(Boolean)
+          .join("\n"),
       };
 
       const { data: inserted, error: insErr } = await (supabase as any)
