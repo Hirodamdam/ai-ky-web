@@ -113,7 +113,6 @@ function pickKind(row: any): string {
   return s(row?.photo_kind).trim() || s(row?.kind).trim() || s(row?.type).trim() || s(row?.category).trim() || "";
 }
 function pickUrl(row: any): string {
-  // ✅ 今回のテーブルでは image_url が NOT NULL の主カラム
   return (
     s(row?.image_url).trim() ||
     s(row?.photo_url).trim() ||
@@ -158,7 +157,7 @@ export default function KyNewClient() {
   const [partnerCompanyName, setPartnerCompanyName] = useState<string>("");
   const [partnerOptions, setPartnerOptions] = useState<PartnerOption[]>([]);
 
-  // ✅ 追加：入場者数
+  // ✅ 追加：本日の作業員数（worker_count）
   const [workerCount, setWorkerCount] = useState<string>("");
 
   const [workDetail, setWorkDetail] = useState("");
@@ -231,7 +230,6 @@ export default function KyNewClient() {
         }
       }
 
-      // ✅ ky_photos：列名差を吸収（select("*")）
       const { data: prevPhotos, error: prevErr } = await (supabase as any)
         .from("ky_photos")
         .select("*")
@@ -407,13 +405,8 @@ export default function KyNewClient() {
       precipitation_mm: x.precipitation_mm ?? null,
     }));
 
-    // ✅ 追加：projects.lat/lon を AI生成payloadへ連携
     const lat = project?.lat ?? null;
     const lon = project?.lon ?? null;
-
-    // ✅ 入場者数（AIに渡してもOK：将来の補足精度UP）
-    const wc = workerCount.trim() ? Number(workerCount.trim()) : null;
-    const worker_count = wc != null && !Number.isNaN(wc) ? wc : null;
 
     return {
       work_detail: w,
@@ -421,12 +414,8 @@ export default function KyNewClient() {
       countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
       third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
 
-      // ✅ 追加
       lat,
       lon,
-
-      // ✅ 追加
-      worker_count,
 
       weather_slots: slotsForAi.length ? slotsForAi : null,
       slope_photo_url: slopeNowUrl,
@@ -451,7 +440,6 @@ export default function KyNewClient() {
     pathPrevUrl,
     project?.lat,
     project?.lon,
-    workerCount,
   ]);
 
   const onGenerateAi = useCallback(async () => {
@@ -510,9 +498,6 @@ export default function KyNewClient() {
       if (pathMode === "file" && pathFile) pathSavedUrl = await uploadToStorage(pathFile, "path");
       else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;
 
-      const wc = workerCount.trim() ? Number(workerCount.trim()) : null;
-      const worker_count = wc != null && !Number.isNaN(wc) ? wc : null;
-
       const insertPayload: any = {
         project_id: projectId,
         work_date: workDate,
@@ -521,15 +506,10 @@ export default function KyNewClient() {
         countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
         third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
         partner_company_name: partnerCompanyName.trim(),
-
-        // ✅ 追加：入場者数
-        worker_count,
-
         weather_slots: weatherSlots && weatherSlots.length ? weatherSlots : null,
 
-        // ✅ ここは地雷になりやすいので一旦保存しない（列が無い環境で落ちる）
-        // weather_applied_hour: appliedSlotHour ?? null,
-        // weather_applied_slot: appliedSlotObj ? (appliedSlotObj as any) : null,
+        // ✅ 本日の作業員数（worker_count）
+        worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
 
         ai_work_detail: aiWork.trim() ? aiWork.trim() : null,
         ai_hazards: aiHazards.trim() ? aiHazards.trim() : null,
@@ -559,11 +539,6 @@ export default function KyNewClient() {
       const kyId = s(inserted?.id).trim();
       if (!kyId) throw new Error("保存に失敗しました（kyId不明）");
 
-      // =========================================================
-      // ✅ ky_photos を「確実に」保存する
-      //    - image_url（NOT NULL）を必ず入れる
-      //    - photo_url も互換で入れる（nullable）
-      // =========================================================
       const photoRows: any[] = [];
 
       if (slopeSavedUrl) {
@@ -572,8 +547,8 @@ export default function KyNewClient() {
           ky_id: kyId,
           ky_entry_id: kyId,
           kind: "slope",
-          image_url: slopeSavedUrl, // ✅ 必須
-          photo_url: slopeSavedUrl, // 任意（互換）
+          image_url: slopeSavedUrl,
+          photo_url: slopeSavedUrl,
         });
       }
       if (pathSavedUrl) {
@@ -582,8 +557,8 @@ export default function KyNewClient() {
           ky_id: kyId,
           ky_entry_id: kyId,
           kind: "path",
-          image_url: pathSavedUrl, // ✅ 必須
-          photo_url: pathSavedUrl, // 任意（互換）
+          image_url: pathSavedUrl,
+          photo_url: pathSavedUrl,
         });
       }
 
@@ -612,8 +587,6 @@ export default function KyNewClient() {
     projectId,
     workDate,
     weatherSlots,
-    appliedSlotHour,
-    appliedSlotObj,
     aiWork,
     aiHazards,
     aiCounter,
@@ -684,17 +657,20 @@ export default function KyNewClient() {
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">施工会社（固定）</div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{project?.contractor_name ?? "（未入力）"}</div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
+          {project?.contractor_name ?? "（未入力）"}
+        </div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">
           協力会社 <span className="text-rose-600">（必須）</span>
         </div>
+
         <select
           value={partnerCompanyName}
           onChange={(e) => setPartnerCompanyName(e.target.value)}
-          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+          className="relative z-10 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
         >
           <option value="">選択してください</option>
           {partnerOptions.map((o) => (
@@ -703,28 +679,34 @@ export default function KyNewClient() {
             </option>
           ))}
         </select>
+
         <div className="text-xs text-slate-500">※ 工事詳細で「入場登録」した会社がここに出ます</div>
+        <div className="text-xs text-slate-500">候補数：{partnerOptions.length}</div>
       </div>
 
-      {/* ✅ 追加：入場者数 */}
+      {/* ✅ 追加：本日の作業員数（worker_count） */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
-        <div className="text-sm font-semibold text-slate-800">入場者数</div>
+        <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
         <input
           type="number"
           inputMode="numeric"
-          min={0}
           value={workerCount}
-          onChange={(e) => setWorkerCount(e.target.value)}
+          onChange={(e) => setWorkerCount(String(e.target.value ?? "").replace(/[^\d]/g, ""))}
           className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
           placeholder="例：12"
         />
-        <div className="text-xs text-slate-500">※ 現場の入場者数（概数でもOK）</div>
+        <div className="text-xs text-slate-500">※ 半角数字で入力してください</div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">日付</div>
         <div className="flex items-center gap-3 flex-wrap">
-          <input type="date" value={workDate} onChange={(e) => setWorkDate(e.target.value)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
+          <input
+            type="date"
+            value={workDate}
+            onChange={(e) => setWorkDate(e.target.value)}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+          />
           <div className="text-sm text-slate-600">{fmtDateJp(workDate)}</div>
         </div>
       </div>
@@ -754,7 +736,11 @@ export default function KyNewClient() {
                 ))}
               </select>
 
-              <button type="button" onClick={onApplyWeather} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+              <button
+                type="button"
+                onClick={onApplyWeather}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+              >
                 気象を適用
               </button>
 
@@ -777,7 +763,13 @@ export default function KyNewClient() {
           <div className="text-xs text-slate-600">
             作業内容 <span className="text-rose-600">（必須）</span>
           </div>
-          <textarea value={workDetail} onChange={(e) => setWorkDetail(e.target.value)} rows={3} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" placeholder="例：法面整形、転圧、土砂運搬 など" />
+          <textarea
+            value={workDetail}
+            onChange={(e) => setWorkDetail(e.target.value)}
+            rows={3}
+            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+            placeholder="例：法面整形、転圧、土砂運搬 など"
+          />
         </div>
 
         <div className="space-y-2">
@@ -787,13 +779,22 @@ export default function KyNewClient() {
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">対策（1行でもOK）</div>
-          <textarea value={countermeasures} onChange={(e) => setCountermeasures(e.target.value)} rows={3} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
+          <textarea
+            value={countermeasures}
+            onChange={(e) => setCountermeasures(e.target.value)}
+            rows={3}
+            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+          />
         </div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">第三者（墓参者）の状況</div>
-        <select value={thirdPartyLevel} onChange={(e) => setThirdPartyLevel(e.target.value)} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm">
+        <select
+          value={thirdPartyLevel}
+          onChange={(e) => setThirdPartyLevel(e.target.value)}
+          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+        >
           <option value="">選択してください</option>
           <option value="多い">多い</option>
           <option value="少ない">少ない</option>
@@ -872,9 +873,7 @@ export default function KyNewClient() {
             type="button"
             onClick={onGenerateAi}
             disabled={aiGenerating}
-            className={`rounded-lg border px-3 py-2 text-sm ${
-              aiGenerating ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
-            }`}
+            className={`rounded-lg border px-3 py-2 text-sm ${aiGenerating ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
           >
             {aiGenerating ? "生成中..." : "AI補足を生成"}
           </button>

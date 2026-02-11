@@ -34,7 +34,7 @@ type KyEntryRow = {
 
   partner_company_name: string | null;
 
-  // ✅ 追加：入場者数
+  // ✅ 追加：本日の作業員数
   worker_count?: number | null;
 
   weather_slots?: WeatherSlot[] | null;
@@ -481,7 +481,6 @@ export default function KyReviewClient() {
   }, []);
 
   // ✅ 承認 → 公開リンク発行 → LINE共有へ
-  // ✅ 改善：ページ遷移せずUI更新が見えるように、まず load() してから window.open を優先
   const onApprove = useCallback(async () => {
     setStatus({ type: null, text: "" });
     setActing(true);
@@ -506,13 +505,9 @@ export default function KyReviewClient() {
       const msg = `KY承認しました\n${project?.name ? `工事：${project.name}\n` : ""}${url}`;
       const lineUrl = `https://line.me/R/msg/text/?${encodeURIComponent(msg)}`;
 
-      setStatus({ type: "success", text: "承認しました（既読/未読も表示します。必要ならLINE共有を開きます）" });
-
+      setStatus({ type: "success", text: "承認しました（LINEを開きます）" });
       await load();
-
-      // ✅ なるべくUIを残す（新規タブ優先、ダメなら遷移）
-      const opened = window.open(lineUrl, "_blank");
-      if (!opened) window.location.href = lineUrl;
+      window.location.href = lineUrl;
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "承認に失敗しました" });
     } finally {
@@ -671,7 +666,6 @@ export default function KyReviewClient() {
           <div className="mt-1 text-sm text-slate-600">日付：{ky?.work_date ? fmtDateJp(ky.work_date) : "（不明）"}</div>
         </div>
 
-        {/* ✅ ヘッダーにログイン導線があるので、ページ内の「ログイン」は出さない */}
         <div className="flex flex-col gap-2 shrink-0">
           <Link className="text-sm text-blue-600 underline text-right" href={`/projects/${projectId}/ky`}>
             KY一覧へ
@@ -704,11 +698,7 @@ export default function KyReviewClient() {
             </a>
 
             {qrDataUrl ? (
-              <button
-                type="button"
-                onClick={() => setQrOpen(true)}
-                className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
-              >
+              <button type="button" onClick={() => setQrOpen(true)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50">
                 QRを表示
               </button>
             ) : null}
@@ -846,15 +836,14 @@ export default function KyReviewClient() {
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.partner_company_name ?? "（未入力）"}</div>
       </div>
 
-      {/* ✅ 追加：入場者数 */}
+      {/* ✅ 追加：本日の作業員数 */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
-        <div className="text-sm font-semibold text-slate-800">入場者数</div>
+        <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
           {ky?.worker_count != null ? `${ky.worker_count} 人` : "（未入力）"}
         </div>
       </div>
 
-      {/* ✅ 人が入力した本文 */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
         <div className="text-sm font-semibold text-slate-800">作業内容</div>
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.work_detail).trim() || "（未入力）"}</div>
@@ -898,7 +887,6 @@ export default function KyReviewClient() {
         )}
       </div>
 
-      {/* ✅ 2ページ目へ */}
       <div className="print-page-break" />
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
@@ -955,7 +943,6 @@ export default function KyReviewClient() {
         </div>
       </div>
 
-      {/* ✅ 3ページ目へ */}
       <div className="print-page-break" />
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
