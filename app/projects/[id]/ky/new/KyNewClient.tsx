@@ -39,13 +39,9 @@ function s(v: any) {
 function ymdJst(d: Date): string {
   const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
   const y = jst.getUTCFullYear();
-  const m = String(jst.getUTCMonth() + 1).padStart(2, leadingZero2());
-  const day = String(jst.getUTCDate()).padStart(2, leadingZero2());
+  const m = String(jst.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(jst.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
-
-  function leadingZero2() {
-    return "0";
-  }
 }
 
 function fmtDateJp(iso: string): string {
@@ -117,7 +113,15 @@ function pickKind(row: any): string {
   return s(row?.photo_kind).trim() || s(row?.kind).trim() || s(row?.type).trim() || s(row?.category).trim() || "";
 }
 function pickUrl(row: any): string {
-  return s(row?.image_url).trim() || s(row?.photo_url).trim() || s(row?.url).trim() || s(row?.photo_path).trim() || s(row?.path).trim() || "";
+  // ✅ 今回のテーブルでは image_url が NOT NULL の主カラム
+  return (
+    s(row?.image_url).trim() ||
+    s(row?.photo_url).trim() ||
+    s(row?.url).trim() ||
+    s(row?.photo_path).trim() ||
+    s(row?.path).trim() ||
+    ""
+  );
 }
 
 function slotSummary(slot: WeatherSlot | null | undefined): string {
@@ -154,7 +158,7 @@ export default function KyNewClient() {
   const [partnerCompanyName, setPartnerCompanyName] = useState<string>("");
   const [partnerOptions, setPartnerOptions] = useState<PartnerOption[]>([]);
 
-  // ✅ 追加：本日の作業員数（必須）
+  // ✅ 追加：入場者数
   const [workerCount, setWorkerCount] = useState<string>("");
 
   const [workDetail, setWorkDetail] = useState("");
@@ -227,6 +231,7 @@ export default function KyNewClient() {
         }
       }
 
+      // ✅ ky_photos：列名差を吸収（select("*")）
       const { data: prevPhotos, error: prevErr } = await (supabase as any)
         .from("ky_photos")
         .select("*")
@@ -266,6 +271,7 @@ export default function KyNewClient() {
     fetchInitial();
   }, [fetchInitial]);
 
+  // ✅ weather：POSTが405ならGETへフォールバック
   const fetchWeather = useCallback(async () => {
     const lat = project?.lat ?? null;
     const lon = project?.lon ?? null;
@@ -301,6 +307,7 @@ export default function KyNewClient() {
 
       if (normalized.length) {
         setSelectedSlotHour(normalized[0].hour);
+        if (!appliedSlotHour) setAppliedSlotHour(null);
       } else {
         setSelectedSlotHour(null);
         setAppliedSlotHour(null);
@@ -310,7 +317,7 @@ export default function KyNewClient() {
       setSelectedSlotHour(null);
       setAppliedSlotHour(null);
     }
-  }, [project?.lat, project?.lon, workDate]);
+  }, [project?.lat, project?.lon, workDate, appliedSlotHour]);
 
   useEffect(() => {
     fetchWeather();
@@ -382,11 +389,6 @@ export default function KyNewClient() {
     const w = workDetail.trim();
     if (!w) throw new Error("作業内容（必須）を入力してください");
 
-    // ✅ 追加：作業員数（AIにも渡す）
-    const wc = workerCount.trim() ? Number(workerCount) : NaN;
-    if (!workerCount.trim()) throw new Error("本日の作業員数（必須）を入力してください");
-    if (!Number.isFinite(wc) || wc <= 0) throw new Error("本日の作業員数は 1 以上の数値で入力してください");
-
     let slopeNowUrl: string | null = null;
     let pathNowUrl: string | null = null;
 
@@ -405,8 +407,13 @@ export default function KyNewClient() {
       precipitation_mm: x.precipitation_mm ?? null,
     }));
 
+    // ✅ 追加：projects.lat/lon を AI生成payloadへ連携
     const lat = project?.lat ?? null;
     const lon = project?.lon ?? null;
+
+    // ✅ 入場者数（AIに渡してもOK：将来の補足精度UP）
+    const wc = workerCount.trim() ? Number(workerCount.trim()) : null;
+    const worker_count = wc != null && !Number.isNaN(wc) ? wc : null;
 
     return {
       work_detail: w,
@@ -414,11 +421,12 @@ export default function KyNewClient() {
       countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
       third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
 
-      // ✅ 追加：作業員数
-      worker_count: wc,
-
+      // ✅ 追加
       lat,
       lon,
+
+      // ✅ 追加
+      worker_count,
 
       weather_slots: slotsForAi.length ? slotsForAi : null,
       slope_photo_url: slopeNowUrl,
@@ -431,7 +439,6 @@ export default function KyNewClient() {
     hazards,
     countermeasures,
     thirdPartyLevel,
-    workerCount,
     weatherSlots,
     slopeMode,
     pathMode,
@@ -444,6 +451,7 @@ export default function KyNewClient() {
     pathPrevUrl,
     project?.lat,
     project?.lon,
+    workerCount,
   ]);
 
   const onGenerateAi = useCallback(async () => {
@@ -486,15 +494,6 @@ export default function KyNewClient() {
       setStatus({ type: "error", text: "協力会社（必須）を選択してください" });
       return;
     }
-    if (!workerCount.trim()) {
-      setStatus({ type: "error", text: "本日の作業員数（必須）を入力してください" });
-      return;
-    }
-    const wc = Number(workerCount);
-    if (!Number.isFinite(wc) || wc <= 0) {
-      setStatus({ type: "error", text: "本日の作業員数は 1 以上の数値で入力してください" });
-      return;
-    }
     if (!workDetail.trim()) {
       setStatus({ type: "error", text: "作業内容（必須）を入力してください" });
       return;
@@ -511,19 +510,26 @@ export default function KyNewClient() {
       if (pathMode === "file" && pathFile) pathSavedUrl = await uploadToStorage(pathFile, "path");
       else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;
 
+      const wc = workerCount.trim() ? Number(workerCount.trim()) : null;
+      const worker_count = wc != null && !Number.isNaN(wc) ? wc : null;
+
       const insertPayload: any = {
         project_id: projectId,
         work_date: workDate,
-
-        // ✅ 追加：作業員数
-        worker_count: wc,
-
         work_detail: workDetail.trim(),
         hazards: hazards.trim() ? hazards.trim() : null,
         countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
         third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
         partner_company_name: partnerCompanyName.trim(),
+
+        // ✅ 追加：入場者数
+        worker_count,
+
         weather_slots: weatherSlots && weatherSlots.length ? weatherSlots : null,
+
+        // ✅ ここは地雷になりやすいので一旦保存しない（列が無い環境で落ちる）
+        // weather_applied_hour: appliedSlotHour ?? null,
+        // weather_applied_slot: appliedSlotObj ? (appliedSlotObj as any) : null,
 
         ai_work_detail: aiWork.trim() ? aiWork.trim() : null,
         ai_hazards: aiHazards.trim() ? aiHazards.trim() : null,
@@ -543,12 +549,21 @@ export default function KyNewClient() {
           .join("\n"),
       };
 
-      const { data: inserted, error: insErr } = await (supabase as any).from("ky_entries").insert(insertPayload).select("id").maybeSingle();
+      const { data: inserted, error: insErr } = await (supabase as any)
+        .from("ky_entries")
+        .insert(insertPayload)
+        .select("id")
+        .maybeSingle();
       if (insErr) throw insErr;
 
       const kyId = s(inserted?.id).trim();
       if (!kyId) throw new Error("保存に失敗しました（kyId不明）");
 
+      // =========================================================
+      // ✅ ky_photos を「確実に」保存する
+      //    - image_url（NOT NULL）を必ず入れる
+      //    - photo_url も互換で入れる（nullable）
+      // =========================================================
       const photoRows: any[] = [];
 
       if (slopeSavedUrl) {
@@ -557,8 +572,8 @@ export default function KyNewClient() {
           ky_id: kyId,
           ky_entry_id: kyId,
           kind: "slope",
-          image_url: slopeSavedUrl,
-          photo_url: slopeSavedUrl,
+          image_url: slopeSavedUrl, // ✅ 必須
+          photo_url: slopeSavedUrl, // 任意（互換）
         });
       }
       if (pathSavedUrl) {
@@ -567,8 +582,8 @@ export default function KyNewClient() {
           ky_id: kyId,
           ky_entry_id: kyId,
           kind: "path",
-          image_url: pathSavedUrl,
-          photo_url: pathSavedUrl,
+          image_url: pathSavedUrl, // ✅ 必須
+          photo_url: pathSavedUrl, // 任意（互換）
         });
       }
 
@@ -590,7 +605,6 @@ export default function KyNewClient() {
     }
   }, [
     partnerCompanyName,
-    workerCount,
     workDetail,
     hazards,
     countermeasures,
@@ -598,6 +612,8 @@ export default function KyNewClient() {
     projectId,
     workDate,
     weatherSlots,
+    appliedSlotHour,
+    appliedSlotObj,
     aiWork,
     aiHazards,
     aiCounter,
@@ -610,28 +626,32 @@ export default function KyNewClient() {
     uploadToStorage,
     slopeUrlFromProject,
     pathUrlFromProject,
+    workerCount,
   ]);
 
-  const WeatherCard = useCallback(({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) => {
-    const isApplied = appliedHour != null && slot.hour === appliedHour;
-    return (
-      <div className={`rounded-lg border p-3 ${isApplied ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`}>
-        <div className="flex items-center justify-between">
-          <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>
-          {isApplied && <div className="text-xs font-semibold text-emerald-700">適用中</div>}
-        </div>
-        <div className="mt-1 text-sm text-slate-700">{slot.weather_text || "（不明）"}</div>
-        <div className="mt-2 text-xs text-slate-600 space-y-1">
-          <div>気温：{slot.temperature_c ?? "—"} ℃</div>
-          <div>
-            風：{degToDirJp(slot.wind_direction_deg) || "—"}{" "}
-            {slot.wind_speed_ms !== null && slot.wind_speed_ms !== undefined ? `${slot.wind_speed_ms} m/s` : "—"}
+  const WeatherCard = useCallback(
+    ({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) => {
+      const isApplied = appliedHour != null && slot.hour === appliedHour;
+      return (
+        <div className={`rounded-lg border p-3 ${isApplied ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`}>
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>
+            {isApplied && <div className="text-xs font-semibold text-emerald-700">適用中</div>}
           </div>
-          <div>降水：{slot.precipitation_mm ?? "—"} mm</div>
+          <div className="mt-1 text-sm text-slate-700">{slot.weather_text || "（不明）"}</div>
+          <div className="mt-2 text-xs text-slate-600 space-y-1">
+            <div>気温：{slot.temperature_c ?? "—"} ℃</div>
+            <div>
+              風：{degToDirJp(slot.wind_direction_deg) || "—"}{" "}
+              {slot.wind_speed_ms !== null && slot.wind_speed_ms !== undefined ? `${slot.wind_speed_ms} m/s` : "—"}
+            </div>
+            <div>降水：{slot.precipitation_mm ?? "—"} mm</div>
+          </div>
         </div>
-      </div>
-    );
-  }, []);
+      );
+    },
+    []
+  );
 
   if (loading) {
     return (
@@ -649,6 +669,9 @@ export default function KyNewClient() {
           <div className="mt-1 text-sm text-slate-600">工事件名：{project?.name ?? "（不明）"}</div>
         </div>
         <div className="flex flex-col gap-2 shrink-0">
+          <Link className="text-sm text-blue-600 underline text-right" href="/login">
+            ログイン
+          </Link>
           <Link className="text-sm text-blue-600 underline text-right" href={`/projects/${projectId}/ky`}>
             KY一覧へ
           </Link>
@@ -683,30 +706,27 @@ export default function KyNewClient() {
         <div className="text-xs text-slate-500">※ 工事詳細で「入場登録」した会社がここに出ます</div>
       </div>
 
+      {/* ✅ 追加：入場者数 */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
+        <div className="text-sm font-semibold text-slate-800">入場者数</div>
+        <input
+          type="number"
+          inputMode="numeric"
+          min={0}
+          value={workerCount}
+          onChange={(e) => setWorkerCount(e.target.value)}
+          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+          placeholder="例：12"
+        />
+        <div className="text-xs text-slate-500">※ 現場の入場者数（概数でもOK）</div>
+      </div>
+
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">日付</div>
         <div className="flex items-center gap-3 flex-wrap">
           <input type="date" value={workDate} onChange={(e) => setWorkDate(e.target.value)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
           <div className="text-sm text-slate-600">{fmtDateJp(workDate)}</div>
         </div>
-      </div>
-
-      {/* ✅ 追加：本日の作業員数 */}
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
-        <div className="text-sm font-semibold text-slate-800">
-          本日の作業員数 <span className="text-rose-600">（必須）</span>
-        </div>
-        <input
-          type="number"
-          inputMode="numeric"
-          min={1}
-          step={1}
-          value={workerCount}
-          onChange={(e) => setWorkerCount(e.target.value)}
-          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-          placeholder="例：12"
-        />
-        <div className="text-xs text-slate-500">※ 当日の作業員の総数（協力会社含む）</div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
@@ -738,7 +758,11 @@ export default function KyNewClient() {
                 気象を適用
               </button>
 
-              {appliedSlotHour && <div className="text-xs text-slate-600">適用：{appliedSlotHour}時 / {slotSummary(appliedSlotObj)}</div>}
+              {appliedSlotHour && (
+                <div className="text-xs text-slate-600">
+                  適用：{appliedSlotHour}時 / {slotSummary(appliedSlotObj)}
+                </div>
+              )}
             </div>
           </>
         ) : (
@@ -753,13 +777,7 @@ export default function KyNewClient() {
           <div className="text-xs text-slate-600">
             作業内容 <span className="text-rose-600">（必須）</span>
           </div>
-          <textarea
-            value={workDetail}
-            onChange={(e) => setWorkDetail(e.target.value)}
-            rows={3}
-            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-            placeholder="例：法面整形、転圧、土砂運搬 など"
-          />
+          <textarea value={workDetail} onChange={(e) => setWorkDetail(e.target.value)} rows={3} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" placeholder="例：法面整形、転圧、土砂運搬 など" />
         </div>
 
         <div className="space-y-2">
@@ -769,12 +787,7 @@ export default function KyNewClient() {
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">対策（1行でもOK）</div>
-          <textarea
-            value={countermeasures}
-            onChange={(e) => setCountermeasures(e.target.value)}
-            rows={3}
-            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-          />
+          <textarea value={countermeasures} onChange={(e) => setCountermeasures(e.target.value)} rows={3} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
         </div>
       </div>
 
@@ -907,12 +920,7 @@ export default function KyNewClient() {
           戻る
         </button>
 
-        <button
-          type="button"
-          onClick={onSave}
-          disabled={saving}
-          className={`rounded-lg px-4 py-2 text-sm text-white ${saving ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}
-        >
+        <button type="button" onClick={onSave} disabled={saving} className={`rounded-lg px-4 py-2 text-sm text-white ${saving ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}>
           {saving ? "保存中..." : "保存"}
         </button>
       </div>
