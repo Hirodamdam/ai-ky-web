@@ -35,31 +35,25 @@ export default function ProjectsPage() {
   const [loading, setLoading] = useState(false);
   const [rows, setRows] = useState<Project[]>([]);
   const [status, setStatus] = useState<Status>({ type: null, text: "" });
-
-  // ✅ ログイン状態（null=確認中）
   const [isLoggedIn, setIsLoggedIn] = useState<boolean | null>(null);
   const [userLabel, setUserLabel] = useState<string>("");
 
-  // ✅ ログイン状態は「1回取得 + 変化追従」
+  // -----------------------------
+  // 🔐 Auth監視
+  // -----------------------------
   useEffect(() => {
     let cancelled = false;
     let unsub: any = null;
 
     async function initAuth() {
-      try {
-        const { data } = await supabase.auth.getSession();
-        if (cancelled) return;
+      const { data } = await supabase.auth.getSession();
+      if (cancelled) return;
 
-        const user = data?.session?.user ?? null;
-        setIsLoggedIn(!!user);
-        setUserLabel(user?.email || user?.id || "");
-      } catch {
-        if (cancelled) return;
-        setIsLoggedIn(false);
-        setUserLabel("");
-      }
+      const user = data?.session?.user ?? null;
+      setIsLoggedIn(!!user);
+      setUserLabel(user?.email || user?.id || "");
 
-      const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
         const user = session?.user ?? null;
         setIsLoggedIn(!!user);
         setUserLabel(user?.email || user?.id || "");
@@ -69,46 +63,54 @@ export default function ProjectsPage() {
     }
 
     initAuth();
-
     return () => {
       cancelled = true;
-      try {
-        unsub?.unsubscribe?.();
-      } catch {}
+      unsub?.unsubscribe?.();
     };
   }, []);
 
-  // ✅ projects 読み込み（ログイン有無は関係なく表示はする）
-  useEffect(() => {
-    let cancelled = false;
+  // -----------------------------
+  // 📦 読込
+  // -----------------------------
+  async function loadProjects() {
+    setLoading(true);
+    const { data, error } = await supabase
+      .from("projects")
+      .select("id, name, site_name, is_active, created_at")
+      .order("created_at", { ascending: false });
 
-    async function load() {
-      setLoading(true);
-      setStatus({ type: null, text: "" });
-
-      const { data, error } = await supabase
-        .from("projects")
-        .select("id, name, site_name, is_active, created_at")
-        .order("created_at", { ascending: false });
-
-      if (cancelled) return;
-
-      if (error) {
-        setStatus({ type: "error", text: `読込エラー: ${error.message}` });
-        setRows([]);
-        setLoading(false);
-        return;
-      }
-
+    if (error) {
+      setStatus({ type: "error", text: error.message });
+      setRows([]);
+    } else {
       setRows((data ?? []) as Project[]);
-      setLoading(false);
+    }
+    setLoading(false);
+  }
+
+  useEffect(() => {
+    loadProjects();
+  }, []);
+
+  // -----------------------------
+  // 🗑 削除
+  // -----------------------------
+  async function handleDelete(id: string) {
+    if (!confirm("このプロジェクトを削除しますか？\n（元に戻せません）")) return;
+
+    const { error } = await supabase
+      .from("projects")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      alert("削除失敗: " + error.message);
+      return;
     }
 
-    load();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    // 一覧を即時更新
+    setRows((prev) => prev.filter((r) => r.id !== id));
+  }
 
   const activeCount = useMemo(
     () => rows.filter((r) => r.is_active !== false).length,
@@ -124,7 +126,6 @@ export default function ProjectsPage() {
           プロジェクト一覧
         </h1>
 
-        {/* ✅ 右上（作成導線 + ステータス） */}
         <div
           style={{
             marginLeft: "auto",
@@ -144,118 +145,23 @@ export default function ProjectsPage() {
               color: isLoggedIn ? "#fff" : "#111",
               fontWeight: 700,
               fontSize: 12,
-              whiteSpace: "nowrap",
             }}
           >
             ＋ プロジェクト作成
           </Link>
 
-          <div style={{ fontSize: 12, opacity: 0.7, textAlign: "right" }}>
-            <div>
-              {loading ? "読み込み中..." : `${rows.length}件（稼働 ${activeCount}件）`}
-            </div>
-            <div style={{ marginTop: 4 }}>
-              {isLoggedIn === null ? (
-                "ログイン状態：確認中..."
-              ) : isLoggedIn ? (
-                <span>
-                  ログイン中{userLabel ? `（${userLabel}）` : ""}
-                  {" / "}
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      await supabase.auth.signOut();
-                      location.reload();
-                    }}
-                    style={{
-                      border: "none",
-                      background: "transparent",
-                      padding: 0,
-                      cursor: "pointer",
-                      color: "#b91c1c",
-                      textDecoration: "underline",
-                      fontSize: 12,
-                    }}
-                  >
-                    ログアウト
-                  </button>
-                </span>
-              ) : (
-                <span>
-                  未ログイン{" / "}
-                  <Link href="/login" style={{ textDecoration: "underline" }}>
-                    ログイン
-                  </Link>
-                </span>
-              )}
-            </div>
+          <div style={{ fontSize: 12, opacity: 0.7 }}>
+            {loading
+              ? "読み込み中..."
+              : `${rows.length}件（稼働 ${activeCount}件）`}
           </div>
         </div>
       </div>
 
-      {isLoggedIn === false && (
-        <div
-          style={{
-            marginTop: 12,
-            padding: 12,
-            border: "1px solid #ffeeba",
-            borderRadius: 12,
-            background: "#fff3cd",
-          }}
-        >
-          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            <p style={{ margin: 0, color: "#856404", fontWeight: 700 }}>
-              ⚠ ログインしていません。編集・保存はできません。
-            </p>
-            <div style={{ marginLeft: "auto" }}>
-              <Link
-                href="/login"
-                style={{
-                  padding: "8px 10px",
-                  borderRadius: 12,
-                  border: "1px solid #ddd",
-                  textDecoration: "none",
-                  background: "#fff",
-                  color: "#111",
-                  fontWeight: 700,
-                  fontSize: 12,
-                }}
-              >
-                ログインへ
-              </Link>
-            </div>
-          </div>
-          <p
-            style={{
-              margin: "6px 0 0 0",
-              color: "#856404",
-              fontSize: 12,
-              opacity: 0.9,
-            }}
-          >
-            右上の「ログイン」表示が残る場合でも、このページ右上の「ログイン中/未ログイン」が真の状態です。
-          </p>
-        </div>
-      )}
-
-      {status.type && (
-        <div
-          style={{
-            marginTop: 12,
-            padding: 12,
-            border: "1px solid #ddd",
-            borderRadius: 12,
-            background: "#fff",
-          }}
-        >
-          <p style={{ margin: 0 }}>{status.text}</p>
-        </div>
-      )}
-
       <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
         {rows.map((p) => {
           const ok = isValidUuid(p.id);
-          const href = ok ? `/projects/${p.id}` : "#"; // ✅ 方針A：KY直行はしない
+          const href = ok ? `/projects/${p.id}` : "#";
 
           return (
             <div
@@ -273,6 +179,7 @@ export default function ProjectsPage() {
                 <div style={{ fontWeight: 700 }}>
                   {p.name ?? "（名称未設定）"}
                 </div>
+
                 {p.is_active === false && (
                   <span
                     style={{
@@ -286,16 +193,10 @@ export default function ProjectsPage() {
                   </span>
                 )}
 
-                <div style={{ marginLeft: "auto" }}>
+                <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
                   <Link
                     href={href}
-                    aria-disabled={!ok}
-                    onClick={(e) => {
-                      if (!ok) e.preventDefault();
-                    }}
                     style={{
-                      pointerEvents: ok ? "auto" : "none",
-                      opacity: ok ? 1 : 0.5,
                       padding: "8px 10px",
                       borderRadius: 12,
                       border: "1px solid #ddd",
@@ -305,6 +206,24 @@ export default function ProjectsPage() {
                   >
                     工事詳細
                   </Link>
+
+                  {isLoggedIn && (
+                    <button
+                      onClick={() => handleDelete(p.id)}
+                      style={{
+                        padding: "8px 10px",
+                        borderRadius: 12,
+                        border: "1px solid #dc2626",
+                        background: "#dc2626",
+                        color: "#fff",
+                        cursor: "pointer",
+                        fontSize: 12,
+                        fontWeight: 700,
+                      }}
+                    >
+                      削除
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -331,51 +250,9 @@ export default function ProjectsPage() {
                   {p.id}
                 </div>
               </div>
-
-              {!ok && (
-                <div style={{ fontSize: 12, opacity: 0.7 }}>
-                  IDが不正のため「工事詳細」リンクを無効化しています。
-                </div>
-              )}
             </div>
           );
         })}
-
-        {!loading && rows.length === 0 && (
-          <div
-            style={{
-              padding: 14,
-              border: "1px solid #ddd",
-              borderRadius: 16,
-              background: "#fff",
-            }}
-          >
-            <p style={{ margin: 0, fontWeight: 700 }}>
-              プロジェクトがありません。
-            </p>
-            <p style={{ margin: "6px 0 0 0", fontSize: 12, opacity: 0.7 }}>
-              まず「プロジェクト作成」から現場を登録してください。
-            </p>
-            <div style={{ marginTop: 10 }}>
-              <Link
-                href={createHref}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 12,
-                  border: "1px solid #111",
-                  textDecoration: "none",
-                  background: isLoggedIn ? "#111" : "#f3f4f6",
-                  color: isLoggedIn ? "#fff" : "#111",
-                  fontWeight: 700,
-                  fontSize: 12,
-                  display: "inline-block",
-                }}
-              >
-                ＋ プロジェクト作成
-              </Link>
-            </div>
-          </div>
-        )}
       </div>
     </main>
   );
