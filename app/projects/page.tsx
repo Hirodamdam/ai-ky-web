@@ -35,25 +35,34 @@ export default function ProjectsPage() {
   const [loading, setLoading] = useState(false);
   const [rows, setRows] = useState<Project[]>([]);
   const [status, setStatus] = useState<Status>({ type: null, text: "" });
+
+  // ✅ ログイン状態（null=確認中）
   const [isLoggedIn, setIsLoggedIn] = useState<boolean | null>(null);
   const [userLabel, setUserLabel] = useState<string>("");
 
-  // -----------------------------
-  // 🔐 Auth監視
-  // -----------------------------
+  // ✅ 削除中のID（連打防止・表示制御）
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // ✅ ログイン状態は「1回取得 + 変化追従」
   useEffect(() => {
     let cancelled = false;
     let unsub: any = null;
 
     async function initAuth() {
-      const { data } = await supabase.auth.getSession();
-      if (cancelled) return;
+      try {
+        const { data } = await supabase.auth.getSession();
+        if (cancelled) return;
 
-      const user = data?.session?.user ?? null;
-      setIsLoggedIn(!!user);
-      setUserLabel(user?.email || user?.id || "");
+        const user = data?.session?.user ?? null;
+        setIsLoggedIn(!!user);
+        setUserLabel(user?.email || user?.id || "");
+      } catch {
+        if (cancelled) return;
+        setIsLoggedIn(false);
+        setUserLabel("");
+      }
 
-      const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
+      const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
         const user = session?.user ?? null;
         setIsLoggedIn(!!user);
         setUserLabel(user?.email || user?.id || "");
@@ -63,54 +72,49 @@ export default function ProjectsPage() {
     }
 
     initAuth();
+
     return () => {
       cancelled = true;
-      unsub?.unsubscribe?.();
+      try {
+        unsub?.unsubscribe?.();
+      } catch {}
     };
   }, []);
 
-  // -----------------------------
-  // 📦 読込
-  // -----------------------------
-  async function loadProjects() {
+  // ✅ projects 読み込み（ログイン有無は関係なく表示はする）
+  const loadProjects = async () => {
     setLoading(true);
+    setStatus({ type: null, text: "" });
+
     const { data, error } = await supabase
       .from("projects")
       .select("id, name, site_name, is_active, created_at")
       .order("created_at", { ascending: false });
 
     if (error) {
-      setStatus({ type: "error", text: error.message });
+      setStatus({ type: "error", text: `読込エラー: ${error.message}` });
       setRows([]);
-    } else {
-      setRows((data ?? []) as Project[]);
-    }
-    setLoading(false);
-  }
-
-  useEffect(() => {
-    loadProjects();
-  }, []);
-
-  // -----------------------------
-  // 🗑 削除
-  // -----------------------------
-  async function handleDelete(id: string) {
-    if (!confirm("このプロジェクトを削除しますか？\n（元に戻せません）")) return;
-
-    const { error } = await supabase
-      .from("projects")
-      .delete()
-      .eq("id", id);
-
-    if (error) {
-      alert("削除失敗: " + error.message);
+      setLoading(false);
       return;
     }
 
-    // 一覧を即時更新
-    setRows((prev) => prev.filter((r) => r.id !== id));
-  }
+    setRows((data ?? []) as Project[]);
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      await loadProjects();
+      if (cancelled) return;
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const activeCount = useMemo(
     () => rows.filter((r) => r.is_active !== false).length,
@@ -119,13 +123,45 @@ export default function ProjectsPage() {
 
   const createHref = isLoggedIn ? "/projects/create" : "/login";
 
+  const onDelete = async (project: Project) => {
+    if (!isLoggedIn) {
+      setStatus({ type: "error", text: "削除にはログインが必要です。" });
+      return;
+    }
+
+    if (!isValidUuid(project.id)) {
+      setStatus({ type: "error", text: "IDが不正のため削除できません。" });
+      return;
+    }
+
+    const name = project.name ?? "（名称未設定）";
+    const ok = confirm(`このプロジェクトを削除しますか？\n\n${name}\n${project.id}`);
+    if (!ok) return;
+
+    setDeletingId(project.id);
+    setStatus({ type: null, text: "" });
+
+    const { error } = await supabase.from("projects").delete().eq("id", project.id);
+
+    if (error) {
+      setStatus({ type: "error", text: `削除エラー: ${error.message}` });
+      setDeletingId(null);
+      return;
+    }
+
+    setStatus({ type: "success", text: "削除しました。" });
+
+    // ✅ 一覧を再取得（reloadより安全）
+    await loadProjects();
+    setDeletingId(null);
+  };
+
   return (
     <main style={{ padding: 16, maxWidth: 960, margin: "0 auto" }}>
       <div style={{ display: "flex", gap: 12, alignItems: "baseline" }}>
-        <h1 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>
-          プロジェクト一覧
-        </h1>
+        <h1 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>プロジェクト一覧</h1>
 
+        {/* ✅ 右上（作成導線 + ステータス） */}
         <div
           style={{
             marginLeft: "auto",
@@ -145,23 +181,112 @@ export default function ProjectsPage() {
               color: isLoggedIn ? "#fff" : "#111",
               fontWeight: 700,
               fontSize: 12,
+              whiteSpace: "nowrap",
             }}
           >
             ＋ プロジェクト作成
           </Link>
 
-          <div style={{ fontSize: 12, opacity: 0.7 }}>
-            {loading
-              ? "読み込み中..."
-              : `${rows.length}件（稼働 ${activeCount}件）`}
+          <div style={{ fontSize: 12, opacity: 0.7, textAlign: "right" }}>
+            <div>{loading ? "読み込み中..." : `${rows.length}件（稼働 ${activeCount}件）`}</div>
+            <div style={{ marginTop: 4 }}>
+              {isLoggedIn === null ? (
+                "ログイン状態：確認中..."
+              ) : isLoggedIn ? (
+                <span>
+                  ログイン中{userLabel ? `（${userLabel}）` : ""}
+                  {" / "}
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await supabase.auth.signOut();
+                      location.reload();
+                    }}
+                    style={{
+                      border: "none",
+                      background: "transparent",
+                      padding: 0,
+                      cursor: "pointer",
+                      color: "#b91c1c",
+                      textDecoration: "underline",
+                      fontSize: 12,
+                    }}
+                  >
+                    ログアウト
+                  </button>
+                </span>
+              ) : (
+                <span>
+                  未ログイン{" / "}
+                  <Link href="/login" style={{ textDecoration: "underline" }}>
+                    ログイン
+                  </Link>
+                </span>
+              )}
+            </div>
           </div>
         </div>
       </div>
 
+      {isLoggedIn === false && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: 12,
+            border: "1px solid #ffeeba",
+            borderRadius: 12,
+            background: "#fff3cd",
+          }}
+        >
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <p style={{ margin: 0, color: "#856404", fontWeight: 700 }}>
+              ⚠ ログインしていません。編集・保存はできません。
+            </p>
+            <div style={{ marginLeft: "auto" }}>
+              <Link
+                href="/login"
+                style={{
+                  padding: "8px 10px",
+                  borderRadius: 12,
+                  border: "1px solid #ddd",
+                  textDecoration: "none",
+                  background: "#fff",
+                  color: "#111",
+                  fontWeight: 700,
+                  fontSize: 12,
+                }}
+              >
+                ログインへ
+              </Link>
+            </div>
+          </div>
+          <p style={{ margin: "6px 0 0 0", color: "#856404", fontSize: 12, opacity: 0.9 }}>
+            右上の「ログイン」表示が残る場合でも、このページ右上の「ログイン中/未ログイン」が真の状態です。
+          </p>
+        </div>
+      )}
+
+      {status.type && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: 12,
+            border: "1px solid #ddd",
+            borderRadius: 12,
+            background: "#fff",
+          }}
+        >
+          <p style={{ margin: 0, color: status.type === "error" ? "#b91c1c" : "#065f46" }}>
+            {status.text}
+          </p>
+        </div>
+      )}
+
       <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
         {rows.map((p) => {
           const ok = isValidUuid(p.id);
-          const href = ok ? `/projects/${p.id}` : "#";
+          const href = ok ? `/projects/${p.id}` : "#"; // ✅ 方針A：KY直行はしない
+          const isDeleting = deletingId === p.id;
 
           return (
             <div
@@ -176,9 +301,7 @@ export default function ProjectsPage() {
               }}
             >
               <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                <div style={{ fontWeight: 700 }}>
-                  {p.name ?? "（名称未設定）"}
-                </div>
+                <div style={{ fontWeight: 700 }}>{p.name ?? "（名称未設定）"}</div>
 
                 {p.is_active === false && (
                   <span
@@ -196,7 +319,13 @@ export default function ProjectsPage() {
                 <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
                   <Link
                     href={href}
+                    aria-disabled={!ok}
+                    onClick={(e) => {
+                      if (!ok) e.preventDefault();
+                    }}
                     style={{
+                      pointerEvents: ok ? "auto" : "none",
+                      opacity: ok ? 1 : 0.5,
                       padding: "8px 10px",
                       borderRadius: 12,
                       border: "1px solid #ddd",
@@ -207,52 +336,75 @@ export default function ProjectsPage() {
                     工事詳細
                   </Link>
 
+                  {/* ✅ 削除ボタン（ログイン時のみ） */}
                   {isLoggedIn && (
                     <button
-                      onClick={() => handleDelete(p.id)}
+                      type="button"
+                      onClick={() => onDelete(p)}
+                      disabled={!ok || isDeleting}
                       style={{
                         padding: "8px 10px",
                         borderRadius: 12,
-                        border: "1px solid #dc2626",
-                        background: "#dc2626",
+                        border: "1px solid #b91c1c",
+                        background: isDeleting ? "#fca5a5" : "#b91c1c",
                         color: "#fff",
-                        cursor: "pointer",
-                        fontSize: 12,
+                        cursor: !ok || isDeleting ? "not-allowed" : "pointer",
                         fontWeight: 700,
+                        fontSize: 12,
+                        opacity: !ok ? 0.5 : 1,
                       }}
+                      title={!ok ? "IDが不正のため削除できません" : "このプロジェクトを削除"}
                     >
-                      削除
+                      {isDeleting ? "削除中..." : "削除"}
                     </button>
                   )}
                 </div>
               </div>
 
-              <div style={{ fontSize: 13, opacity: 0.85 }}>
-                現場名：{p.site_name ?? "—"}
-              </div>
+              <div style={{ fontSize: 13, opacity: 0.85 }}>現場名：{p.site_name ?? "—"}</div>
 
-              <div
-                style={{
-                  display: "flex",
-                  gap: 12,
-                  fontSize: 12,
-                  opacity: 0.7,
-                }}
-              >
+              <div style={{ display: "flex", gap: 12, fontSize: 12, opacity: 0.7 }}>
                 <div>作成：{fmtDateTime(p.created_at) || "—"}</div>
-                <div
-                  style={{
-                    marginLeft: "auto",
-                    fontFamily:
-                      "ui-monospace, SFMono-Regular, Menlo, monospace",
-                  }}
-                >
+                <div style={{ marginLeft: "auto", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
                   {p.id}
                 </div>
               </div>
+
+              {!ok && (
+                <div style={{ fontSize: 12, opacity: 0.7 }}>
+                  IDが不正のため「工事詳細」リンクと「削除」を無効化しています。
+                </div>
+              )}
             </div>
           );
         })}
+
+        {!loading && rows.length === 0 && (
+          <div style={{ padding: 14, border: "1px solid #ddd", borderRadius: 16, background: "#fff" }}>
+            <p style={{ margin: 0, fontWeight: 700 }}>プロジェクトがありません。</p>
+            <p style={{ margin: "6px 0 0 0", fontSize: 12, opacity: 0.7 }}>
+              まず「プロジェクト作成」から現場を登録してください。
+            </p>
+            <div style={{ marginTop: 10 }}>
+              <Link
+                href={createHref}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: "1px solid #111",
+                  textDecoration: "none",
+                  background: isLoggedIn ? "#111" : "#f3f4f6",
+                  color: isLoggedIn ? "#fff" : "#111",
+                  fontWeight: 700,
+                  fontSize: 12,
+                  display: "inline-block",
+                }}
+              >
+                ＋ プロジェクト作成
+              </Link>
+            </div>
+          </div>
+        )}
       </div>
     </main>
   );
