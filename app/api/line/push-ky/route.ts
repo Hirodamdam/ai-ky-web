@@ -11,7 +11,6 @@ type WeatherSlot = {
 };
 
 // 互換維持：text でも title/url でも送れる
-// 将来拡張：fields を渡せば「完成形テンプレ」を自動組み立て
 type Body =
   | { text: string }
   | {
@@ -19,13 +18,11 @@ type Body =
       url?: string;
       note?: string;
 
-      // optional (完成形に必要な情報)
       work_detail?: string | null;
       workers?: number | null;
-      third_party_level?: string | null; // "多い" / "少ない" / etc
+      third_party_level?: string | null;
       weather_slots?: WeatherSlot[] | null;
 
-      // AI要点（短く使う）
       ai_hazards?: string | null;
       ai_countermeasures?: string | null;
       ai_third_party?: string | null;
@@ -73,8 +70,8 @@ function degToDirJp(deg: number | null | undefined): string {
   return dirs[idx];
 }
 
-const WIND_WARN_MS = 8; // 強風注意
-const RAIN_WARN_MM = 3; // 雨注意
+const WIND_WARN_MS = 8;
+const RAIN_WARN_MM = 3;
 
 function pickWorstWeather(slots: WeatherSlot[] | null | undefined) {
   const arr = Array.isArray(slots) ? slots : [];
@@ -82,18 +79,17 @@ function pickWorstWeather(slots: WeatherSlot[] | null | undefined) {
 
   if (!filtered.length) return null;
 
-  // スコアリング：強風/雨を優先、どれも無ければ先頭
   const score = (x: WeatherSlot) => {
     const ws = x.wind_speed_ms ?? null;
     const pr = x.precipitation_mm ?? null;
 
     let sc = 0;
-    if (ws != null) sc += Math.min(Math.max(ws, 0), 30) * 10; // 風を重め
+    if (ws != null) sc += Math.min(Math.max(ws, 0), 30) * 10;
     if (pr != null) sc += Math.min(Math.max(pr, 0), 50) * 8;
     return sc;
   };
 
-  filtered.sort((a, b) => score(b) - score(a) || (a.hour - b.hour));
+  filtered.sort((a, b) => score(b) - score(a) || a.hour - b.hour);
   return filtered[0];
 }
 
@@ -111,12 +107,7 @@ function weatherWarningLine(slot: WeatherSlot | null) {
     parts.push(`雨（降水 ${pr}mm）`);
   }
 
-  if (!parts.length) {
-    // 注意なしでも「気象」行は出したい場合：必要ならここを有効化
-    // return `気象：${slot.hour}時 ${s(slot.weather_text).trim() || "（不明）"}`;
-    return "";
-  }
-
+  if (!parts.length) return "";
   return `⚠ 気象：${slot.hour}時 ${parts.join(" / ")}`;
 }
 
@@ -127,10 +118,8 @@ function buildCompletedTemplate(body: Extract<Body, { title: string }>) {
 
   const lines: string[] = [];
 
-  // 1) タイトル（識別子）
   lines.push(`【本日KY】${title}`);
 
-  // 2) 最重要サマリ（5秒）
   const work = trimLineOne(s(body.work_detail), 70);
   const workers = body.workers != null ? `${body.workers}名` : "";
   const third = s(body.third_party_level).trim();
@@ -146,15 +135,12 @@ function buildCompletedTemplate(body: Extract<Body, { title: string }>) {
   }
   if (summaryParts.length) lines.push(summaryParts.join(""));
 
-  // 3) 気象警戒（1枠だけ）
   const worst = pickWorstWeather(body.weather_slots);
   const warn = weatherWarningLine(worst);
   if (warn) lines.push(warn);
 
-  // 4) 要点3つ（固定フォーマット）
-  // note が渡ってきた場合はそのまま優先（互換）
   if (note) {
-    lines.push(""); // 見やすさ
+    lines.push("");
     lines.push(note);
   } else {
     const hz = normalizeBullets(body.ai_hazards || "", 1, 120)[0] || "";
@@ -168,14 +154,12 @@ function buildCompletedTemplate(body: Extract<Body, { title: string }>) {
     }
   }
 
-  // 5) 公開リンク
   lines.push(`必ず作業前に確認（確認ボタンで既読登録）`);
   if (url) {
     lines.push(`▼KY公開リンク`);
     lines.push(url);
   }
 
-  // LINE上限を超えないよう保険（だいたい 5000 文字上限を想定）
   const text = lines.join("\n").replace(/\n{3,}/g, "\n\n");
   return text.length > 4900 ? text.slice(0, 4899) + "…" : text;
 }
@@ -184,10 +168,10 @@ export async function POST(req: Request) {
   const started = Date.now();
 
   try {
-    // ✅ 簡易認証（このAPIを外部から勝手に叩かせない）
-    const secret = process.env.LINE_PUSH_SECRET || "";
+    // ✅ 簡易認証（trimして事故防止）
+    const secret = (process.env.LINE_PUSH_SECRET || "").trim();
     if (secret) {
-      const header = req.headers.get("x-line-push-secret") || "";
+      const header = (req.headers.get("x-line-push-secret") || "").trim();
       if (header !== secret) {
         console.warn("[line-push-ky] unauthorized");
         return NextResponse.json({ error: "unauthorized" }, { status: 401 });
@@ -196,7 +180,6 @@ export async function POST(req: Request) {
 
     const body = (await req.json()) as Body;
 
-    // ✅ 送信テキストを組み立て（text優先 / それ以外は完成形テンプレ生成）
     let text = "";
     if ("text" in body) {
       text = s(body.text).trim();
@@ -208,7 +191,7 @@ export async function POST(req: Request) {
 
     if (!text) return NextResponse.json({ error: "text empty" }, { status: 400 });
 
-    const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+    const token = (process.env.LINE_CHANNEL_ACCESS_TOKEN || "").trim();
     if (!token) {
       console.error("[line-push-ky] LINE_CHANNEL_ACCESS_TOKEN missing");
       return NextResponse.json({ error: "LINE token missing" }, { status: 500 });
@@ -253,7 +236,10 @@ export async function POST(req: Request) {
     const ms = Date.now() - started;
 
     if (!ok) {
-      return NextResponse.json({ error: "line api error", status: lastStatus, data: lastBody, ms }, { status: 500 });
+      return NextResponse.json(
+        { error: "line api error", status: lastStatus, data: lastBody, ms },
+        { status: 500 }
+      );
     }
 
     return NextResponse.json({ ok: true, status: lastStatus, data: lastBody, ms });

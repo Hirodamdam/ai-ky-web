@@ -47,7 +47,10 @@ export async function POST(req: Request) {
       );
     }
     if (!projectId || !kyId || !accessToken) {
-      return NextResponse.json({ error: "Missing body: projectId / kyId / accessToken" }, { status: 400 });
+      return NextResponse.json(
+        { error: "Missing body: projectId / kyId / accessToken" },
+        { status: 400 }
+      );
     }
 
     // 1) ログインユーザー確認（accessTokenで認証）
@@ -76,17 +79,19 @@ export async function POST(req: Request) {
 
     if (curErr) return NextResponse.json({ error: `Fetch ky failed: ${curErr.message}` }, { status: 500 });
     if (!current) return NextResponse.json({ error: "KY not found" }, { status: 404 });
-    if (s(current.project_id).trim() !== projectId) return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
+    if (s(current.project_id).trim() !== projectId)
+      return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
 
     // 参考：工事名も通知に入れる（取れなければ空でOK）
     const { data: proj } = await adminClient.from("projects").select("name").eq("id", projectId).maybeSingle();
     const projectName = s(proj?.name).trim();
     const workDate = s((current as any)?.work_date).trim();
 
-    const baseUrl = getBaseUrl(req);
+    // ✅ baseUrlが空になるケースを潰す（req.urlからも取る）
+    const baseUrl = getBaseUrl(req) || new URL(req.url).origin;
 
     if (action === "unapprove") {
-      // ✅ 承認解除＝公開停止（重要：public_enabled を false にする）
+      // ✅ 承認解除＝公開停止
       const { error: updErr } = await adminClient
         .from("ky_entries")
         .update({
@@ -108,7 +113,7 @@ export async function POST(req: Request) {
     const token = s((current as any)?.public_token).trim() || crypto.randomUUID();
     const nowIso = new Date().toISOString();
 
-    // ✅ 承認＝公開ON（重要：public_enabled を true にする）
+    // ✅ 承認＝公開ON
     const { error: updErr } = await adminClient
       .from("ky_entries")
       .update({
@@ -124,14 +129,15 @@ export async function POST(req: Request) {
     if (updErr) return NextResponse.json({ error: `Approve failed: ${updErr.message}` }, { status: 500 });
 
     const publicPath = `/ky/public/${token}`;
-    const publicUrl = baseUrl ? `${baseUrl}${publicPath}` : publicPath;
+    const publicUrl = `${baseUrl}${publicPath}`;
 
     // 3) ★承認成功後にLINE通知（失敗しても承認は成功扱いにする）
     let lineOk: boolean | null = null;
     let lineError: string | null = null;
 
     try {
-      const pushSecret = process.env.LINE_PUSH_SECRET || "";
+      // ✅ trim必須：VercelのEnvに末尾改行/空白が混ざる事故が多い
+      const pushSecret = (process.env.LINE_PUSH_SECRET || "").trim();
       if (!pushSecret) {
         lineOk = null;
         lineError = "LINE_PUSH_SECRET missing (skip)";
@@ -141,7 +147,10 @@ export async function POST(req: Request) {
         if (workDate) titleParts.push(workDate);
         const title = titleParts.length ? titleParts.join(" / ") : "KY承認";
 
-        const res = await fetch(`${baseUrl}/api/line/push-ky`, {
+        // ✅ このプロジェクトの実体ルート：/api/line/push-ky
+        const endpoint = new URL("/api/line/push-ky", baseUrl).toString();
+
+        const res = await fetch(endpoint, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
