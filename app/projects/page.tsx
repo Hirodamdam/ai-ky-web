@@ -115,6 +115,8 @@ export default function ProjectsPage() {
     [rows]
   );
 
+  const createHref = isLoggedIn ? "/projects/create" : "/login";
+
   return (
     <main style={{ padding: 16, maxWidth: 960, margin: "0 auto" }}>
       <div style={{ display: "flex", gap: 12, alignItems: "baseline" }}>
@@ -122,44 +124,71 @@ export default function ProjectsPage() {
           プロジェクト一覧
         </h1>
 
-        <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.7, textAlign: "right" }}>
-          <div>
-            {loading ? "読み込み中..." : `${rows.length}件（稼働 ${activeCount}件）`}
-          </div>
-          <div style={{ marginTop: 4 }}>
-            {isLoggedIn === null ? (
-              "ログイン状態：確認中..."
-            ) : isLoggedIn ? (
-              <span>
-                ログイン中{userLabel ? `（${userLabel}）` : ""}
-                {" / "}
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await supabase.auth.signOut();
-                    location.reload();
-                  }}
-                  style={{
-                    border: "none",
-                    background: "transparent",
-                    padding: 0,
-                    cursor: "pointer",
-                    color: "#b91c1c",
-                    textDecoration: "underline",
-                    fontSize: 12,
-                  }}
-                >
-                  ログアウト
-                </button>
-              </span>
-            ) : (
-              <span>
-                未ログイン{" / "}
-                <Link href="/login" style={{ textDecoration: "underline" }}>
-                  ログイン
-                </Link>
-              </span>
-            )}
+        {/* ✅ 右上（作成導線 + ステータス） */}
+        <div
+          style={{
+            marginLeft: "auto",
+            display: "flex",
+            gap: 12,
+            alignItems: "center",
+          }}
+        >
+          <Link
+            href={createHref}
+            style={{
+              padding: "8px 10px",
+              borderRadius: 12,
+              border: "1px solid #111",
+              textDecoration: "none",
+              background: isLoggedIn ? "#111" : "#f3f4f6",
+              color: isLoggedIn ? "#fff" : "#111",
+              fontWeight: 700,
+              fontSize: 12,
+              whiteSpace: "nowrap",
+            }}
+          >
+            ＋ プロジェクト作成
+          </Link>
+
+          <div style={{ fontSize: 12, opacity: 0.7, textAlign: "right" }}>
+            <div>
+              {loading ? "読み込み中..." : `${rows.length}件（稼働 ${activeCount}件）`}
+            </div>
+            <div style={{ marginTop: 4 }}>
+              {isLoggedIn === null ? (
+                "ログイン状態：確認中..."
+              ) : isLoggedIn ? (
+                <span>
+                  ログイン中{userLabel ? `（${userLabel}）` : ""}
+                  {" / "}
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await supabase.auth.signOut();
+                      location.reload();
+                    }}
+                    style={{
+                      border: "none",
+                      background: "transparent",
+                      padding: 0,
+                      cursor: "pointer",
+                      color: "#b91c1c",
+                      textDecoration: "underline",
+                      fontSize: 12,
+                    }}
+                  >
+                    ログアウト
+                  </button>
+                </span>
+              ) : (
+                <span>
+                  未ログイン{" / "}
+                  <Link href="/login" style={{ textDecoration: "underline" }}>
+                    ログイン
+                  </Link>
+                </span>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -196,7 +225,14 @@ export default function ProjectsPage() {
               </Link>
             </div>
           </div>
-          <p style={{ margin: "6px 0 0 0", color: "#856404", fontSize: 12, opacity: 0.9 }}>
+          <p
+            style={{
+              margin: "6px 0 0 0",
+              color: "#856404",
+              fontSize: 12,
+              opacity: 0.9,
+            }}
+          >
             右上の「ログイン」表示が残る場合でも、このページ右上の「ログイン中/未ログイン」が真の状態です。
           </p>
         </div>
@@ -276,9 +312,22 @@ export default function ProjectsPage() {
                 現場名：{p.site_name ?? "—"}
               </div>
 
-              <div style={{ display: "flex", gap: 12, fontSize: 12, opacity: 0.7 }}>
+              <div
+                style={{
+                  display: "flex",
+                  gap: 12,
+                  fontSize: 12,
+                  opacity: 0.7,
+                }}
+              >
                 <div>作成：{fmtDateTime(p.created_at) || "—"}</div>
-                <div style={{ marginLeft: "auto", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                <div
+                  style={{
+                    marginLeft: "auto",
+                    fontFamily:
+                      "ui-monospace, SFMono-Regular, Menlo, monospace",
+                  }}
+                >
                   {p.id}
                 </div>
               </div>
@@ -301,7 +350,30 @@ export default function ProjectsPage() {
               background: "#fff",
             }}
           >
-            <p style={{ margin: 0 }}>プロジェクトがありません。</p>
+            <p style={{ margin: 0, fontWeight: 700 }}>
+              プロジェクトがありません。
+            </p>
+            <p style={{ margin: "6px 0 0 0", fontSize: 12, opacity: 0.7 }}>
+              まず「プロジェクト作成」から現場を登録してください。
+            </p>
+            <div style={{ marginTop: 10 }}>
+              <Link
+                href={createHref}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: "1px solid #111",
+                  textDecoration: "none",
+                  background: isLoggedIn ? "#111" : "#f3f4f6",
+                  color: isLoggedIn ? "#fff" : "#111",
+                  fontWeight: 700,
+                  fontSize: 12,
+                  display: "inline-block",
+                }}
+              >
+                ＋ プロジェクト作成
+              </Link>
+            </div>
           </div>
         )}
       </div>
