@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/app/lib/supabaseClient";
 
@@ -10,6 +10,28 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [status, setStatus] = useState("");
+
+  // ✅ すでにログイン済みなら /projects へ（商品導線）
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const { data } = await supabase.auth.getSession();
+        if (cancelled) return;
+        if (data?.session?.user) {
+          router.replace("/projects");
+          router.refresh();
+        }
+      } catch {
+        // ignore
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [router]);
 
   const onLogin = async () => {
     setStatus("");
@@ -24,8 +46,8 @@ export default function LoginPage() {
       return;
     }
 
-    setStatus("ログインしました。");
-    router.push("/");
+    setStatus("ログインしました。プロジェクト一覧へ移動します。");
+    router.replace("/projects");
     router.refresh();
   };
 
