@@ -133,6 +133,129 @@ function slotSummary(slot: WeatherSlot | null | undefined): string {
   return `${w} / 気温${t} / 風${wd} ${ws} / 降水${p}`;
 }
 
+/** ===== 表示用整形（レビューと同じ） ===== */
+
+function normalizeLineBase(raw: string): string {
+  return raw
+    .replace(/^[•・\-*]\s*/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripGenericAccidentNote(x: string): string {
+  return x
+    .replace(/（\s*事故につながる恐れ\s*）/g, "")
+    .replace(/（\s*事故に繋がる恐れ\s*）/g, "")
+    .replace(/（\s*事故につながる可能性\s*）/g, "")
+    .replace(/（\s*事故に繋がる可能性\s*）/g, "")
+    .trim();
+}
+
+function takeRightOfArrow(line: string): string {
+  const t = line;
+  const seps = ["→", "⇒", "->", "＞", "〉"];
+  for (const sep of seps) {
+    const idx = t.indexOf(sep);
+    if (idx >= 0) {
+      const right = t.slice(idx + sep.length).trim();
+      if (right) return right;
+    }
+  }
+  return t.trim();
+}
+
+function dedupeKeepOrder(arr: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const x of arr) {
+    const k = x.trim();
+    if (!k) continue;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+  }
+  return out;
+}
+
+// 危険予知：右側だけ採用、(事故につながる恐れ)削除、最大5件、番号なし
+function formatHazardsForView5(text: string): string[] {
+  const lines = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const picked: string[] = [];
+  for (const l0 of lines) {
+    const base = normalizeLineBase(l0);
+    if (!base) continue;
+
+    let v = takeRightOfArrow(base);
+    v = stripGenericAccidentNote(v);
+    v = v.replace(/（\s*[^）]*事故[^）]*恐れ\s*）\s*$/g, "").trim();
+
+    if (/^危険予知/i.test(v) || /^対策/i.test(v) || /^AI補足/i.test(v)) continue;
+    if (v) picked.push(v);
+  }
+  return dedupeKeepOrder(picked).slice(0, 5);
+}
+
+function splitMeasuresLine(line: string): string[] {
+  const t = line.trim();
+  const noLead = t
+    .replace(/^\s*\[\s*\d+\s*\]\s*/g, "")
+    .replace(/^\s*\d+[)\.]\s*/g, "")
+    .trim();
+
+  const hasMulti = /\[\s*\d+\s*\]/.test(noLead);
+  if (!hasMulti) return [noLead];
+
+  const parts = noLead
+    .split(/\[\s*\d+\s*\]/g)
+    .map((x) => x.replace(/^[、,\s]+/, "").trim())
+    .filter(Boolean);
+
+  return parts.length ? parts : [noLead];
+}
+
+// 対策：番号削除、右側だけ採用、最大5件、番号なし
+function formatMeasuresForView5(text: string): string[] {
+  const lines = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const items: string[] = [];
+  for (const l0 of lines) {
+    const base0 = normalizeLineBase(l0);
+    if (!base0) continue;
+
+    const parts = splitMeasuresLine(base0);
+    for (let p of parts) {
+      p = normalizeLineBase(p);
+      if (!p) continue;
+
+      p = takeRightOfArrow(p);
+
+      if (/^対策/i.test(p) || /^AI補足/i.test(p)) continue;
+      if (p) items.push(p);
+    }
+  }
+  return dedupeKeepOrder(items).slice(0, 5);
+}
+
+// 第三者：番号なし（今は上限なし）
+function formatThirdForView(text: string): string[] {
+  return String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .map((x) => x.replace(/^[•・\-*]\s*/, "").trim())
+    .filter(Boolean);
+}
+
 export default function KyNewClient() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
@@ -634,6 +757,11 @@ export default function KyNewClient() {
     );
   }, []);
 
+  // ✅ AI表示（レビューと同じ：危険予知/対策は5件・番号なし・重複/注記除去）
+  const aiHazardsTop5 = useMemo(() => formatHazardsForView5(aiHazards), [aiHazards]);
+  const aiMeasuresTop5 = useMemo(() => formatMeasuresForView5(aiCounter), [aiCounter]);
+  const aiThirdView = useMemo(() => formatThirdForView(aiThird), [aiThird]);
+
   if (loading) {
     return (
       <div className="p-4">
@@ -879,17 +1007,51 @@ export default function KyNewClient() {
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">危険予知の補足</div>
+          <div className="text-xs text-slate-600">危険予知の補足（上位5項目・番号なし）</div>
+          {aiHazardsTop5.length ? (
+            <div className="rounded-lg border border-slate-300 bg-white p-3">
+              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                {aiHazardsTop5.map((x, i) => (
+                  <li key={`${x}-${i}`}>{x}</li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
+          )}
+          {/* ※保存値は壊さないため、元テキストはそのまま編集可 */}
           <textarea value={aiHazards} onChange={(e) => setAiHazards(e.target.value)} rows={4} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">対策の補足</div>
+          <div className="text-xs text-slate-600">対策の補足（上位5項目・番号なし）</div>
+          {aiMeasuresTop5.length ? (
+            <div className="rounded-lg border border-slate-300 bg-white p-3">
+              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                {aiMeasuresTop5.map((x, i) => (
+                  <li key={`${x}-${i}`}>{x}</li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
+          )}
           <textarea value={aiCounter} onChange={(e) => setAiCounter(e.target.value)} rows={4} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">第三者（墓参者）の補足</div>
+          <div className="text-xs text-slate-600">第三者（墓参者）の補足（番号なし）</div>
+          {aiThirdView.length ? (
+            <div className="rounded-lg border border-slate-300 bg-white p-3">
+              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                {aiThirdView.map((x, i) => (
+                  <li key={`${x}-${i}`}>{x}</li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
+          )}
           <textarea value={aiThird} onChange={(e) => setAiThird(e.target.value)} rows={4} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
         </div>
       </div>

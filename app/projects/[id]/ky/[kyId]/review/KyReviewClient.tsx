@@ -214,36 +214,148 @@ async function postJsonTry(urls: string[], body: any): Promise<any> {
   throw lastErr ?? new Error("API呼び出しに失敗しました");
 }
 
-/** ============ 表示整形（AI補足の見せ方） ============ */
+/** =========================
+ *  AI補足：表示整形（要望対応）
+ *  - 危険予知：右側（→以降）だけ採用
+ *  - 「事故につながる恐れ」系の注記は削除
+ *  - 最大5件
+ *  - 対策：番号除去、複合行は分割、最大5件
+ *  - 第三者：番号なしのまま
+ * ========================= */
 
-/** 表示整形：危険予知＝「〜だから〜が起こる（恐れ）」っぽく見せる（断定しない） */
-function formatHazardsForView(text: string): string[] {
+function normalizeLineBase(raw: string): string {
+  return raw
+    .replace(/^[•・\-*]\s*/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripGenericAccidentNote(x: string): string {
+  // 「（事故につながる恐れ）」等を削除（当たり前なので）
+  return x
+    .replace(/（\s*事故につながる恐れ\s*）/g, "")
+    .replace(/（\s*事故に繋がる恐れ\s*）/g, "")
+    .replace(/（\s*事故につながる可能性\s*）/g, "")
+    .replace(/（\s*事故に繋がる可能性\s*）/g, "")
+    .trim();
+}
+
+function takeRightOfArrow(line: string): string {
+  // 「〜 → 〜」の右側のみ採用（最初の文面は人入力と重複しがちなので捨てる）
+  const t = line;
+  const seps = ["→", "⇒", "->", "＞", "〉"];
+  for (const sep of seps) {
+    const idx = t.indexOf(sep);
+    if (idx >= 0) {
+      const right = t.slice(idx + sep.length).trim();
+      if (right) return right;
+    }
+  }
+  return t.trim();
+}
+
+function dedupeKeepOrder(arr: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const x of arr) {
+    const k = x.trim();
+    if (!k) continue;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+  }
+  return out;
+}
+
+function formatHazardsForView5(text: string): string[] {
   const lines = s(text)
     .replace(/\r\n/g, "\n")
     .split("\n")
     .map((x) => x.trim())
     .filter(Boolean);
 
-  const out: string[] = [];
-  for (const line of lines) {
-    const raw = line.replace(/^[•・\-*]\s*/, "").trim();
-    if (!raw) continue;
+  const picked: string[] = [];
 
-    // 既に「だから」「ため」「ので」などがあればそのまま
-    if (/(だから|ため|ので|から)/.test(raw)) {
-      // 語尾が弱い場合だけ「恐れ」注記
-      out.push(raw.endsWith("。") ? raw : `${raw}（事故につながる恐れ）`);
-      continue;
-    }
+  for (const l0 of lines) {
+    const base = normalizeLineBase(l0);
+    if (!base) continue;
 
-    // 1文だけの場合：断定せず恐れ注記で補強
-    out.push(`${raw}（事故につながる恐れ）`);
+    // 右側だけ（重複しやすい前置きを捨てる）
+    let v = takeRightOfArrow(base);
+
+    // 「〜になる恐れ」「事故につながる恐れ」注記の除去
+    v = stripGenericAccidentNote(v);
+
+    // 末尾に付くことが多いので再除去
+    v = v.replace(/（\s*[^）]*恐れ\s*）\s*$/g, (m) => {
+      // 「事故につながる恐れ」系は消す。それ以外の恐れ注記は残してもよいが、
+      // 今回は「事故につながる〜」が主なのでそれだけ消す。
+      if (/事故/.test(m)) return "";
+      return m;
+    }).trim();
+
+    // まだ長すぎる／ただの見出しっぽい行は弾く
+    if (/^危険予知/i.test(v) || /^対策/i.test(v) || /^AI補足/i.test(v)) continue;
+
+    if (v) picked.push(v);
   }
-  return out;
+
+  return dedupeKeepOrder(picked).slice(0, 5);
 }
 
-/** 対策：箇条書きとして見せる */
-function formatMeasuresForView(text: string): string[] {
+function splitMeasuresLine(line: string): string[] {
+  // 例）"[1] xxx、[2] yyy、[3] zzz" を分割して番号なしに
+  const t = line.trim();
+
+  // まず先頭の番号は落とす
+  const noLead = t.replace(/^\s*\[\s*\d+\s*\]\s*/g, "").replace(/^\s*\d+[)\.]\s*/g, "").trim();
+
+  // 行内に [n] が複数ある場合はそれを区切りとして分割
+  const hasMulti = /\[\s*\d+\s*\]/.test(noLead);
+  if (!hasMulti) return [noLead];
+
+  const parts = noLead
+    .split(/\[\s*\d+\s*\]/g)
+    .map((x) => x.replace(/^[、,\s]+/, "").trim())
+    .filter(Boolean);
+
+  return parts.length ? parts : [noLead];
+}
+
+function formatMeasuresForView5(text: string): string[] {
+  const lines = s(text)
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const items: string[] = [];
+  for (const l0 of lines) {
+    const base0 = normalizeLineBase(l0);
+    if (!base0) continue;
+
+    // 行を分割（番号は消す）
+    const parts = splitMeasuresLine(base0);
+
+    for (let p of parts) {
+      p = normalizeLineBase(p);
+      if (!p) continue;
+
+      // 「→」がある場合、人入力と重複しやすい左側は捨てて右側だけ
+      p = takeRightOfArrow(p);
+
+      // 見出し除去
+      if (/^対策/i.test(p) || /^AI補足/i.test(p)) continue;
+
+      if (p) items.push(p);
+    }
+  }
+
+  return dedupeKeepOrder(items).slice(0, 5);
+}
+
+function formatThirdForView(text: string): string[] {
+  // 第三者は番号なしでOK：そのまま箇条書き化（上限は付けない／必要なら後で）
   return s(text)
     .replace(/\r\n/g, "\n")
     .split("\n")
@@ -674,10 +786,6 @@ export default function KyReviewClient() {
       if (error) throw error;
 
       setStatus({ type: "success", text: "AI補足を再生成して保存しました。" });
-
-      // ✅ AI補足が変わったらリスクも更新
-      // （useEffectでも走るが、体感を良くするため即時）
-      // loadRiskは下のuseCallbackで定義
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "AI補足の再生成に失敗しました" });
     } finally {
@@ -792,15 +900,32 @@ export default function KyReviewClient() {
     }
   }, [ky, appliedWeather, slopeNowUrl, slopePrevUrl, pathNowUrl, pathPrevUrl]);
 
-  // ✅ KY / 写真 / 気象 / AI補足が変わればリスクを再計算
   useEffect(() => {
     if (!ky) return;
-    // 連続呼び出しを避けるため軽くディレイ
     const t = setTimeout(() => {
       loadRisk();
     }, 120);
     return () => clearTimeout(t);
-  }, [ky?.id, ky?.work_detail, ky?.hazards, ky?.countermeasures, ky?.third_party_level, ky?.worker_count, ky?.ai_hazards, ky?.ai_countermeasures, ky?.ai_third_party, appliedWeather?.hour, appliedWeather?.weather_text, appliedWeather?.wind_speed_ms, appliedWeather?.precipitation_mm, slopeNowUrl, slopePrevUrl, pathNowUrl, pathPrevUrl, loadRisk]);
+  }, [
+    ky?.id,
+    ky?.work_detail,
+    ky?.hazards,
+    ky?.countermeasures,
+    ky?.third_party_level,
+    ky?.worker_count,
+    ky?.ai_hazards,
+    ky?.ai_countermeasures,
+    ky?.ai_third_party,
+    appliedWeather?.hour,
+    appliedWeather?.weather_text,
+    appliedWeather?.wind_speed_ms,
+    appliedWeather?.precipitation_mm,
+    slopeNowUrl,
+    slopePrevUrl,
+    pathNowUrl,
+    pathPrevUrl,
+    loadRisk,
+  ]);
 
   const riskBadge = useMemo(() => {
     const v = risk?.total_ai ?? 0;
@@ -809,9 +934,10 @@ export default function KyReviewClient() {
     return { label: "低", cls: "bg-emerald-100 text-emerald-800 border-emerald-200" };
   }, [risk?.total_ai]);
 
-  const hazardsView = useMemo(() => formatHazardsForView(s(ky?.ai_hazards)), [ky?.ai_hazards]);
-  const measuresView = useMemo(() => formatMeasuresForView(s(ky?.ai_countermeasures)), [ky?.ai_countermeasures]);
-  const thirdView = useMemo(() => formatMeasuresForView(s(ky?.ai_third_party)), [ky?.ai_third_party]);
+  // ✅ 表示：危険予知/対策は「5項目」「右側のみ」「番号なし」「恐れ注記なし」
+  const hazardsView = useMemo(() => formatHazardsForView5(s(ky?.ai_hazards)), [ky?.ai_hazards]);
+  const measuresView = useMemo(() => formatMeasuresForView5(s(ky?.ai_countermeasures)), [ky?.ai_countermeasures]);
+  const thirdView = useMemo(() => formatThirdForView(s(ky?.ai_third_party)), [ky?.ai_third_party]);
 
   if (loading) {
     return (
@@ -1244,7 +1370,7 @@ export default function KyReviewClient() {
         </div>
 
         <div className="space-y-2 print-avoid-break">
-          <div className="text-xs text-slate-600">危険予知の補足（箇条書き：理由→恐れ）</div>
+          <div className="text-xs text-slate-600">危険予知の補足（5項目：右側のみ）</div>
           {hazardsView.length ? (
             <div className="rounded-lg border border-slate-300 bg-white p-3">
               <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
@@ -1259,7 +1385,7 @@ export default function KyReviewClient() {
         </div>
 
         <div className="space-y-2 print-avoid-break">
-          <div className="text-xs text-slate-600">対策の補足（項目別・箇条書き）</div>
+          <div className="text-xs text-slate-600">対策の補足（5項目：番号なし）</div>
           {measuresView.length ? (
             <div className="rounded-lg border border-slate-300 bg-white p-3">
               <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
@@ -1274,7 +1400,7 @@ export default function KyReviewClient() {
         </div>
 
         <div className="space-y-2 print-avoid-break">
-          <div className="text-xs text-slate-600">第三者（墓参者）の補足（箇条書き）</div>
+          <div className="text-xs text-slate-600">第三者（墓参者）の補足（番号なし）</div>
           {thirdView.length ? (
             <div className="rounded-lg border border-slate-300 bg-white p-3">
               <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">

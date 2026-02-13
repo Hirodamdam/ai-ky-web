@@ -1,3 +1,4 @@
+// app/projects/[id]/ky/[kyId]/edit/KyEditClient.tsx
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
@@ -104,17 +105,17 @@ function normalizeThirdPartyLabel(v: any): "多い" | "少ない" {
   if (v === true) return "多い";
   if (v === false) return "少ない";
   if (typeof v === "number") return v === 1 ? "多い" : "少ない";
-  const s = typeof v === "string" ? v.trim() : "";
-  if (!s) return "少ない";
-  if (s.includes("多")) return "多い";
-  if (s.includes("少")) return "少ない";
+  const s0 = typeof v === "string" ? v.trim() : "";
+  if (!s0) return "少ない";
+  if (s0.includes("多")) return "多い";
+  if (s0.includes("少")) return "少ない";
   return "少ない";
 }
 
 type AiParts = { work: string; hazards: string; counter: string; third: string };
 
-function splitAiSupplement(s: string): AiParts {
-  const text = (s ?? "").trim();
+function splitAiSupplement(s0: string): AiParts {
+  const text = (s0 ?? "").trim();
   if (!text) return { work: "", hazards: "", counter: "", third: "" };
 
   const keys = [
@@ -177,6 +178,47 @@ function normalizeText(text: string): string {
   return (text || "").replace(/\r\n/g, "\n").replace(/\u3000/g, " ").trim();
 }
 
+function splitAiCombined(text: string): { work: string; hazards: string; countermeasures: string; third: string } {
+  const src = (text || "").trim();
+  if (!src) return { work: "", hazards: "", countermeasures: "", third: "" };
+
+  const makeBracketRe = (label: string) =>
+    new RegExp(String.raw`(?:^|\n)\s*(?:[•・\-*]\s*)?[【\[]\s*AI補足\s*[｜|]\s*${label}\s*[】\]]`, "g");
+
+  const headings: Array<{ key: "work" | "hazards" | "countermeasures" | "third"; re: RegExp }> = [
+    { key: "work", re: makeBracketRe("作業内容") },
+    { key: "hazards", re: makeBracketRe("危険予知") },
+    { key: "countermeasures", re: makeBracketRe("対策") },
+    { key: "third", re: makeBracketRe("第三者(?:\\s*（\\s*墓参者\\s*）)?") },
+    { key: "work", re: /(?:^|\n)\s*(作業内容)\s*[:：]/g },
+    { key: "hazards", re: /(?:^|\n)\s*(危険予知)\s*[:：]/g },
+    { key: "countermeasures", re: /(?:^|\n)\s*(対策)\s*[:：]/g },
+    { key: "third", re: /(?:^|\n)\s*(第三者|墓参者)\s*[:：]/g },
+  ];
+
+  const marks: Array<{ idx: number; key: "work" | "hazards" | "countermeasures" | "third"; len: number }> = [];
+  for (const h of headings) {
+    let m: RegExpExecArray | null;
+    h.re.lastIndex = 0;
+    while ((m = h.re.exec(src))) marks.push({ idx: m.index, key: h.key, len: m[0].length });
+  }
+  marks.sort((a, b) => a.idx - b.idx);
+
+  if (!marks.length) return { work: src, hazards: "", countermeasures: "", third: "" };
+
+  const out = { work: "", hazards: "", countermeasures: "", third: "" };
+  for (let i = 0; i < marks.length; i++) {
+    const cur = marks[i];
+    const next = marks[i + 1];
+    const start = cur.idx + cur.len;
+    const end = next ? next.idx : src.length;
+    const chunk = src.slice(start, end).trim();
+    if (!chunk) continue;
+    (out as any)[cur.key] = (out as any)[cur.key] ? `${(out as any)[cur.key]}\n${chunk}` : chunk;
+  }
+  return out;
+}
+
 function isApprovedLike(row: KyRow | null): boolean {
   if (!row) return false;
   const a = (row as any)?.approved_at;
@@ -186,6 +228,129 @@ function isApprovedLike(row: KyRow | null): boolean {
   if (b === true) return true;
   if (c === true) return true;
   return false;
+}
+
+/** ===== 表示用整形（レビューと同じ） ===== */
+
+function normalizeLineBase(raw: string): string {
+  return raw
+    .replace(/^[•・\-*]\s*/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripGenericAccidentNote(x: string): string {
+  return x
+    .replace(/（\s*事故につながる恐れ\s*）/g, "")
+    .replace(/（\s*事故に繋がる恐れ\s*）/g, "")
+    .replace(/（\s*事故につながる可能性\s*）/g, "")
+    .replace(/（\s*事故に繋がる可能性\s*）/g, "")
+    .trim();
+}
+
+function takeRightOfArrow(line: string): string {
+  const t = line;
+  const seps = ["→", "⇒", "->", "＞", "〉"];
+  for (const sep of seps) {
+    const idx = t.indexOf(sep);
+    if (idx >= 0) {
+      const right = t.slice(idx + sep.length).trim();
+      if (right) return right;
+    }
+  }
+  return t.trim();
+}
+
+function dedupeKeepOrder(arr: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const x of arr) {
+    const k = x.trim();
+    if (!k) continue;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+  }
+  return out;
+}
+
+// 危険予知：右側だけ採用、(事故につながる恐れ)削除、最大5件、番号なし
+function formatHazardsForView5(text: string): string[] {
+  const lines = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const picked: string[] = [];
+  for (const l0 of lines) {
+    const base = normalizeLineBase(l0);
+    if (!base) continue;
+
+    let v = takeRightOfArrow(base);
+    v = stripGenericAccidentNote(v);
+    v = v.replace(/（\s*[^）]*事故[^）]*恐れ\s*）\s*$/g, "").trim();
+
+    if (/^危険予知/i.test(v) || /^対策/i.test(v) || /^AI補足/i.test(v)) continue;
+    if (v) picked.push(v);
+  }
+  return dedupeKeepOrder(picked).slice(0, 5);
+}
+
+function splitMeasuresLine(line: string): string[] {
+  const t = line.trim();
+  const noLead = t
+    .replace(/^\s*\[\s*\d+\s*\]\s*/g, "")
+    .replace(/^\s*\d+[)\.]\s*/g, "")
+    .trim();
+
+  const hasMulti = /\[\s*\d+\s*\]/.test(noLead);
+  if (!hasMulti) return [noLead];
+
+  const parts = noLead
+    .split(/\[\s*\d+\s*\]/g)
+    .map((x) => x.replace(/^[、,\s]+/, "").trim())
+    .filter(Boolean);
+
+  return parts.length ? parts : [noLead];
+}
+
+// 対策：番号削除、右側だけ採用、最大5件、番号なし
+function formatMeasuresForView5(text: string): string[] {
+  const lines = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const items: string[] = [];
+  for (const l0 of lines) {
+    const base0 = normalizeLineBase(l0);
+    if (!base0) continue;
+
+    const parts = splitMeasuresLine(base0);
+    for (let p of parts) {
+      p = normalizeLineBase(p);
+      if (!p) continue;
+
+      p = takeRightOfArrow(p);
+
+      if (/^対策/i.test(p) || /^AI補足/i.test(p)) continue;
+      if (p) items.push(p);
+    }
+  }
+  return dedupeKeepOrder(items).slice(0, 5);
+}
+
+// 第三者：番号なし（今は上限なし）
+function formatThirdForView(text: string): string[] {
+  return String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .map((x) => x.replace(/^[•・\-*]\s*/, "").trim())
+    .filter(Boolean);
 }
 
 export default function KyEditClient() {
@@ -227,7 +392,7 @@ export default function KyEditClient() {
 
   const appliedSlot = useMemo(() => {
     if (!weatherSlots.length || appliedHour == null) return null;
-    return weatherSlots.find((s) => s.hour === appliedHour) ?? null;
+    return weatherSlots.find((slt) => slt.hour === appliedHour) ?? null;
   }, [weatherSlots, appliedHour]);
 
   const appliedLine = useMemo(() => {
@@ -262,7 +427,11 @@ export default function KyEditClient() {
       if (!ky) throw new Error("KYが見つかりません");
 
       // ✅ lat/lon を取得
-      const { data: proj, error: projErr } = await supabase.from("projects").select("id,name,lat,lon").eq("id", projectId).maybeSingle();
+      const { data: proj, error: projErr } = await supabase
+        .from("projects")
+        .select("id,name,lat,lon")
+        .eq("id", projectId)
+        .maybeSingle();
       if (projErr) throw projErr;
 
       setRow(ky as any);
@@ -296,7 +465,6 @@ export default function KyEditClient() {
     load();
   }, [load]);
 
-  // ✅ 修正版：APIの戻り値（ai_*）を正しく読む＋空で上書きして全消ししない
   const onRegenerateAi = useCallback(async () => {
     if (isApprovedLike(row)) {
       setStatus({ type: "error", text: "承認済みのため、AI補足の再生成はできません。" });
@@ -330,7 +498,6 @@ export default function KyEditClient() {
         hazards: (hazards ?? "").trim() ? (hazards ?? "").trim() : null,
         countermeasures: (countermeasures ?? "").trim() ? (countermeasures ?? "").trim() : null,
         third_party_level: third ? third : null,
-        worker_count: null, // 編集画面に無ければnullでOK（APIがあれば使う）
         weather_slots: slotsForAi.length ? slotsForAi : null,
         lat,
         lon,
@@ -352,20 +519,13 @@ export default function KyEditClient() {
       const j = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(j?.error || "AI補足生成に失敗しました");
 
-      const nextWork = normalizeText(s(j?.ai_work_detail));
-      const nextHaz = normalizeText(s(j?.ai_hazards));
-      const nextCtr = normalizeText(s(j?.ai_countermeasures));
-      const nextThird = normalizeText(s(j?.ai_third_party));
+      const combined = normalizeText(s(j?.ai_supplement));
+      const split = splitAiCombined(combined);
 
-      // ✅ 空で上書きしない（全消し防止）
-      if (nextWork) setAiWork(nextWork);
-      if (nextHaz) setAiHazards(nextHaz);
-      if (nextCtr) setAiCounter(nextCtr);
-      if (nextThird) setAiThird(nextThird);
-
-      if (!nextWork && !nextHaz && !nextCtr && !nextThird) {
-        throw new Error("AI補足の返却が空でした（API応答を確認してください）");
-      }
+      setAiWork(normalizeText(split.work));
+      setAiHazards(normalizeText(split.hazards));
+      setAiCounter(normalizeText(split.countermeasures));
+      setAiThird(normalizeText(split.third));
 
       setStatus({ type: "success", text: "AI補足を再生成しました（未保存）" });
     } catch (e: any) {
@@ -420,6 +580,13 @@ export default function KyEditClient() {
     }
   }, [kyId, projectId, workDate, workDetail, hazards, countermeasures, thirdPartyLevel, aiWork, aiHazards, aiCounter, aiThird, row, router]);
 
+  const approved = isApprovedLike(row);
+
+  // ✅ AI表示（レビューと同じ：危険予知/対策は5件・番号なし・重複/注記除去）
+  const aiHazardsTop5 = useMemo(() => formatHazardsForView5(aiHazards), [aiHazards]);
+  const aiMeasuresTop5 = useMemo(() => formatMeasuresForView5(aiCounter), [aiCounter]);
+  const aiThirdView = useMemo(() => formatThirdForView(aiThird), [aiThird]);
+
   if (loading) {
     return (
       <div className="p-6">
@@ -427,8 +594,6 @@ export default function KyEditClient() {
       </div>
     );
   }
-
-  const approved = isApprovedLike(row);
 
   return (
     <div className="max-w-5xl mx-auto p-6 space-y-4">
@@ -449,7 +614,7 @@ export default function KyEditClient() {
         </div>
       )}
 
-      {/* --- 基本（スクショの書式を維持）--- */}
+      {/* --- 基本 --- */}
       <div className="border rounded-xl bg-white">
         <div className="px-4 py-3 border-b font-semibold">基本</div>
 
@@ -530,18 +695,51 @@ export default function KyEditClient() {
           </div>
 
           <div>
-            <div className="text-sm font-semibold mb-1">危険予知の補足（AI）</div>
-            <textarea className="border rounded p-3 w-full" rows={4} value={aiHazards} onChange={(e) => setAiHazards(e.target.value)} />
+            <div className="text-sm font-semibold mb-1">危険予知の補足（AI：上位5項目・番号なし）</div>
+            {aiHazardsTop5.length ? (
+              <div className="border rounded p-3 bg-white">
+                <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                  {aiHazardsTop5.map((x, i) => (
+                    <li key={`${x}-${i}`}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <div className="text-sm text-slate-600 border rounded p-3 bg-white">（なし）</div>
+            )}
+            <textarea className="border rounded p-3 w-full mt-2" rows={4} value={aiHazards} onChange={(e) => setAiHazards(e.target.value)} />
           </div>
 
           <div>
-            <div className="text-sm font-semibold mb-1">対策の補足（AI）</div>
-            <textarea className="border rounded p-3 w-full" rows={4} value={aiCounter} onChange={(e) => setAiCounter(e.target.value)} />
+            <div className="text-sm font-semibold mb-1">対策の補足（AI：上位5項目・番号なし）</div>
+            {aiMeasuresTop5.length ? (
+              <div className="border rounded p-3 bg-white">
+                <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                  {aiMeasuresTop5.map((x, i) => (
+                    <li key={`${x}-${i}`}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <div className="text-sm text-slate-600 border rounded p-3 bg-white">（なし）</div>
+            )}
+            <textarea className="border rounded p-3 w-full mt-2" rows={4} value={aiCounter} onChange={(e) => setAiCounter(e.target.value)} />
           </div>
 
           <div>
-            <div className="text-sm font-semibold mb-1">第三者の補足（AI）</div>
-            <textarea className="border rounded p-3 w-full" rows={4} value={aiThird} onChange={(e) => setAiThird(e.target.value)} />
+            <div className="text-sm font-semibold mb-1">第三者の補足（AI：番号なし）</div>
+            {aiThirdView.length ? (
+              <div className="border rounded p-3 bg-white">
+                <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                  {aiThirdView.map((x, i) => (
+                    <li key={`${x}-${i}`}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <div className="text-sm text-slate-600 border rounded p-3 bg-white">（なし）</div>
+            )}
+            <textarea className="border rounded p-3 w-full mt-2" rows={4} value={aiThird} onChange={(e) => setAiThird(e.target.value)} />
           </div>
         </div>
       </div>
