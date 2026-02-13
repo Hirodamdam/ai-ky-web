@@ -286,6 +286,11 @@ export default function KyReviewClient() {
   const [unreadMode, setUnreadMode] = useState<"person" | "company" | "none">("none");
   const [unreadErr, setUnreadErr] = useState<string>("");
 
+  // ✅ ① 承認ガード（高リスクは確認必須）
+  const RISK_APPROVE_THRESHOLD = 80;
+  const [riskModalOpen, setRiskModalOpen] = useState(false);
+  const [riskConfirm, setRiskConfirm] = useState(false);
+
   // ✅ 表示用：既読者を未読から除外（表記ゆれ対策）
   const unreadFiltered = useMemo(() => {
     // 既読：名前正規化セット
@@ -549,6 +554,10 @@ export default function KyReviewClient() {
         setUnreadErr("");
         setUnreadMode("none");
       }
+
+      // ✅ 画面再読込でモーダル状態をリセット
+      setRiskModalOpen(false);
+      setRiskConfirm(false);
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "読み込みに失敗しました" });
     } finally {
@@ -572,8 +581,27 @@ export default function KyReviewClient() {
     window.print();
   }, []);
 
-  // ✅ 承認 → 公開リンク発行 → LINE共有へ
-  const onApprove = useCallback(async () => {
+  const riskView = useMemo(() => {
+    const r = safeNum((ky as any)?.r_base);
+    if (r == null) return null;
+    const rr = clamp(Math.round(r), 0, 100);
+    const tag = riskLabel(rr);
+    return { value: rr, ...tag };
+  }, [ky]);
+
+  const photoScoreView = useMemo(() => {
+    const v = fmtPhotoScore((ky as any)?.photo_score);
+    return v ? v : "";
+  }, [ky]);
+
+  const isHighRisk = useMemo(() => {
+    const r = safeNum((ky as any)?.r_base);
+    if (r == null) return false;
+    return r >= RISK_APPROVE_THRESHOLD;
+  }, [ky]);
+
+  // ✅ 承認処理（本体）
+  const doApprove = useCallback(async () => {
     setStatus({ type: null, text: "" });
     setActing(true);
     try {
@@ -604,8 +632,20 @@ export default function KyReviewClient() {
       setStatus({ type: "error", text: e?.message ?? "承認に失敗しました" });
     } finally {
       setActing(false);
+      setRiskModalOpen(false);
+      setRiskConfirm(false);
     }
-  }, [projectId, kyId, load, project?.name]);
+  }, [projectId, kyId, project?.name, load]);
+
+  // ✅ 承認（入口）：高リスクならモーダルへ
+  const onApprove = useCallback(async () => {
+    if (isHighRisk) {
+      setRiskModalOpen(true);
+      setRiskConfirm(false);
+      return;
+    }
+    await doApprove();
+  }, [isHighRisk, doApprove]);
 
   const onUnapprove = useCallback(async () => {
     setStatus({ type: null, text: "" });
@@ -742,19 +782,6 @@ export default function KyReviewClient() {
     }
   }, [publicUrl]);
 
-  const riskView = useMemo(() => {
-    const r = safeNum((ky as any)?.r_base);
-    if (r == null) return null;
-    const rr = clamp(Math.round(r), 0, 100);
-    const tag = riskLabel(rr);
-    return { value: rr, ...tag };
-  }, [ky]);
-
-  const photoScoreView = useMemo(() => {
-    const v = fmtPhotoScore((ky as any)?.photo_score);
-    return v ? v : "";
-  }, [ky]);
-
   if (loading) {
     return (
       <div className="p-4">
@@ -765,6 +792,54 @@ export default function KyReviewClient() {
 
   return (
     <div className="p-4 space-y-4">
+      {/* ✅ 高リスク承認モーダル */}
+      {riskModalOpen ? (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4 no-print" onClick={() => setRiskModalOpen(false)}>
+          <div className="bg-white rounded-xl p-4 max-w-lg w-full" onClick={(e) => e.stopPropagation()}>
+            <div className="text-base font-bold text-slate-900">高リスクのため確認が必要です</div>
+
+            <div className="mt-2 text-sm text-slate-700 leading-relaxed">
+              このKYは <span className="font-semibold">R_base が {riskView?.value ?? "—"}</span> で、
+              閾値（{RISK_APPROVE_THRESHOLD}）以上です。<br />
+              内容・対策・誘導計画を確認した上で承認してください。
+            </div>
+
+            <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800">
+              注意：承認すると公開リンクが発行され、作業員へ共有されます。
+            </div>
+
+            <label className="mt-4 flex items-center gap-2 text-sm text-slate-800 select-none">
+              <input type="checkbox" checked={riskConfirm} onChange={(e) => setRiskConfirm(!!e.target.checked)} />
+              内容を確認し、追加対策が必要なら実施します（確認）
+            </label>
+
+            <div className="mt-4 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
+                onClick={() => setRiskModalOpen(false)}
+              >
+                戻る
+              </button>
+
+              <button
+                type="button"
+                disabled={!riskConfirm || acting || !!ky?.is_approved}
+                onClick={async () => {
+                  if (!riskConfirm) return;
+                  await doApprove();
+                }}
+                className={`rounded-lg px-4 py-2 text-sm text-white ${
+                  !riskConfirm || acting || !!ky?.is_approved ? "bg-slate-400" : "bg-rose-600 hover:bg-rose-700"
+                }`}
+              >
+                {acting ? "承認中..." : "確認して承認"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <div className="flex items-start justify-between gap-3 no-print">
         <div>
           <div className="text-lg font-bold text-slate-900">KY レビュー</div>
@@ -942,9 +1017,14 @@ export default function KyReviewClient() {
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.partner_company_name ?? "（未入力）"}</div>
       </div>
 
-      {/* ✅ 追加：R_base / 写真スコア(I) */}
+      {/* ✅ R_base / 写真スコア(I) */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
-        <div className="text-sm font-semibold text-slate-800">リスク評価</div>
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-sm font-semibold text-slate-800">リスク評価</div>
+          {isHighRisk ? (
+            <div className="text-xs font-semibold rounded-full px-2 py-0.5 bg-rose-100 text-rose-800">高リスク：承認時に確認必須</div>
+          ) : null}
+        </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <div className="rounded-lg border border-slate-300 bg-white px-3 py-2">
@@ -989,7 +1069,7 @@ export default function KyReviewClient() {
         </div>
       </div>
 
-      {/* ✅ 追加：本日の作業員数 */}
+      {/* ✅ 本日の作業員数 */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
         <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
