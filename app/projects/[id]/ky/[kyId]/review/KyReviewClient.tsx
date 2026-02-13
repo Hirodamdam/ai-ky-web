@@ -1,3 +1,4 @@
+// app/projects/[id]/ky/[kyId]/review/KyReviewClient.tsx
 "use client";
 
 import Link from "next/link";
@@ -33,7 +34,6 @@ type KyEntryRow = {
 
   partner_company_name: string | null;
 
-  // ✅ 追加：本日の作業員数
   worker_count?: number | null;
 
   weather_slots?: WeatherSlot[] | null;
@@ -43,13 +43,6 @@ type KyEntryRow = {
   ai_countermeasures?: string | null;
   ai_third_party?: string | null;
   ai_supplement?: string | null;
-
-  // ✅ リスク（比較）
-  r_human?: number | null;
-  r_ai?: number | null;
-  r_delta?: number | null;
-  photo_ai_score?: number | null;
-  risk_engine?: string | null;
 
   is_approved?: boolean | null;
 
@@ -84,12 +77,10 @@ function s(v: any) {
 }
 
 function normalizeName(v: any): string {
-  // ✅ 既読/未読の表記ゆれ対策（空白・全角空白・タブ除去）
   return s(v).replace(/[ 　\t]/g, "").trim();
 }
 
 function normEntrantNoLoose(v: any): string {
-  // 入場Noの大小無視（英字を含む可能性があるため）
   return s(v).trim().toUpperCase();
 }
 
@@ -223,97 +214,165 @@ async function postJsonTry(urls: string[], body: any): Promise<any> {
   throw lastErr ?? new Error("API呼び出しに失敗しました");
 }
 
-/* =========================
-   ✅ リスク計算（Review側：未保存なら自動保存）
-   ========================= */
+/** ============ リスク評価（表示専用） ============ */
 
-function normalizeText(text: string): string {
-  return (text || "").replace(/\r\n/g, "\n").replace(/\u3000/g, " ").trim();
+function clamp01(x: number) {
+  if (!Number.isFinite(x)) return 0;
+  return Math.max(0, Math.min(1, x));
+}
+function clamp100(x: number) {
+  if (!Number.isFinite(x)) return 0;
+  return Math.max(0, Math.min(100, Math.round(x)));
 }
 
-function clamp100(v: number) {
-  if (!Number.isFinite(v)) return 0;
-  return Math.max(0, Math.min(100, v));
+function calcThirdRisk(level: string): number {
+  const v = s(level).trim();
+  if (v === "多い") return 25;
+  if (v === "少ない") return 10;
+  return 0;
 }
 
-function getAppliedWeather(weatherSlots: WeatherSlot[], appliedHour: 9 | 12 | 15 | null): WeatherSlot | null {
-  if (!Array.isArray(weatherSlots) || !weatherSlots.length) return null;
-  if (appliedHour != null) {
-    const x = weatherSlots.find((a) => a?.hour === appliedHour) ?? null;
-    if (x) return x;
+function calcWorkerRisk(workerCount: number | null | undefined): number {
+  const n = Number(workerCount ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  if (n <= 5) return 5;
+  if (n <= 10) return 10;
+  if (n <= 20) return 15;
+  return 20;
+}
+
+function calcWeatherRisk(slot: WeatherSlot | null): { score: number; notes: string[] } {
+  if (!slot) return { score: 0, notes: ["気象データなし"] };
+
+  let score = 0;
+  const notes: string[] = [];
+
+  const p = slot.precipitation_mm == null ? 0 : Number(slot.precipitation_mm);
+  if (p >= 6) {
+    score += 30;
+    notes.push(`降水 ${p}mm（高）`);
+  } else if (p >= 3) {
+    score += 20;
+    notes.push(`降水 ${p}mm（中）`);
+  } else if (p >= 1) {
+    score += 10;
+    notes.push(`降水 ${p}mm（小）`);
+  } else {
+    notes.push(`降水 ${p}mm`);
   }
-  return weatherSlots[0] ?? null;
+
+  const ws = slot.wind_speed_ms == null ? 0 : Number(slot.wind_speed_ms);
+  if (ws >= 10) {
+    score += 20;
+    notes.push(`風速 ${ws}m/s（強）`);
+  } else if (ws >= 5) {
+    score += 10;
+    notes.push(`風速 ${ws}m/s（やや強）`);
+  } else {
+    notes.push(`風速 ${ws}m/s`);
+  }
+
+  const wt = s(slot.weather_text);
+  if (/(雨|雷|強風|暴風|大雨|霧)/.test(wt)) {
+    score += 10;
+    notes.push(`天気「${wt}」`);
+  } else if (wt) {
+    notes.push(`天気「${wt}」`);
+  }
+
+  return { score: clamp100(score), notes };
 }
 
-function calcRHuman(args: {
-  workerCount: number | null;
-  thirdPartyLevel: string | null;
-  weatherSlots: WeatherSlot[];
-  appliedHour: 9 | 12 | 15 | null;
-}) {
-  const wc = args.workerCount ?? 0;
-  const third = (args.thirdPartyLevel ?? "").trim();
-  const slot = getAppliedWeather(args.weatherSlots || [], args.appliedHour);
+function calcKeywordRisk(text: string): { score: number; hits: string[] } {
+  const t = s(text);
+  const rules: Array<{ re: RegExp; add: number; label: string }> = [
+    { re: /(バックホウ|ユンボ|重機|クレーン|玉掛|吊)/, add: 10, label: "重機/吊り" },
+    { re: /(法面|斜面|のり面|高所|転落)/, add: 10, label: "法面/高所" },
+    { re: /(掘削|床掘|開削|崩壊|土砂)/, add: 10, label: "掘削/崩壊" },
+    { re: /(車両|搬入|運搬|交通|誘導)/, add: 8, label: "車両/交通" },
+    { re: /(第三者|墓参者|通行人)/, add: 8, label: "第三者" },
+  ];
 
-  const wind = slot?.wind_speed_ms ?? 0;
-  const rain = slot?.precipitation_mm ?? 0;
-
-  const wcScore = Math.min(1, Math.max(0, wc / 20));
-  const thirdScore = third === "多い" ? 1 : third === "少ない" ? 0.4 : 0.2;
-  const windScore = Math.min(1, Math.max(0, wind / 12));
-  const rainScore = Math.min(1, Math.max(0, rain / 10));
-
-  const r01 = 0.45 * wcScore + 0.30 * thirdScore + 0.15 * windScore + 0.10 * rainScore;
-  return clamp100(r01 * 100);
+  let score = 0;
+  const hits: string[] = [];
+  for (const r of rules) {
+    if (r.re.test(t)) {
+      score += r.add;
+      hits.push(r.label);
+    }
+  }
+  return { score: clamp100(score), hits };
 }
 
-function splitLinesAsItems(text: string): string[] {
-  const t = normalizeText(text);
-  if (!t) return [];
-  return t
+function pseudoPhotoScore(slopeNowUrl: string, pathNowUrl: string): { I: number; engine: string } {
+  // DB保存しない前提の擬似値
+  const hasSlope = !!s(slopeNowUrl).trim();
+  const hasPath = !!s(pathNowUrl).trim();
+  if (hasSlope && hasPath) return { I: 0.85, engine: "pseudo-v1" };
+  if (hasSlope || hasPath) return { I: 0.65, engine: "pseudo-v1" };
+  return { I: 0.0, engine: "pseudo-v1" };
+}
+
+function aiTextRichnessScore(aiHazards: string, aiCounter: string, aiThird: string): { score: number; notes: string[] } {
+  // 文章量/箇条書き数を雑にスコア化（0-25）
+  const notes: string[] = [];
+  const countBullets = (x: string) => s(x).split("\n").map((l) => l.trim()).filter(Boolean).length;
+
+  const hN = countBullets(aiHazards);
+  const cN = countBullets(aiCounter);
+  const tN = countBullets(aiThird);
+
+  let score = 0;
+  if (hN >= 5) score += 10;
+  else if (hN >= 3) score += 7;
+  else if (hN >= 1) score += 4;
+
+  if (cN >= 5) score += 10;
+  else if (cN >= 3) score += 7;
+  else if (cN >= 1) score += 4;
+
+  if (tN >= 2) score += 5;
+  else if (tN >= 1) score += 3;
+
+  notes.push(`危険予知 ${hN}項目`, `対策 ${cN}項目`, `第三者 ${tN}項目`);
+  return { score: clamp100(score), notes };
+}
+
+/** 表示整形：危険予知＝「〜だから〜が起こる（恐れ）」っぽく見せる（断定しない） */
+function formatHazardsForView(text: string): string[] {
+  const lines = s(text)
+    .replace(/\r\n/g, "\n")
     .split("\n")
     .map((x) => x.trim())
-    .map((x) => x.replace(/^[•・\-\*]\s*/g, "").trim())
     .filter(Boolean);
+
+  const out: string[] = [];
+  for (const line of lines) {
+    const raw = line.replace(/^[•・\-*]\s*/, "").trim();
+    if (!raw) continue;
+
+    // 既に「だから」「ため」「ので」などがあればそのまま
+    if (/(だから|ため|ので|から)/.test(raw)) {
+      // 語尾が弱い場合だけ「恐れ」注記
+      out.push(raw.endsWith("。") ? raw : `${raw}（事故につながる恐れ）`);
+      continue;
+    }
+
+    // 1文だけの場合：断定せず恐れ注記で補強
+    out.push(`${raw}（事故につながる恐れ）`);
+  }
+  return out;
 }
 
-function formatHazardBecause(items: string[]): string[] {
-  return items.map((x) => {
-    const v = x.replace(/[。．]+$/g, "").trim();
-    if (!v) return v;
-    if (/(だから|ため|ので|により|よって)/.test(v) && /(起こる|発生|恐れ|リスク|可能性)/.test(v)) return v;
-    if (/(ため|ので|により|よって)/.test(v)) return v;
-    return `${v} のため注意`;
-  });
-}
-
-function formatMeasures(items: string[]): string[] {
-  return items.map((x) => x.replace(/[。．]+$/g, "").trim()).filter(Boolean);
-}
-
-function calcRAi(args: {
-  rHuman: number;
-  aiHazards: string;
-  aiCounter: string;
-  photoScoreI: number | null;
-}) {
-  const hazards = splitLinesAsItems(args.aiHazards);
-  const counter = splitLinesAsItems(args.aiCounter);
-
-  const hazardBoost = Math.min(18, hazards.length * 3);
-  const counterReduce = Math.min(12, counter.length * 2);
-
-  const I = args.photoScoreI;
-  const photoAdj = I == null ? 0 : clamp100((0.5 - I) * 20);
-
-  const r = args.rHuman + hazardBoost - counterReduce + photoAdj;
-  return clamp100(r);
-}
-
-function riskLabel(r: number): { label: string; cls: string } {
-  if (r >= 70) return { label: "高", cls: "bg-rose-100 text-rose-800 border-rose-200" };
-  if (r >= 40) return { label: "中", cls: "bg-amber-100 text-amber-800 border-amber-200" };
-  return { label: "低", cls: "bg-emerald-100 text-emerald-800 border-emerald-200" };
+/** 対策：箇条書きとして見せる */
+function formatMeasuresForView(text: string): string[] {
+  return s(text)
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .map((x) => x.replace(/^[•・\-*]\s*/, "").trim())
+    .filter(Boolean);
 }
 
 export default function KyReviewClient() {
@@ -353,10 +412,7 @@ export default function KyReviewClient() {
 
   // ✅ 表示用：既読者を未読から除外（表記ゆれ対策）
   const unreadFiltered = useMemo(() => {
-    // 既読：名前正規化セット
     const readNameSet = new Set(readLogs.map((r) => normalizeName(r.reader_name)));
-
-    // 既読：No:XXXX 形式もセットに入れる（公開側がNo保存のケース）
     const readNoSet = new Set(
       readLogs
         .map((r) => normalizeName(r.reader_name))
@@ -373,10 +429,8 @@ export default function KyReviewClient() {
       const n = normalizeName(name);
       if (!n) return false;
 
-      // 1) 名前一致で除外
       if (readNameSet.has(n)) return false;
 
-      // 2) 未読側が「No:xxxx」表記の場合も吸収
       const m = n.match(/^No:([0-9A-Za-z_-]{1,32})$/i);
       if (m) {
         const key = `No:${normEntrantNoLoose(m[1])}`;
@@ -468,11 +522,6 @@ export default function KyReviewClient() {
             "ai_countermeasures",
             "ai_third_party",
             "ai_supplement",
-            "r_human",
-            "r_ai",
-            "r_delta",
-            "photo_ai_score",
-            "risk_engine",
             "is_approved",
             "approved_at",
             "approved_by",
@@ -489,8 +538,6 @@ export default function KyReviewClient() {
       if (kyErr) throw kyErr;
 
       const kyData: KyEntryRow | null = (kyRow as any) ?? null;
-
-      // ✅ ai_supplementの互換展開
       if (kyData) {
         const sup = safeParseJson(kyData.ai_supplement);
         if (sup) {
@@ -506,27 +553,15 @@ export default function KyReviewClient() {
           if (!s(kyData.ai_countermeasures).trim() && parts.counter) kyData.ai_countermeasures = parts.counter;
           if (!s(kyData.ai_third_party).trim() && parts.third) kyData.ai_third_party = parts.third;
         }
-
-        // ✅ AI補足の表示品質を担保（内容は増やさず形式だけ整える）
-        const hazItems = formatHazardBecause(splitLinesAsItems(kyData.ai_hazards || ""));
-        const cntItems = formatMeasures(splitLinesAsItems(kyData.ai_countermeasures || ""));
-        if (hazItems.length) kyData.ai_hazards = hazItems.map((x) => `・${x}`).join("\n");
-        if (cntItems.length) kyData.ai_countermeasures = cntItems.map((x) => `・${x}`).join("\n");
       }
-
       setKy(kyData);
 
       const projectTargetId = kyData?.project_id || projectId;
-      const { data: pRow, error: pErr } = await supabase
-        .from("projects")
-        .select("id,name,contractor_name")
-        .eq("id", projectTargetId)
-        .maybeSingle();
+      const { data: pRow, error: pErr } = await supabase.from("projects").select("id,name,contractor_name").eq("id", projectTargetId).maybeSingle();
       if (pErr) throw pErr;
       setProject((pRow as any) ?? null);
 
       const photoProjectId = kyData?.project_id || projectId;
-
       const { data: photos, error: phErr } = await supabase
         .from("ky_photos")
         .select("*")
@@ -578,72 +613,12 @@ export default function KyReviewClient() {
 
           if (slopeNow && slopePrev && pathNow && pathPrev) break;
         }
-
-        if (!slopePrev) {
-          const firstSlope = (photos as any[])
-            .map((r) => ({
-              k: canonicalKind(pickKind(r)),
-              url: pickUrl(r),
-              rowKy: s(r?.ky_id).trim() || s(r?.ky_entry_id).trim(),
-            }))
-            .find((x) => x.k === "slope" && x.url && x.rowKy !== curKyKey);
-          if (firstSlope) slopePrev = firstSlope.url;
-        }
-        if (!pathPrev) {
-          const firstPath = (photos as any[])
-            .map((r) => ({
-              k: canonicalKind(pickKind(r)),
-              url: pickUrl(r),
-              rowKy: s(r?.ky_id).trim() || s(r?.ky_entry_id).trim(),
-            }))
-            .find((x) => x.k === "path" && x.url && x.rowKy !== curKyKey);
-          if (firstPath) pathPrev = firstPath.url;
-        }
       }
 
       setSlopeNowUrl(slopeNow);
       setSlopePrevUrl(slopePrev);
       setPathNowUrl(pathNow);
       setPathPrevUrl(pathPrev);
-
-      // ✅ リスクが未保存なら、ここで計算してDBへ保存（スクショの「— / 未保存」を潰す）
-      if (kyData && (kyData.r_human == null || kyData.r_ai == null || kyData.r_delta == null)) {
-        const weatherArr = Array.isArray(kyData.weather_slots) ? (kyData.weather_slots as WeatherSlot[]) : [];
-        const rHuman = calcRHuman({
-          workerCount: kyData.worker_count ?? null,
-          thirdPartyLevel: kyData.third_party_level ?? null,
-          weatherSlots: weatherArr,
-          appliedHour: null, // Reviewでは「適用枠」概念は持っていないので先頭枠
-        });
-
-        const rAi = calcRAi({
-          rHuman,
-          aiHazards: kyData.ai_hazards || "",
-          aiCounter: kyData.ai_countermeasures || "",
-          photoScoreI: kyData.photo_ai_score ?? null,
-        });
-
-        const rDelta = clamp100(rAi - rHuman);
-
-        // DB更新
-        const { error: upErr } = await supabase
-          .from("ky_entries")
-          .update({
-            r_human: rHuman,
-    r_ai: rAi,
-    r_delta: rDelta,
-    risk_engine: kyData.risk_engine || "pseudo-v1",
-  } as any)
-          .eq("id", kyData.id);
-
-        if (!upErr) {
-          kyData.r_human = rHuman;
-          kyData.r_ai = rAi;
-          kyData.r_delta = rDelta;
-          kyData.risk_engine = kyData.risk_engine || "pseudo-v1";
-          setKy({ ...(kyData as any) });
-        }
-      }
 
       if (kyData?.is_approved) {
         await loadReadLogs();
@@ -670,15 +645,19 @@ export default function KyReviewClient() {
     const raw = ky?.weather_slots ?? null;
     const arr = Array.isArray(raw) ? (raw as WeatherSlot[]) : [];
     const filtered = arr.filter((x) => x && (x.hour === 9 || x.hour === 12 || x.hour === 15));
-    filtered.sort((a, b) => a.hour - b.hour);
+    // ✅ 保存時に「適用枠を先頭」にしているので、ここでは順序を崩さない
     return filtered;
   }, [ky?.weather_slots]);
+
+  // ✅ 適用枠（保存順の先頭）
+  const appliedWeather = useMemo(() => {
+    return weatherSlots.length ? weatherSlots[0] : null;
+  }, [weatherSlots]);
 
   const onPrint = useCallback(() => {
     window.print();
   }, []);
 
-  // ✅ 承認 → 公開リンク発行 → LINE共有へ
   const onApprove = useCallback(async () => {
     setStatus({ type: null, text: "" });
     setActing(true);
@@ -749,16 +728,12 @@ export default function KyReviewClient() {
         hazards: ky.hazards,
         countermeasures: ky.countermeasures,
         third_party_level: ky.third_party_level,
-        worker_count: ky.worker_count ?? null,
         weather_slots: weatherSlots,
         slope_photo_url: slopeNowUrl || null,
         slope_prev_photo_url: slopePrevUrl || null,
         path_photo_url: pathNowUrl || null,
         path_prev_photo_url: pathPrevUrl || null,
-        output_style: {
-          hazards: "bullet_because",
-          countermeasures: "bullet_actions",
-        },
+        worker_count: ky.worker_count ?? null,
       };
 
       const data = await postJsonTry(["/api/ky-ai-supplement"], payload);
@@ -772,32 +747,6 @@ export default function KyReviewClient() {
         ai_supplement: s(data?.ai_supplement).trim() || ky.ai_supplement || null,
       };
 
-      // ✅ 表示品質を担保（内容は増やさず形式だけ整える）
-      const hazItems = formatHazardBecause(splitLinesAsItems(next.ai_hazards || ""));
-      const cntItems = formatMeasures(splitLinesAsItems(next.ai_countermeasures || ""));
-      if (hazItems.length) next.ai_hazards = hazItems.map((x) => `・${x}`).join("\n");
-      if (cntItems.length) next.ai_countermeasures = cntItems.map((x) => `・${x}`).join("\n");
-
-      // ✅ リスク再計算（AI再生成後に更新）
-      const rHuman = calcRHuman({
-        workerCount: ky.worker_count ?? null,
-        thirdPartyLevel: ky.third_party_level ?? null,
-        weatherSlots: weatherSlots || [],
-        appliedHour: null,
-      });
-      const rAi = calcRAi({
-        rHuman,
-        aiHazards: next.ai_hazards || "",
-        aiCounter: next.ai_countermeasures || "",
-        photoScoreI: ky.photo_ai_score ?? null,
-      });
-      const rDelta = clamp100(rAi - rHuman);
-
-      next.r_human = rHuman;
-      next.r_ai = rAi;
-      next.r_delta = rDelta;
-      next.risk_engine = ky.risk_engine || "pseudo-v1";
-
       setKy(next);
 
       const { error } = await supabase
@@ -808,16 +757,12 @@ export default function KyReviewClient() {
           ai_countermeasures: next.ai_countermeasures || null,
           ai_third_party: next.ai_third_party || null,
           ai_supplement: next.ai_supplement || null,
-          r_human: next.r_human ?? null,
-          r_ai: next.r_ai ?? null,
-          r_delta: next.r_delta ?? null,
-          risk_engine: next.risk_engine ?? "pseudo-v1",
         })
         .eq("id", ky.id);
 
       if (error) throw error;
 
-      setStatus({ type: "success", text: "AI補足を再生成して保存しました（リスクも更新）。" });
+      setStatus({ type: "success", text: "AI補足を再生成して保存しました。" });
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "AI補足の再生成に失敗しました" });
     } finally {
@@ -836,7 +781,6 @@ export default function KyReviewClient() {
 
   useEffect(() => {
     let cancelled = false;
-
     const run = async () => {
       if (!publicUrl) {
         setQrDataUrl("");
@@ -853,7 +797,6 @@ export default function KyReviewClient() {
         if (!cancelled) setQrDataUrl("");
       }
     };
-
     run();
     return () => {
       cancelled = true;
@@ -883,13 +826,60 @@ export default function KyReviewClient() {
     }
   }, [publicUrl]);
 
-  // ✅ リスク表示（比較）
-  const rHuman = useMemo(() => (ky?.r_human == null ? null : Number(ky.r_human)), [ky?.r_human]);
-  const rAi = useMemo(() => (ky?.r_ai == null ? null : Number(ky.r_ai)), [ky?.r_ai]);
-  const rDelta = useMemo(() => (ky?.r_delta == null ? null : Number(ky.r_delta)), [ky?.r_delta]);
+  /** ============ リスク評価（比較＋内訳） ============ */
+  const risk = useMemo(() => {
+    const third = calcThirdRisk(ky?.third_party_level || "");
+    const worker = calcWorkerRisk(ky?.worker_count ?? null);
 
-  const rHumanTag = useMemo(() => (rHuman == null ? null : riskLabel(rHuman)), [rHuman]);
-  const rAiTag = useMemo(() => (rAi == null ? null : riskLabel(rAi)), [rAi]);
+    const w0 = calcWeatherRisk(appliedWeather);
+    const kw = calcKeywordRisk(`${s(ky?.work_detail)}\n${s(ky?.hazards)}\n${s(ky?.countermeasures)}`);
+
+    // 人の入力：ベース + 作業員 + 第三者 + 気象 + キーワード
+    const rHuman = clamp100(10 + worker + third + w0.score + kw.score);
+
+    // 写真（擬似I）
+    const photo = pseudoPhotoScore(slopeNowUrl, pathNowUrl);
+    const rPhoto = clamp100(clamp01(photo.I) * 100);
+
+    // AI補足の情報量（表示専用の雑スコア）
+    const rich = aiTextRichnessScore(s(ky?.ai_hazards), s(ky?.ai_countermeasures), s(ky?.ai_third_party));
+    const rAiText = clamp100(rich.score); // 0-25想定だが100にしても問題ない
+
+    // AIデータ：気象・第三者・写真・AI補足量を合成（表示専用）
+    const rAi = clamp100(0.35 * w0.score + 0.25 * third + 0.25 * rPhoto + 0.15 * rAiText);
+
+    const delta = clamp100(rAi - rHuman);
+
+    return {
+      rHuman,
+      rAi,
+      delta: rAi - rHuman,
+      components: {
+        r_weather: w0.score,
+        weather_notes: w0.notes,
+        r_third: third,
+        r_worker: worker,
+        r_keyword: kw.score,
+        keyword_hits: kw.hits,
+        I: photo.I,
+        r_photo: rPhoto,
+        photo_engine: photo.engine,
+        r_ai_text: rAiText,
+        ai_text_notes: rich.notes,
+      },
+    };
+  }, [ky, appliedWeather, slopeNowUrl, pathNowUrl]);
+
+  const riskBadge = useMemo(() => {
+    const v = risk.rAi;
+    if (v >= 70) return { label: "高", cls: "bg-rose-100 text-rose-800 border-rose-200" };
+    if (v >= 40) return { label: "中", cls: "bg-amber-100 text-amber-800 border-amber-200" };
+    return { label: "低", cls: "bg-emerald-100 text-emerald-800 border-emerald-200" };
+  }, [risk.rAi]);
+
+  const hazardsView = useMemo(() => formatHazardsForView(s(ky?.ai_hazards)), [ky?.ai_hazards]);
+  const measuresView = useMemo(() => formatMeasuresForView(s(ky?.ai_countermeasures)), [ky?.ai_countermeasures]);
+  const thirdView = useMemo(() => formatMeasuresForView(s(ky?.ai_third_party)), [ky?.ai_third_party]);
 
   if (loading) {
     return (
@@ -924,41 +914,73 @@ export default function KyReviewClient() {
         <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 print-avoid-break">未承認</div>
       )}
 
-      {/* ✅ リスク評価（比較） */}
+      {/* ✅ リスク評価（比較＋内訳）：レビューだけに表示 */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
-        <div className="text-sm font-semibold text-slate-800">リスク評価（比較）</div>
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-sm font-semibold text-slate-800">リスク評価（比較＋内訳）</div>
+          <div className={`text-xs px-2 py-1 rounded-full border ${riskBadge.cls}`}>AI総合：{risk.rAi}（{riskBadge.label}）</div>
+        </div>
+
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
           <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-            <div className="text-xs text-slate-600">R_human（人の入力）</div>
-            <div className="mt-1 flex items-center gap-2">
-              <div className="text-2xl font-bold text-slate-900">{rHuman == null ? "—" : Math.round(rHuman)}</div>
-              {rHumanTag ? <span className={`text-xs rounded-full border px-2 py-0.5 ${rHumanTag.cls}`}>{rHumanTag.label}</span> : null}
-            </div>
-            <div className="text-xs text-slate-500 mt-1">{rHuman == null ? "未保存" : `engine: ${s(ky?.risk_engine) || "—"}`}</div>
+            <div className="text-xs text-slate-600 mb-1">R_human（人の入力）</div>
+            <div className="text-2xl font-bold text-slate-900">{risk.rHuman}</div>
+            <div className="text-xs text-slate-600 mt-1">作業員/第三者/気象/キーワード</div>
           </div>
 
           <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-            <div className="text-xs text-slate-600">R_ai（AIデータ）</div>
-            <div className="mt-1 flex items-center gap-2">
-              <div className="text-2xl font-bold text-slate-900">{rAi == null ? "—" : Math.round(rAi)}</div>
-              {rAiTag ? <span className={`text-xs rounded-full border px-2 py-0.5 ${rAiTag.cls}`}>{rAiTag.label}</span> : null}
-            </div>
-            <div className="text-xs text-slate-500 mt-1">
-              {rAi == null ? "未保存" : `写真スコアI: ${ky?.photo_ai_score == null ? "—" : String(ky.photo_ai_score)}`}
-            </div>
+            <div className="text-xs text-slate-600 mb-1">R_ai（AIデータ）</div>
+            <div className="text-2xl font-bold text-slate-900">{risk.rAi}</div>
+            <div className="text-xs text-slate-600 mt-1">写真/第三者/気象/AI補足</div>
           </div>
 
           <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-            <div className="text-xs text-slate-600">Δ（AI − 人）</div>
-            <div className="mt-1 text-2xl font-bold text-slate-900">{rDelta == null ? "—" : Math.round(rDelta)}</div>
-            <div className="text-xs text-slate-500 mt-1">
-              {rAi == null || rHuman == null ? "AIが厳しい甘いが一目" : rAi > rHuman ? "AIが厳しめ" : rAi < rHuman ? "人が厳しめ" : "同等"}
+            <div className="text-xs text-slate-600 mb-1">Δ（AI − 人）</div>
+            <div className="text-2xl font-bold text-slate-900">{risk.delta >= 0 ? `+${risk.delta}` : `${risk.delta}`}</div>
+            <div className="text-xs text-slate-600 mt-1">{risk.delta >= 10 ? "AIが厳しめ" : risk.delta <= -10 ? "人が厳しめ" : "同程度"}</div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div className="rounded-lg border border-slate-200 bg-white p-3">
+            <div className="text-xs text-slate-600 mb-1">R_photo（写真）</div>
+            <div className="flex items-end gap-2">
+              <div className="text-xl font-bold text-slate-900">{risk.components.r_photo}</div>
+              <div className="text-xs text-slate-600">I={risk.components.I.toFixed(2)} / engine:{risk.components.photo_engine}</div>
             </div>
+            <div className="text-xs text-slate-500 mt-2">※ 現在は擬似スコア（pseudo）</div>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 bg-white p-3">
+            <div className="text-xs text-slate-600 mb-1">R_third（第三者）</div>
+            <div className="text-xl font-bold text-slate-900">{risk.components.r_third}</div>
+            <div className="text-xs text-slate-600 mt-1">状況：{s(ky?.third_party_level).trim() || "（未入力）"}</div>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 bg-white p-3">
+            <div className="text-xs text-slate-600 mb-1">R_weather（気象：適用枠）</div>
+            <div className="text-xl font-bold text-slate-900">{risk.components.r_weather}</div>
+            <div className="text-xs text-slate-600 mt-1">
+              適用：{appliedWeather ? `${appliedWeather.hour}時` : "—"}
+            </div>
+            <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
+              {risk.components.weather_notes.map((x, i) => (
+                <li key={`${x}-${i}`}>{x}</li>
+              ))}
+            </ul>
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div className="text-xs text-slate-600 mb-2">参考：人側内訳</div>
+          <div className="text-xs text-slate-700 flex flex-wrap gap-3">
+            <span>作業員：{risk.components.r_worker}</span>
+            <span>キーワード：{risk.components.r_keyword}{risk.components.keyword_hits.length ? `（${risk.components.keyword_hits.join(" / ")}）` : ""}</span>
           </div>
         </div>
 
         <div className="text-xs text-slate-500">
-          ※ 係数は運用しながら調整できます。写真AIスコアIをDBで持っている場合は次段でR_aiへ合成します。
+          ※ 係数は運用しながら調整できます。気象は「適用枠＝保存先頭」を使用。写真Iは現状pseudoです（DB保存なし）。
         </div>
       </div>
 
@@ -1052,7 +1074,6 @@ export default function KyReviewClient() {
             )}
           </div>
 
-          {/* ✅ 未読ブロックは印刷に出さない（no-print） */}
           <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 space-y-2 no-print">
             <div className="flex items-center justify-between gap-2">
               <div className="text-sm font-semibold text-rose-800">
@@ -1085,11 +1106,7 @@ export default function KyReviewClient() {
               <div className="bg-white rounded-xl p-4 max-w-md w-full" onClick={(e) => e.stopPropagation()}>
                 <div className="flex items-center justify-between mb-3">
                   <div className="text-sm font-semibold text-slate-800">QRコード（拡大）</div>
-                  <button
-                    type="button"
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-1 text-sm hover:bg-slate-50"
-                    onClick={() => setQrOpen(false)}
-                  >
+                  <button type="button" className="rounded-lg border border-slate-300 bg-white px-3 py-1 text-sm hover:bg-slate-50" onClick={() => setQrOpen(false)}>
                     閉じる
                   </button>
                 </div>
@@ -1116,7 +1133,6 @@ export default function KyReviewClient() {
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.partner_company_name ?? "（未入力）"}</div>
       </div>
 
-      {/* ✅ 追加：本日の作業員数 */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
         <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
@@ -1145,12 +1161,15 @@ export default function KyReviewClient() {
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
-        <div className="text-sm font-semibold text-slate-800">気象（9/12/15）</div>
+        <div className="text-sm font-semibold text-slate-800">気象（先頭＝適用枠）</div>
         {weatherSlots.length ? (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            {weatherSlots.map((slot) => (
-              <div key={slot.hour} className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
-                <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>
+            {weatherSlots.map((slot, idx) => (
+              <div key={`${slot.hour}-${idx}`} className={`rounded-lg border p-3 print-avoid-break ${idx === 0 ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`}>
+                <div className="flex items-center justify-between">
+                  <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>
+                  {idx === 0 ? <div className="text-xs font-semibold text-emerald-700">適用</div> : null}
+                </div>
                 <div className="mt-1 text-sm text-slate-700">{slot.weather_text || "（不明）"}</div>
                 <div className="mt-2 text-xs text-slate-600 space-y-1">
                   <div>気温：{slot.temperature_c ?? "—"} ℃</div>
@@ -1227,7 +1246,7 @@ export default function KyReviewClient() {
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
         <div className="flex items-center justify-between gap-3">
-          <div className="text-sm font-semibold text-slate-800">AI補足（項目別）</div>
+          <div className="text-sm font-semibold text-slate-800">AI補足（見やすく表示）</div>
 
           <button
             type="button"
@@ -1247,27 +1266,53 @@ export default function KyReviewClient() {
         </div>
 
         <div className="space-y-2 print-avoid-break">
-          <div className="text-xs text-slate-600">危険予知の補足（箇条書き：〇〇だから〇〇が起こる）</div>
-          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.ai_hazards).trim() || "（なし）"}</div>
+          <div className="text-xs text-slate-600">危険予知の補足（箇条書き：理由→恐れ）</div>
+          {hazardsView.length ? (
+            <div className="rounded-lg border border-slate-300 bg-white p-3">
+              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                {hazardsView.map((x, i) => (
+                  <li key={`${x}-${i}`}>{x}</li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
+          )}
         </div>
 
         <div className="space-y-2 print-avoid-break">
-          <div className="text-xs text-slate-600">対策の補足（箇条書き：各項目の対策）</div>
-          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.ai_countermeasures).trim() || "（なし）"}</div>
+          <div className="text-xs text-slate-600">対策の補足（項目別・箇条書き）</div>
+          {measuresView.length ? (
+            <div className="rounded-lg border border-slate-300 bg-white p-3">
+              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                {measuresView.map((x, i) => (
+                  <li key={`${x}-${i}`}>{x}</li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
+          )}
         </div>
 
         <div className="space-y-2 print-avoid-break">
-          <div className="text-xs text-slate-600">第三者（墓参者）の補足</div>
-          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.ai_third_party).trim() || "（なし）"}</div>
+          <div className="text-xs text-slate-600">第三者（墓参者）の補足（箇条書き）</div>
+          {thirdView.length ? (
+            <div className="rounded-lg border border-slate-300 bg-white p-3">
+              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                {thirdView.map((x, i) => (
+                  <li key={`${x}-${i}`}>{x}</li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
+          )}
         </div>
       </div>
 
       <div className="flex items-center justify-between gap-3 no-print">
-        <button
-          type="button"
-          onClick={() => router.push(`/projects/${projectId}/ky`)}
-          className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
-        >
+        <button type="button" onClick={() => router.push(`/projects/${projectId}/ky`)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50">
           戻る
         </button>
 
@@ -1281,19 +1326,12 @@ export default function KyReviewClient() {
               type="button"
               disabled={acting}
               onClick={onUnapprove}
-              className={`rounded-lg border px-4 py-2 text-sm ${
-                acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
-              }`}
+              className={`rounded-lg border px-4 py-2 text-sm ${acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
             >
               承認解除
             </button>
           ) : (
-            <button
-              type="button"
-              disabled={acting}
-              onClick={onApprove}
-              className={`rounded-lg px-4 py-2 text-sm text-white ${acting ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}
-            >
+            <button type="button" disabled={acting} onClick={onApprove} className={`rounded-lg px-4 py-2 text-sm text-white ${acting ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}>
               承認
             </button>
           )}
@@ -1302,9 +1340,7 @@ export default function KyReviewClient() {
             type="button"
             onClick={() => load()}
             disabled={acting}
-            className={`rounded-lg border px-4 py-2 text-sm ${
-              acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
-            }`}
+            className={`rounded-lg border px-4 py-2 text-sm ${acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
           >
             再読み込み
           </button>
