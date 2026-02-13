@@ -133,6 +133,129 @@ function slotSummary(slot: WeatherSlot | null | undefined): string {
   return `${w} / 気温${t} / 風${wd} ${ws} / 降水${p}`;
 }
 
+/* ===========================
+   ✅ R_base / 写真スコア(I)
+   =========================== */
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function safeNum(v: any): number | null {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * ✅ R_base（0〜100）
+ * 画面に既にある情報で同期演算（差分最小）。
+ */
+function computeRBase(args: {
+  workerCount: number | null;
+  thirdPartyLevel: string | null;
+  appliedSlot: WeatherSlot | null; // 「気象を適用」優先
+  workDetail: string;
+  hazards: string;
+}): number {
+  let score = 10;
+
+  // 作業員数（上限30で頭打ち）
+  if (args.workerCount != null) {
+    score += clamp(args.workerCount, 0, 30) * 1.2; // 最大+36
+  }
+
+  // 第三者
+  if ((args.thirdPartyLevel || "").includes("多い")) score += 18;
+  else if ((args.thirdPartyLevel || "").includes("少ない")) score += 6;
+
+  // 気象（適用中枠）
+  const w = args.appliedSlot;
+  if (w) {
+    const wind = safeNum(w.wind_speed_ms);
+    const rain = safeNum(w.precipitation_mm);
+
+    if (wind != null) {
+      if (wind >= 10) score += 18;
+      else if (wind >= 7) score += 12;
+      else if (wind >= 5) score += 6;
+    }
+    if (rain != null) {
+      if (rain >= 10) score += 18;
+      else if (rain >= 5) score += 12;
+      else if (rain >= 1) score += 6;
+    }
+
+    const wt = (w.weather_text || "").toLowerCase();
+    if (wt.includes("雷") || wt.includes("thunder")) score += 10;
+    if (wt.includes("雪") || wt.includes("snow")) score += 8;
+    if (wt.includes("雨") || wt.includes("rain")) score += 6;
+  }
+
+  // 作業内容/危険予知の危険語
+  const text = `${args.workDetail}\n${args.hazards}`.toLowerCase();
+  const dangerWords = [
+    "高所",
+    "墜落",
+    "転落",
+    "法面",
+    "重機",
+    "バックホウ",
+    "クレーン",
+    "吊",
+    "玉掛",
+    "車両",
+    "誘導",
+    "通行",
+    "第三者",
+    "掘削",
+    "開口",
+    "埋設",
+    "倒壊",
+    "崩壊",
+    "落石",
+    "感電",
+  ];
+  let hits = 0;
+  for (const dw of dangerWords) if (text.includes(dw)) hits++;
+  score += clamp(hits, 0, 8) * 4; // 最大+32
+
+  return Math.round(clamp(score, 0, 100));
+}
+
+/**
+ * ✅ 写真スコア(I)（失敗しても保存は継続）
+ */
+async function fetchPhotoScore(input: {
+  projectId: string;
+  workDate: string;
+  slopeUrl: string | null;
+  pathUrl: string | null;
+}): Promise<{ score: number | null; meta: any }> {
+  try {
+    const imageUrls = [input.slopeUrl, input.pathUrl].filter(Boolean) as string[];
+    if (!imageUrls.length) return { score: null, meta: { reason: "no_images" } };
+
+    const res = await fetch("/api/photo-score", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({
+        projectId: input.projectId,
+        workDate: input.workDate,
+        imageUrls,
+      }),
+    });
+
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) return { score: null, meta: { error: j?.error || "photo-score failed", status: res.status } };
+
+    const sc = safeNum(j?.score);
+    return { score: sc, meta: j?.meta ?? null };
+  } catch (e: any) {
+    return { score: null, meta: { error: e?.message || "photo-score fetch failed" } };
+  }
+}
+
 export default function KyNewClient() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
@@ -157,7 +280,7 @@ export default function KyNewClient() {
   const [partnerCompanyName, setPartnerCompanyName] = useState<string>("");
   const [partnerOptions, setPartnerOptions] = useState<PartnerOption[]>([]);
 
-  // ✅ 追加：本日の作業員数（worker_count）
+  // ✅ 本日の作業員数（worker_count）
   const [workerCount, setWorkerCount] = useState<string>("");
 
   const [workDetail, setWorkDetail] = useState("");
@@ -414,7 +537,7 @@ export default function KyNewClient() {
       countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
       third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
 
-      // ✅ 追加：作業員数（AIへ渡す）
+      // ✅ 作業員数（AIへ渡す）
       worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
 
       lat,
@@ -516,6 +639,24 @@ export default function KyNewClient() {
       if (pathMode === "file" && pathFile) pathSavedUrl = await uploadToStorage(pathFile, "path");
       else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;
 
+      // ✅ ① R_base（0〜100）
+      const wc = workerCount.trim() ? Number(workerCount.trim()) : null;
+      const rBase = computeRBase({
+        workerCount: Number.isFinite(Number(wc)) ? Number(wc) : null,
+        thirdPartyLevel: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
+        appliedSlot: appliedSlotObj ?? null, // 「気象を適用」優先
+        workDetail: workDetail.trim(),
+        hazards: hazards.trim(),
+      });
+
+      // ✅ ② 写真スコア(I)（失敗しても保存は継続）
+      const photoScoreRes = await fetchPhotoScore({
+        projectId,
+        workDate,
+        slopeUrl: slopeSavedUrl,
+        pathUrl: pathSavedUrl,
+      });
+
       const insertPayload: any = {
         project_id: projectId,
         work_date: workDate,
@@ -528,6 +669,11 @@ export default function KyNewClient() {
 
         // ✅ 本日の作業員数（worker_count）
         worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
+
+        // ✅ 追加：R_base / 写真スコア(I)
+        r_base: rBase,
+        photo_score: photoScoreRes.score,
+        photo_score_meta: photoScoreRes.meta,
 
         ai_work_detail: aiWork.trim() ? aiWork.trim() : null,
         ai_hazards: aiHazards.trim() ? aiHazards.trim() : null,
@@ -618,6 +764,7 @@ export default function KyNewClient() {
     slopeUrlFromProject,
     pathUrlFromProject,
     workerCount,
+    appliedSlotObj,
   ]);
 
   const WeatherCard = useCallback(
@@ -702,7 +849,7 @@ export default function KyNewClient() {
         <div className="text-xs text-slate-500">候補数：{partnerOptions.length}</div>
       </div>
 
-      {/* ✅ 追加：本日の作業員数（worker_count） */}
+      {/* ✅ 本日の作業員数（worker_count） */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
         <input

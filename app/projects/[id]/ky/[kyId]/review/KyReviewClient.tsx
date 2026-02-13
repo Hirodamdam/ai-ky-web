@@ -37,6 +37,11 @@ type KyEntryRow = {
   // ✅ 追加：本日の作業員数
   worker_count?: number | null;
 
+  // ✅ 追加：R_base / 写真スコア(I)
+  r_base?: number | null;
+  photo_score?: number | null;
+  photo_score_meta?: any | null;
+
   weather_slots?: WeatherSlot[] | null;
 
   ai_work_detail?: string | null;
@@ -105,6 +110,16 @@ function degToDirJp(deg: number | null | undefined): string {
   const dirs = ["北", "北東", "東", "南東", "南", "南西", "西", "北西"];
   const idx = Math.round(d / 45) % 8;
   return dirs[idx];
+}
+
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function safeNum(v: any): number | null {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 // ky_photos の列名差を吸収
@@ -215,6 +230,25 @@ async function postJsonTry(urls: string[], body: any): Promise<any> {
     }
   }
   throw lastErr ?? new Error("API呼び出しに失敗しました");
+}
+
+/**
+ * ✅ 表示用：R_base をラベル化
+ */
+function riskLabel(r: number): { label: string; tone: "low" | "mid" | "high" } {
+  if (r >= 80) return { label: "高", tone: "high" };
+  if (r >= 50) return { label: "中", tone: "mid" };
+  return { label: "低", tone: "low" };
+}
+
+/**
+ * ✅ 表示用：写真スコア(I) を 0〜1 として整形
+ */
+function fmtPhotoScore(v: any): string {
+  const n = safeNum(v);
+  if (n == null) return "";
+  const clamped = clamp(n, 0, 1);
+  return clamped.toFixed(2);
 }
 
 export default function KyReviewClient() {
@@ -363,6 +397,12 @@ export default function KyReviewClient() {
             "third_party_level",
             "partner_company_name",
             "worker_count",
+
+            // ✅ 追加：R_base / 写真スコア(I)
+            "r_base",
+            "photo_score",
+            "photo_score_meta",
+
             "weather_slots",
             "ai_work_detail",
             "ai_hazards",
@@ -386,6 +426,12 @@ export default function KyReviewClient() {
 
       const kyData: KyEntryRow | null = (kyRow as any) ?? null;
       if (kyData) {
+        // meta が JSON 文字列で来る可能性も吸収（運用差異対策）
+        if (typeof (kyData as any).photo_score_meta === "string") {
+          const parsed = safeParseJson((kyData as any).photo_score_meta);
+          (kyData as any).photo_score_meta = parsed ?? (kyData as any).photo_score_meta;
+        }
+
         const sup = safeParseJson(kyData.ai_supplement);
         if (sup) {
           const parsed = pickAiFromSupplement(sup);
@@ -696,6 +742,19 @@ export default function KyReviewClient() {
     }
   }, [publicUrl]);
 
+  const riskView = useMemo(() => {
+    const r = safeNum((ky as any)?.r_base);
+    if (r == null) return null;
+    const rr = clamp(Math.round(r), 0, 100);
+    const tag = riskLabel(rr);
+    return { value: rr, ...tag };
+  }, [ky]);
+
+  const photoScoreView = useMemo(() => {
+    const v = fmtPhotoScore((ky as any)?.photo_score);
+    return v ? v : "";
+  }, [ky]);
+
   if (loading) {
     return (
       <div className="p-4">
@@ -881,6 +940,53 @@ export default function KyReviewClient() {
           協力会社 <span className="text-rose-600">（必須）</span>
         </div>
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.partner_company_name ?? "（未入力）"}</div>
+      </div>
+
+      {/* ✅ 追加：R_base / 写真スコア(I) */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
+        <div className="text-sm font-semibold text-slate-800">リスク評価</div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2">
+            <div className="text-xs text-slate-600">R_base（0〜100）</div>
+            {riskView ? (
+              <div className="mt-1 flex items-center gap-2">
+                <div className="text-lg font-bold text-slate-900">{riskView.value}</div>
+                <div
+                  className={`text-xs font-semibold rounded-full px-2 py-0.5 ${
+                    riskView.tone === "high"
+                      ? "bg-rose-100 text-rose-800"
+                      : riskView.tone === "mid"
+                      ? "bg-amber-100 text-amber-800"
+                      : "bg-emerald-100 text-emerald-800"
+                  }`}
+                >
+                  {riskView.label}
+                </div>
+              </div>
+            ) : (
+              <div className="mt-1 text-sm text-slate-500">（未計算）</div>
+            )}
+          </div>
+
+          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2">
+            <div className="text-xs text-slate-600">写真スコア I（0〜1）</div>
+            {photoScoreView ? (
+              <div className="mt-1 text-lg font-bold text-slate-900">{photoScoreView}</div>
+            ) : (
+              <div className="mt-1 text-sm text-slate-500">（なし）</div>
+            )}
+            {ky?.photo_score_meta ? (
+              <div className="mt-1 text-xs text-slate-500">
+                {typeof ky.photo_score_meta === "object" ? `engine: ${s((ky.photo_score_meta as any)?.engine)}` : ""}
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="text-xs text-slate-500">
+          ※ R_base は「作業員数・第三者・気象（適用）・作業内容/危険語」から算出（初期版）。係数は後で調整可能です。
+        </div>
       </div>
 
       {/* ✅ 追加：本日の作業員数 */}
