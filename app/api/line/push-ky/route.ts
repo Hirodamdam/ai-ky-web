@@ -12,23 +12,20 @@ type WeatherSlot = {
   precipitation_mm?: number | null;
 };
 
-// 互換維持：text でも title/url でも送れる
-// ✅ 追加：to（userId / groupId / roomId）を渡せば協力会社別Push
 type Body =
-  | { text: string; to?: string }
+  | { text: string; to?: string | string[]; also_to?: string | string[] }
   | {
       title: string;
       url?: string;
       note?: string;
-      to?: string;
+      to?: string | string[];
+      also_to?: string | string[];
 
-      // optional (完成形に必要な情報)
       work_detail?: string | null;
       workers?: number | null;
       third_party_level?: string | null;
       weather_slots?: WeatherSlot[] | null;
 
-      // AI要点（短く使う）
       ai_hazards?: string | null;
       ai_countermeasures?: string | null;
       ai_third_party?: string | null;
@@ -43,6 +40,43 @@ async function sleep(ms: number) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
+function isValidLineTo(id: string): boolean {
+  // userId: U + 32hex, groupId: C + 32hex, roomId: R + 32hex
+  const x = s(id).trim().replace(/^"+|"+$/g, ""); // 念のため両端の " を除去
+  return /^[UCR][0-9a-f]{32}$/i.test(x);
+}
+
+function parseRecipients(v: any): string[] {
+  if (Array.isArray(v)) return v.map((x) => s(x).trim()).filter(Boolean);
+  const one = s(v).trim();
+  return one ? [one] : [];
+}
+
+function parseAdminRecipientsFromEnv(): string[] {
+  const raw = (process.env.LINE_ADMIN_RECIPIENT_IDS || "").trim();
+  if (!raw) return [];
+  return raw.split(",").map((x) => x.trim()).filter(Boolean);
+}
+
+async function callLinePush(token: string, to: string, text: string) {
+  const url = "https://api.line.me/v2/bot/message/push";
+  const payload = { to, messages: [{ type: "text", text }] };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const bodyText = await res.text().catch(() => "");
+  const retryAfter = Number(res.headers.get("retry-after") || "0") || 0;
+  return { ok: res.ok, status: res.status, bodyText, retryAfter };
+}
+
+// 既存テンプレ関数（あなたの現行をそのまま使う想定）
 function trimLineOne(text: string, max = 60) {
   const t = s(text).replace(/\r\n/g, "\n").trim();
   if (!t) return "";
@@ -50,7 +84,6 @@ function trimLineOne(text: string, max = 60) {
   if (first.length <= max) return first;
   return first.slice(0, max - 1) + "…";
 }
-
 function normalizeBullets(text: string, maxLines = 3, maxLen = 120) {
   const t = s(text).replace(/\r\n/g, "\n").trim();
   if (!t) return [];
@@ -67,7 +100,6 @@ function normalizeBullets(text: string, maxLines = 3, maxLen = 120) {
   }
   return picked;
 }
-
 function degToDirJp(deg: number | null | undefined): string {
   if (deg === null || deg === undefined || Number.isNaN(Number(deg))) return "—";
   const d = ((Number(deg) % 360) + 360) % 360;
@@ -75,22 +107,19 @@ function degToDirJp(deg: number | null | undefined): string {
   const idx = Math.round(d / 45) % 8;
   return dirs[idx];
 }
-
-const WIND_WARN_MS = 8; // 強風注意
-const RAIN_WARN_MM = 3; // 雨注意
+const WIND_WARN_MS = 8;
+const RAIN_WARN_MM = 3;
 
 function pickWorstWeather(slots: WeatherSlot[] | null | undefined) {
   const arr = Array.isArray(slots) ? slots : [];
   const filtered = arr.filter((x) => x && (x.hour === 9 || x.hour === 12 || x.hour === 15));
-
   if (!filtered.length) return null;
 
   const score = (x: WeatherSlot) => {
     const ws = x.wind_speed_ms ?? null;
     const pr = x.precipitation_mm ?? null;
-
     let sc = 0;
-    if (ws != null) sc += Math.min(Math.max(ws, 0), 30) * 10; // 風を重め
+    if (ws != null) sc += Math.min(Math.max(ws, 0), 30) * 10;
     if (pr != null) sc += Math.min(Math.max(pr, 0), 50) * 8;
     return sc;
   };
@@ -98,21 +127,14 @@ function pickWorstWeather(slots: WeatherSlot[] | null | undefined) {
   filtered.sort((a, b) => score(b) - score(a) || a.hour - b.hour);
   return filtered[0];
 }
-
 function weatherWarningLine(slot: WeatherSlot | null) {
   if (!slot) return "";
-
   const ws = slot.wind_speed_ms ?? null;
   const pr = slot.precipitation_mm ?? null;
 
   const parts: string[] = [];
-  if (ws != null && ws >= WIND_WARN_MS) {
-    parts.push(`強風（${degToDirJp(slot.wind_direction_deg)} ${ws}m/s）`);
-  }
-  if (pr != null && pr >= RAIN_WARN_MM) {
-    parts.push(`雨（降水 ${pr}mm）`);
-  }
-
+  if (ws != null && ws >= WIND_WARN_MS) parts.push(`強風（${degToDirJp(slot.wind_direction_deg)} ${ws}m/s）`);
+  if (pr != null && pr >= RAIN_WARN_MM) parts.push(`雨（降水 ${pr}mm）`);
   if (!parts.length) return "";
   return `⚠ 気象：${slot.hour}時 ${parts.join(" / ")}`;
 }
@@ -123,7 +145,6 @@ function buildCompletedTemplate(body: Extract<Body, { title: string }>) {
   const note = s(body.note).trim();
 
   const lines: string[] = [];
-
   lines.push(`【本日KY】${title}`);
 
   const work = trimLineOne(s((body as any).work_detail), 70);
@@ -152,7 +173,6 @@ function buildCompletedTemplate(body: Extract<Body, { title: string }>) {
     const hz = normalizeBullets((body as any).ai_hazards || "", 1, 120)[0] || "";
     const cm = normalizeBullets((body as any).ai_countermeasures || "", 1, 120)[0] || "";
     const th = normalizeBullets((body as any).ai_third_party || "", 1, 120)[0] || "";
-
     if (hz || cm || th) {
       if (hz) lines.push(`・危険：${hz}`);
       if (cm) lines.push(`・対策：${cm}`);
@@ -170,36 +190,10 @@ function buildCompletedTemplate(body: Extract<Body, { title: string }>) {
   return text.length > 4900 ? text.slice(0, 4899) + "…" : text;
 }
 
-async function callLineApi(token: string, to: string | null, text: string) {
-  // to があれば push、無ければ broadcast
-  const isPush = !!to;
-
-  const url = isPush
-    ? "https://api.line.me/v2/bot/message/push"
-    : "https://api.line.me/v2/bot/message/broadcast";
-
-  const payload = isPush
-    ? { to, messages: [{ type: "text", text }] }
-    : { messages: [{ type: "text", text }] };
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const bodyText = await res.text().catch(() => "");
-  return { ok: res.ok, status: res.status, bodyText, isPush };
-}
-
 export async function POST(req: Request) {
   const started = Date.now();
 
   try {
-    // ✅ 簡易認証（trimして事故防止）
     const secret = (process.env.LINE_PUSH_SECRET || "").trim();
     if (secret) {
       const header = (req.headers.get("x-line-push-secret") || "").trim();
@@ -211,10 +205,6 @@ export async function POST(req: Request) {
 
     const body = (await req.json()) as Body;
 
-    // ✅ to（宛先）を取得：協力会社別Pushに使う
-    const to = s((body as any)?.to).trim() || null;
-
-    // ✅ 送信テキストを組み立て（text優先 / それ以外は完成形テンプレ生成）
     let text = "";
     if ("text" in body) {
       text = s((body as any).text).trim();
@@ -223,51 +213,65 @@ export async function POST(req: Request) {
       if (!title) return NextResponse.json({ error: "title required" }, { status: 400 });
       text = buildCompletedTemplate(body as any);
     }
-
     if (!text) return NextResponse.json({ error: "text empty" }, { status: 400 });
 
     const token = (process.env.LINE_CHANNEL_ACCESS_TOKEN || "").trim();
-    if (!token) {
-      console.error("[line-push-ky] LINE_CHANNEL_ACCESS_TOKEN missing");
-      return NextResponse.json({ error: "LINE token missing" }, { status: 500 });
+    if (!token) return NextResponse.json({ error: "LINE token missing" }, { status: 500 });
+
+    const toFromBody = parseRecipients((body as any)?.to);
+    const alsoFromBody = parseRecipients((body as any)?.also_to);
+    const adminFromEnv = parseAdminRecipientsFromEnv();
+
+    const rawTargets = Array.from(new Set([...toFromBody, ...alsoFromBody, ...adminFromEnv]));
+    const validTargets = rawTargets.map((x) => x.trim().replace(/^"+|"+$/g, "")).filter(isValidLineTo);
+    const invalidTargets = rawTargets.filter((x) => !isValidLineTo(x));
+
+    if (invalidTargets.length) {
+      console.warn("[line-push-ky] invalid targets filtered:", invalidTargets);
+    }
+    if (!validTargets.length) {
+      return NextResponse.json({ error: "no valid recipients", invalidTargets }, { status: 400 });
     }
 
-    // ✅ 429対策：最大3回リトライ
-    let lastStatus = 0;
-    let lastBody = "";
-    let ok = false;
-    let mode: "push" | "broadcast" = to ? "push" : "broadcast";
+    const results: Array<{ to: string; ok: boolean; status: number; body: string }> = [];
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const r = await callLineApi(token, to, text);
+    for (const to of validTargets) {
+      let ok = false;
+      let lastStatus = 0;
+      let lastBody = "";
 
-      lastStatus = r.status;
-      lastBody = r.bodyText;
-      ok = r.ok;
-      mode = r.isPush ? "push" : "broadcast";
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const r = await callLinePush(token, to, text);
+        lastStatus = r.status;
+        lastBody = r.bodyText;
+        ok = r.ok;
 
-      console.log(
-        `[line-push-ky] mode=${mode} attempt=${attempt} status=${lastStatus} ok=${ok} body=${lastBody.slice(0, 300)}`
-      );
+        console.log(
+          `[line-push-ky] mode=push to=${to} attempt=${attempt} status=${lastStatus} ok=${ok} body=${lastBody.slice(0, 200)}`
+        );
 
-      if (ok) break;
+        if (ok) break;
 
-      if (lastStatus === 429) {
-        const ra = Number((req.headers.get("retry-after") ?? "1").toString());
-        await sleep(Math.min(Math.max(ra, 1), 10) * 1000);
-        continue;
+        if (lastStatus === 429) {
+          const wait = Math.min(Math.max(r.retryAfter || 1, 1), 10);
+          await sleep(wait * 1000);
+          continue;
+        }
+        break;
       }
 
-      break;
+      results.push({ to, ok, status: lastStatus, body: lastBody.slice(0, 500) });
     }
 
     const ms = Date.now() - started;
 
-    if (!ok) {
-      return NextResponse.json({ error: "line api error", mode, status: lastStatus, data: lastBody, ms }, { status: 500 });
+    // 1件でも成功していれば OK 扱いにする（現場運用優先）
+    const anyOk = results.some((r) => r.ok);
+    if (!anyOk) {
+      return NextResponse.json({ error: "line api error (all failed)", targets: validTargets.length, results, ms }, { status: 500 });
     }
 
-    return NextResponse.json({ ok: true, mode, status: lastStatus, data: lastBody, ms });
+    return NextResponse.json({ ok: true, targets: validTargets.length, results, ms, invalidTargets });
   } catch (e: any) {
     console.error("[line-push-ky] failed:", e);
     return NextResponse.json({ error: "failed", message: String(e?.message ?? e) }, { status: 500 });
