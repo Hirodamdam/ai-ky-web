@@ -133,11 +133,23 @@ function slotSummary(slot: WeatherSlot | null | undefined): string {
   return `${w} / 気温${t} / 風${wd} ${ws} / 降水${p}`;
 }
 
-/** ===== 表示用整形（レビューと同じ） ===== */
+/** =========================
+ *  表示用整形（壊さず改良）
+ *  - 重複除去
+ *  - 重要度スコアリング
+ *  - 上位5件抽出
+ *  - 番号削除（全項目統一）
+ *  - 人入力との最小一致文削除
+ *  - 危険予知と対策の整合統一（右側採用/番号除去/分割）
+ * ========================= */
 
 function normalizeLineBase(raw: string): string {
   return raw
+    .replace(/\u3000/g, " ")
     .replace(/^[•・\-*]\s*/, "")
+    .replace(/^\s*\[\s*\d+\s*\]\s*/g, "")
+    .replace(/^\s*\d+\s*[)\.．、]\s*/g, "")
+    .replace(/^\s*（\s*\d+\s*）\s*/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -153,7 +165,7 @@ function stripGenericAccidentNote(x: string): string {
 
 function takeRightOfArrow(line: string): string {
   const t = line;
-  const seps = ["→", "⇒", "->", "＞", "〉"];
+  const seps = ["→", "⇒", "->", "＞", "〉", "→→"];
   for (const sep of seps) {
     const idx = t.indexOf(sep);
     if (idx >= 0) {
@@ -177,34 +189,158 @@ function dedupeKeepOrder(arr: string[]): string[] {
   return out;
 }
 
-// 危険予知：右側だけ採用、(事故につながる恐れ)削除、最大5件、番号なし
-function formatHazardsForView5(text: string): string[] {
-  const lines = String(text ?? "")
-    .replace(/\r\n/g, "\n")
-    .split("\n")
+function normalizeForSim(x: string): string {
+  return (x || "")
+    .toLowerCase()
+    .replace(/\u3000/g, " ")
+    .replace(/[（）()\[\]【】「」『』]/g, "")
+    .replace(/[、，,。．.・:：;；/／|｜]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function charBigrams(x: string): Set<string> {
+  const t = normalizeForSim(x).replace(/\s+/g, "");
+  const s2 = t;
+  const out = new Set<string>();
+  if (s2.length <= 1) return out;
+  for (let i = 0; i < s2.length - 1; i++) out.add(s2.slice(i, i + 2));
+  return out;
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (!a.size || !b.size) return 0;
+  let inter = 0;
+  for (const x of a) if (b.has(x)) inter++;
+  const uni = a.size + b.size - inter;
+  return uni ? inter / uni : 0;
+}
+
+function isTooSimilarToHuman(line: string, humanText: string, threshold = 0.42): boolean {
+  const h = normalizeForSim(humanText);
+  if (!h) return false;
+
+  const a = charBigrams(line);
+  if (!a.size) return false;
+
+  const candidates = h
+    .split(/\n+/g)
     .map((x) => x.trim())
     .filter(Boolean);
 
-  const picked: string[] = [];
-  for (const l0 of lines) {
-    const base = normalizeLineBase(l0);
-    if (!base) continue;
-
-    let v = takeRightOfArrow(base);
-    v = stripGenericAccidentNote(v);
-    v = v.replace(/（\s*[^）]*事故[^）]*恐れ\s*）\s*$/g, "").trim();
-
-    if (/^危険予知/i.test(v) || /^対策/i.test(v) || /^AI補足/i.test(v)) continue;
-    if (v) picked.push(v);
+  // 人入力は1～数行が多いので、行単位で比較（雑な一致を落とす）
+  for (const c of candidates) {
+    const b = charBigrams(c);
+    const sim = jaccard(a, b);
+    if (sim >= threshold) return true;
   }
-  return dedupeKeepOrder(picked).slice(0, 5);
+  return false;
+}
+
+function scoreImportance(line: string, kind: "hazard" | "measure" | "third"): number {
+  const t = normalizeForSim(line);
+
+  // 強い危険ワード（法面/墓地/重機を想定して厳しめ）
+  const strong = [
+    "墜落",
+    "転落",
+    "崩壊",
+    "土砂",
+    "法面",
+    "落下",
+    "飛来",
+    "挟まれ",
+    "巻き込まれ",
+    "接触",
+    "重機",
+    "バックホウ",
+    "ユンボ",
+    "クレーン",
+    "玉掛",
+    "感電",
+    "ガス",
+    "酸欠",
+    "火災",
+    "倒壊",
+    "逸走",
+    "第三者",
+    "墓参者",
+    "一般",
+    "通行人",
+    "車両",
+    "交通",
+    "交差",
+    "誘導",
+  ];
+
+  const medium = [
+    "滑り",
+    "足元",
+    "段差",
+    "転倒",
+    "つまず",
+    "視界",
+    "死角",
+    "手元",
+    "工具",
+    "刃物",
+    "切創",
+    "打撃",
+    "激突",
+    "騒音",
+    "粉じん",
+    "粉塵",
+    "飛散",
+    "風",
+    "強風",
+    "雨",
+    "降雨",
+    "ぬかるみ",
+    "路面",
+    "養生",
+    "区画",
+    "立入",
+    "立入禁止",
+    "カラーコーン",
+    "バリケード",
+    "ロープ",
+    "看板",
+    "声掛け",
+    "監視",
+  ];
+
+  let score = 10;
+
+  for (const w of strong) if (t.includes(w)) score += 18;
+  for (const w of medium) if (t.includes(w)) score += 10;
+
+  // kindごと微調整
+  if (kind === "measure") {
+    const good = ["立入禁止", "区画", "誘導", "合図", "指差呼称", "退避", "停止", "監視", "点検", "KY", "周知", "周囲確認"];
+    for (const w of good) if (t.includes(w)) score += 6;
+  }
+  if (kind === "third") {
+    const good = ["誘導", "区画", "導線", "声掛け", "案内", "掲示", "停止", "同伴", "見守り"];
+    for (const w of good) if (t.includes(w)) score += 6;
+  }
+
+  // 長すぎる1行は読みにくいので軽く減点
+  const len = normalizeForSim(line).length;
+  if (len >= 60) score -= 8;
+  if (len >= 90) score -= 12;
+
+  // ありがちな薄い文を減点
+  if (t === "注意する" || t === "気をつける" || t === "安全に作業する") score -= 20;
+
+  return Math.max(0, score);
 }
 
 function splitMeasuresLine(line: string): string[] {
   const t = line.trim();
+
   const noLead = t
     .replace(/^\s*\[\s*\d+\s*\]\s*/g, "")
-    .replace(/^\s*\d+[)\.]\s*/g, "")
+    .replace(/^\s*\d+[)\.．、]\s*/g, "")
     .trim();
 
   const hasMulti = /\[\s*\d+\s*\]/.test(noLead);
@@ -218,8 +354,66 @@ function splitMeasuresLine(line: string): string[] {
   return parts.length ? parts : [noLead];
 }
 
-// 対策：番号削除、右側だけ採用、最大5件、番号なし
-function formatMeasuresForView5(text: string): string[] {
+function pickTop5ByScore(lines: string[], kind: "hazard" | "measure" | "third"): string[] {
+  const scored = lines
+    .map((x) => ({ x: x.trim(), score: scoreImportance(x, kind) }))
+    .filter((it) => it.x && it.score > 0);
+
+  scored.sort((a, b) => b.score - a.score);
+
+  const out: string[] = [];
+  for (const it of scored) {
+    if (out.length >= 5) break;
+    out.push(it.x);
+  }
+  return out;
+}
+
+// 危険予知：右側だけ採用、注記削除、重複除去、スコア上位5、人入力と類似は除外、番号なし
+function formatHazardsForView5(text: string, humanHazards: string): string[] {
+  const lines = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const picked: string[] = [];
+  for (const l0 of lines) {
+    const base = normalizeLineBase(l0);
+    if (!base) continue;
+
+    let v = takeRightOfArrow(base);
+    v = normalizeLineBase(v);
+    v = stripGenericAccidentNote(v);
+    v = v.replace(/（\s*[^）]*事故[^）]*恐れ\s*）\s*$/g, "").trim();
+
+    if (/^危険予知/i.test(v) || /^対策/i.test(v) || /^AI補足/i.test(v)) continue;
+    if (!v) continue;
+
+    if (isTooSimilarToHuman(v, humanHazards, 0.42)) continue;
+
+    picked.push(v);
+  }
+
+  const deduped = dedupeKeepOrder(picked);
+
+  // スコア上位5（重要度）
+  const top5 = pickTop5ByScore(deduped, "hazard");
+
+  // スコアリングで落ち切ることがあるので、保険で先頭から補完（最大5）
+  if (top5.length < 5) {
+    for (const x of deduped) {
+      if (top5.length >= 5) break;
+      if (top5.includes(x)) continue;
+      top5.push(x);
+    }
+  }
+
+  return top5.slice(0, 5);
+}
+
+// 対策：番号削除、複合行分割、右側だけ採用、重複除去、スコア上位5、人入力と類似は除外、番号なし
+function formatMeasuresForView5(text: string, humanMeasures: string): string[] {
   const lines = String(text ?? "")
     .replace(/\r\n/g, "\n")
     .split("\n")
@@ -237,23 +431,50 @@ function formatMeasuresForView5(text: string): string[] {
       if (!p) continue;
 
       p = takeRightOfArrow(p);
+      p = normalizeLineBase(p);
 
       if (/^対策/i.test(p) || /^AI補足/i.test(p)) continue;
-      if (p) items.push(p);
+      if (!p) continue;
+
+      if (isTooSimilarToHuman(p, humanMeasures, 0.40)) continue;
+
+      items.push(p);
     }
   }
-  return dedupeKeepOrder(items).slice(0, 5);
+
+  const deduped = dedupeKeepOrder(items);
+  const top5 = pickTop5ByScore(deduped, "measure");
+
+  if (top5.length < 5) {
+    for (const x of deduped) {
+      if (top5.length >= 5) break;
+      if (top5.includes(x)) continue;
+      top5.push(x);
+    }
+  }
+
+  return top5.slice(0, 5);
 }
 
-// 第三者：番号なし（今は上限なし）
-function formatThirdForView(text: string): string[] {
-  return String(text ?? "")
+// 第三者：番号削除、重複除去、人入力（第三者レベル）と一致しそうな薄い文は落とす（上限なし）
+function formatThirdForView(text: string, thirdLevelHuman: string): string[] {
+  const raw = String(text ?? "")
     .replace(/\r\n/g, "\n")
     .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean)
+    .map((x) => normalizeLineBase(x))
     .map((x) => x.replace(/^[•・\-*]\s*/, "").trim())
     .filter(Boolean);
+
+  // 「多い/少ない」だけの行などを落とす
+  const filtered = raw.filter((x) => {
+    const t = normalizeForSim(x);
+    if (!t) return false;
+    if (t === "多い" || t === "少ない") return false;
+    if (thirdLevelHuman && isTooSimilarToHuman(x, thirdLevelHuman, 0.55)) return false;
+    return true;
+  });
+
+  return dedupeKeepOrder(filtered);
 }
 
 export default function KyNewClient() {
@@ -757,10 +978,10 @@ export default function KyNewClient() {
     );
   }, []);
 
-  // ✅ AI表示（レビューと同じ：危険予知/対策は5件・番号なし・重複/注記除去）
-  const aiHazardsTop5 = useMemo(() => formatHazardsForView5(aiHazards), [aiHazards]);
-  const aiMeasuresTop5 = useMemo(() => formatMeasuresForView5(aiCounter), [aiCounter]);
-  const aiThirdView = useMemo(() => formatThirdForView(aiThird), [aiThird]);
+  // ✅ AI表示（壊さず改良版）
+  const aiHazardsTop5 = useMemo(() => formatHazardsForView5(aiHazards, hazards), [aiHazards, hazards]);
+  const aiMeasuresTop5 = useMemo(() => formatMeasuresForView5(aiCounter, countermeasures), [aiCounter, countermeasures]);
+  const aiThirdView = useMemo(() => formatThirdForView(aiThird, thirdPartyLevel), [aiThird, thirdPartyLevel]);
 
   if (loading) {
     return (
@@ -871,7 +1092,11 @@ export default function KyNewClient() {
                 ))}
               </select>
 
-              <button type="button" onClick={onApplyWeather} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+              <button
+                type="button"
+                onClick={onApplyWeather}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+              >
                 気象を適用
               </button>
 
@@ -1007,7 +1232,7 @@ export default function KyNewClient() {
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">危険予知の補足（上位5項目・番号なし）</div>
+          <div className="text-xs text-slate-600">危険予知の補足（上位5項目・番号なし・人入力重複除外）</div>
           {aiHazardsTop5.length ? (
             <div className="rounded-lg border border-slate-300 bg-white p-3">
               <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
@@ -1024,7 +1249,7 @@ export default function KyNewClient() {
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">対策の補足（上位5項目・番号なし）</div>
+          <div className="text-xs text-slate-600">対策の補足（上位5項目・番号なし・人入力重複除外）</div>
           {aiMeasuresTop5.length ? (
             <div className="rounded-lg border border-slate-300 bg-white p-3">
               <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
@@ -1040,7 +1265,7 @@ export default function KyNewClient() {
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">第三者（墓参者）の補足（番号なし）</div>
+          <div className="text-xs text-slate-600">第三者（墓参者）の補足（番号なし・重複除去）</div>
           {aiThirdView.length ? (
             <div className="rounded-lg border border-slate-300 bg-white p-3">
               <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
