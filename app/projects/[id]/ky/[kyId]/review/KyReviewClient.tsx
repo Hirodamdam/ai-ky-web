@@ -34,13 +34,8 @@ type KyEntryRow = {
 
   partner_company_name: string | null;
 
-  // ✅ 追加：本日の作業員数
+  // ✅ 作業員数
   worker_count?: number | null;
-
-  // ✅ 追加：R_base / 写真スコア(I)
-  r_base?: number | null;
-  photo_score?: number | null;
-  photo_score_meta?: any | null;
 
   weather_slots?: WeatherSlot[] | null;
 
@@ -49,6 +44,11 @@ type KyEntryRow = {
   ai_countermeasures?: string | null;
   ai_third_party?: string | null;
   ai_supplement?: string | null;
+
+  // ✅ リスク（比較）
+  r_human?: number | null;
+  r_ai?: number | null;
+  r_compare_meta?: any | null;
 
   is_approved?: boolean | null;
 
@@ -83,12 +83,10 @@ function s(v: any) {
 }
 
 function normalizeName(v: any): string {
-  // ✅ 既読/未読の表記ゆれ対策（空白・全角空白・タブ除去）
   return s(v).replace(/[ 　\t]/g, "").trim();
 }
 
 function normEntrantNoLoose(v: any): string {
-  // 入場Noの大小無視（英字を含む可能性があるため）
   return s(v).trim().toUpperCase();
 }
 
@@ -110,16 +108,6 @@ function degToDirJp(deg: number | null | undefined): string {
   const dirs = ["北", "北東", "東", "南東", "南", "南西", "西", "北西"];
   const idx = Math.round(d / 45) % 8;
   return dirs[idx];
-}
-
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function safeNum(v: any): number | null {
-  if (v == null) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
 }
 
 // ky_photos の列名差を吸収
@@ -232,23 +220,65 @@ async function postJsonTry(urls: string[], body: any): Promise<any> {
   throw lastErr ?? new Error("API呼び出しに失敗しました");
 }
 
-/**
- * ✅ 表示用：R_base をラベル化
- */
-function riskLabel(r: number): { label: string; tone: "low" | "mid" | "high" } {
-  if (r >= 80) return { label: "高", tone: "high" };
-  if (r >= 50) return { label: "中", tone: "mid" };
-  return { label: "低", tone: "low" };
+/* =========================
+   リスク計算（Review側：AI再生成時にR_aiも更新）
+   ========================= */
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
 }
+function countHits(text: string, words: string[]) {
+  const t = (text || "").toLowerCase();
+  let c = 0;
+  for (const w of words) {
+    if (!w) continue;
+    if (t.includes(w.toLowerCase())) c++;
+  }
+  return c;
+}
+function calcRAi(args: {
+  weather: { wind_speed_ms: number | null; precipitation_mm: number | null; temperature_c: number | null } | null;
+  photoScore: number | null;
 
-/**
- * ✅ 表示用：写真スコア(I) を 0〜1 として整形
- */
-function fmtPhotoScore(v: any): string {
-  const n = safeNum(v);
-  if (n == null) return "";
-  const clamped = clamp(n, 0, 1);
-  return clamped.toFixed(2);
+  aiWork: string;
+  aiHazards: string;
+  aiCounter: string;
+  aiThird: string;
+
+  thirdPartyLevel: string | null;
+}) {
+  let score = 0;
+
+  if (args.weather) {
+    const w = args.weather;
+    const wind = w.wind_speed_ms ?? null;
+    if (wind != null) score += clamp(Math.round((wind / 10) * 15), 0, 15);
+    const rain = w.precipitation_mm ?? null;
+    if (rain != null) score += clamp(Math.round((rain / 10) * 15), 0, 15);
+    const temp = w.temperature_c ?? null;
+    if (temp != null) {
+      if (temp >= 30) score += 8;
+      else if (temp >= 25) score += 4;
+      if (temp <= 5) score += 8;
+      else if (temp <= 10) score += 4;
+    }
+  }
+
+  if (args.photoScore != null) {
+    score += clamp(Math.round(args.photoScore * 20), 0, 20);
+  }
+
+  const aiDanger = ["転落", "墜落", "崩壊", "飛来", "落下", "接触", "挟ま", "巻き込", "第三者", "墓参者", "近接"];
+  const hit = countHits([args.aiHazards, args.aiWork, args.aiThird].join("\n"), aiDanger);
+  score += clamp(hit * 5, 0, 30);
+
+  const len = (args.aiCounter || "").trim().length;
+  if (len < 40) score += 10;
+  else if (len < 80) score += 5;
+
+  if (args.thirdPartyLevel === "多い") score += 10;
+  else if (args.thirdPartyLevel === "少ない") score += 3;
+
+  return clamp(score, 0, 100);
 }
 
 export default function KyReviewClient() {
@@ -286,17 +316,10 @@ export default function KyReviewClient() {
   const [unreadMode, setUnreadMode] = useState<"person" | "company" | "none">("none");
   const [unreadErr, setUnreadErr] = useState<string>("");
 
-  // ✅ ① 承認ガード（高リスクは確認必須）
-  const RISK_APPROVE_THRESHOLD = 80;
-  const [riskModalOpen, setRiskModalOpen] = useState(false);
-  const [riskConfirm, setRiskConfirm] = useState(false);
-
   // ✅ 表示用：既読者を未読から除外（表記ゆれ対策）
   const unreadFiltered = useMemo(() => {
-    // 既読：名前正規化セット
     const readNameSet = new Set(readLogs.map((r) => normalizeName(r.reader_name)));
 
-    // 既読：No:XXXX 形式もセットに入れる（公開側がNo保存のケース）
     const readNoSet = new Set(
       readLogs
         .map((r) => normalizeName(r.reader_name))
@@ -313,10 +336,8 @@ export default function KyReviewClient() {
       const n = normalizeName(name);
       if (!n) return false;
 
-      // 1) 名前一致で除外
       if (readNameSet.has(n)) return false;
 
-      // 2) 未読側が「No:xxxx」表記の場合も吸収
       const m = n.match(/^No:([0-9A-Za-z_-]{1,32})$/i);
       if (m) {
         const key = `No:${normEntrantNoLoose(m[1])}`;
@@ -402,18 +423,15 @@ export default function KyReviewClient() {
             "third_party_level",
             "partner_company_name",
             "worker_count",
-
-            // ✅ 追加：R_base / 写真スコア(I)
-            "r_base",
-            "photo_score",
-            "photo_score_meta",
-
             "weather_slots",
             "ai_work_detail",
             "ai_hazards",
             "ai_countermeasures",
             "ai_third_party",
             "ai_supplement",
+            "r_human",
+            "r_ai",
+            "r_compare_meta",
             "is_approved",
             "approved_at",
             "approved_by",
@@ -431,12 +449,6 @@ export default function KyReviewClient() {
 
       const kyData: KyEntryRow | null = (kyRow as any) ?? null;
       if (kyData) {
-        // meta が JSON 文字列で来る可能性も吸収（運用差異対策）
-        if (typeof (kyData as any).photo_score_meta === "string") {
-          const parsed = safeParseJson((kyData as any).photo_score_meta);
-          (kyData as any).photo_score_meta = parsed ?? (kyData as any).photo_score_meta;
-        }
-
         const sup = safeParseJson(kyData.ai_supplement);
         if (sup) {
           const parsed = pickAiFromSupplement(sup);
@@ -455,11 +467,7 @@ export default function KyReviewClient() {
       setKy(kyData);
 
       const projectTargetId = kyData?.project_id || projectId;
-      const { data: pRow, error: pErr } = await supabase
-        .from("projects")
-        .select("id,name,contractor_name")
-        .eq("id", projectTargetId)
-        .maybeSingle();
+      const { data: pRow, error: pErr } = await supabase.from("projects").select("id,name,contractor_name").eq("id", projectTargetId).maybeSingle();
       if (pErr) throw pErr;
       setProject((pRow as any) ?? null);
 
@@ -554,10 +562,6 @@ export default function KyReviewClient() {
         setUnreadErr("");
         setUnreadMode("none");
       }
-
-      // ✅ 画面再読込でモーダル状態をリセット
-      setRiskModalOpen(false);
-      setRiskConfirm(false);
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "読み込みに失敗しました" });
     } finally {
@@ -577,31 +581,19 @@ export default function KyReviewClient() {
     return filtered;
   }, [ky?.weather_slots]);
 
+  const delta = useMemo(() => {
+    const h = ky?.r_human;
+    const a = ky?.r_ai;
+    if (h == null || a == null) return null;
+    return a - h;
+  }, [ky?.r_human, ky?.r_ai]);
+
   const onPrint = useCallback(() => {
     window.print();
   }, []);
 
-  const riskView = useMemo(() => {
-    const r = safeNum((ky as any)?.r_base);
-    if (r == null) return null;
-    const rr = clamp(Math.round(r), 0, 100);
-    const tag = riskLabel(rr);
-    return { value: rr, ...tag };
-  }, [ky]);
-
-  const photoScoreView = useMemo(() => {
-    const v = fmtPhotoScore((ky as any)?.photo_score);
-    return v ? v : "";
-  }, [ky]);
-
-  const isHighRisk = useMemo(() => {
-    const r = safeNum((ky as any)?.r_base);
-    if (r == null) return false;
-    return r >= RISK_APPROVE_THRESHOLD;
-  }, [ky]);
-
-  // ✅ 承認処理（本体）
-  const doApprove = useCallback(async () => {
+  // ✅ 承認 → 公開リンク発行 → LINE共有へ
+  const onApprove = useCallback(async () => {
     setStatus({ type: null, text: "" });
     setActing(true);
     try {
@@ -632,20 +624,8 @@ export default function KyReviewClient() {
       setStatus({ type: "error", text: e?.message ?? "承認に失敗しました" });
     } finally {
       setActing(false);
-      setRiskModalOpen(false);
-      setRiskConfirm(false);
     }
-  }, [projectId, kyId, project?.name, load]);
-
-  // ✅ 承認（入口）：高リスクならモーダルへ
-  const onApprove = useCallback(async () => {
-    if (isHighRisk) {
-      setRiskModalOpen(true);
-      setRiskConfirm(false);
-      return;
-    }
-    await doApprove();
-  }, [isHighRisk, doApprove]);
+  }, [projectId, kyId, load, project?.name]);
 
   const onUnapprove = useCallback(async () => {
     setStatus({ type: null, text: "" });
@@ -701,6 +681,33 @@ export default function KyReviewClient() {
         ai_supplement: s(data?.ai_supplement).trim() || ky.ai_supplement || null,
       };
 
+      // ✅ R_ai も再計算（写真スコアはここでは未取得扱い：null）
+      const slot = weatherSlots?.[0] ?? null;
+      const newRAi = calcRAi({
+        weather: slot
+          ? {
+              wind_speed_ms: slot.wind_speed_ms ?? null,
+              precipitation_mm: slot.precipitation_mm ?? null,
+              temperature_c: slot.temperature_c ?? null,
+            }
+          : null,
+        photoScore: null,
+        aiWork: next.ai_work_detail || "",
+        aiHazards: next.ai_hazards || "",
+        aiCounter: next.ai_countermeasures || "",
+        aiThird: next.ai_third_party || "",
+        thirdPartyLevel: next.third_party_level || null,
+      });
+
+      next.r_ai = newRAi;
+      next.r_compare_meta = {
+        ...(next.r_compare_meta || {}),
+        v: 1,
+        method: "regen_ai",
+        r_ai: newRAi,
+        note: "R_ai recalculated after AI regenerate (photoScore not included here)",
+      };
+
       setKy(next);
 
       const { error } = await supabase
@@ -711,12 +718,14 @@ export default function KyReviewClient() {
           ai_countermeasures: next.ai_countermeasures || null,
           ai_third_party: next.ai_third_party || null,
           ai_supplement: next.ai_supplement || null,
+          r_ai: next.r_ai ?? null,
+          r_compare_meta: next.r_compare_meta ?? null,
         })
         .eq("id", ky.id);
 
       if (error) throw error;
 
-      setStatus({ type: "success", text: "AI補足を再生成して保存しました。" });
+      setStatus({ type: "success", text: "AI補足を再生成して保存しました（R_aiも更新）" });
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "AI補足の再生成に失敗しました" });
     } finally {
@@ -792,54 +801,6 @@ export default function KyReviewClient() {
 
   return (
     <div className="p-4 space-y-4">
-      {/* ✅ 高リスク承認モーダル */}
-      {riskModalOpen ? (
-        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4 no-print" onClick={() => setRiskModalOpen(false)}>
-          <div className="bg-white rounded-xl p-4 max-w-lg w-full" onClick={(e) => e.stopPropagation()}>
-            <div className="text-base font-bold text-slate-900">高リスクのため確認が必要です</div>
-
-            <div className="mt-2 text-sm text-slate-700 leading-relaxed">
-              このKYは <span className="font-semibold">R_base が {riskView?.value ?? "—"}</span> で、
-              閾値（{RISK_APPROVE_THRESHOLD}）以上です。<br />
-              内容・対策・誘導計画を確認した上で承認してください。
-            </div>
-
-            <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800">
-              注意：承認すると公開リンクが発行され、作業員へ共有されます。
-            </div>
-
-            <label className="mt-4 flex items-center gap-2 text-sm text-slate-800 select-none">
-              <input type="checkbox" checked={riskConfirm} onChange={(e) => setRiskConfirm(!!e.target.checked)} />
-              内容を確認し、追加対策が必要なら実施します（確認）
-            </label>
-
-            <div className="mt-4 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
-                onClick={() => setRiskModalOpen(false)}
-              >
-                戻る
-              </button>
-
-              <button
-                type="button"
-                disabled={!riskConfirm || acting || !!ky?.is_approved}
-                onClick={async () => {
-                  if (!riskConfirm) return;
-                  await doApprove();
-                }}
-                className={`rounded-lg px-4 py-2 text-sm text-white ${
-                  !riskConfirm || acting || !!ky?.is_approved ? "bg-slate-400" : "bg-rose-600 hover:bg-rose-700"
-                }`}
-              >
-                {acting ? "承認中..." : "確認して承認"}
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
       <div className="flex items-start justify-between gap-3 no-print">
         <div>
           <div className="text-lg font-bold text-slate-900">KY レビュー</div>
@@ -862,6 +823,37 @@ export default function KyReviewClient() {
       ) : (
         <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 print-avoid-break">未承認</div>
       )}
+
+      {/* ✅ リスク比較（印刷にも出す） */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
+        <div className="text-sm font-semibold text-slate-800">リスク評価（比較）</div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
+            <div className="text-xs text-slate-600">R_human（人の入力）</div>
+            <div className="mt-1 text-lg font-bold text-slate-900">{ky?.r_human != null ? ky.r_human : "—"}</div>
+            <div className="text-xs text-slate-500">{ky?.r_human != null ? "保存済み" : "未保存"}</div>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
+            <div className="text-xs text-slate-600">R_ai（AI/データ）</div>
+            <div className="mt-1 text-lg font-bold text-slate-900">{ky?.r_ai != null ? ky.r_ai : "—"}</div>
+            <div className="text-xs text-slate-500">{ky?.r_ai != null ? "保存済み" : "未保存"}</div>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
+            <div className="text-xs text-slate-600">Δ（AI − 人）</div>
+            <div className="mt-1 text-lg font-bold text-slate-900">
+              {delta == null ? "—" : delta > 0 ? `+${delta}` : `${delta}`}
+            </div>
+            <div className="text-xs text-slate-500">AIが厳しい/甘いが一目</div>
+          </div>
+        </div>
+
+        <div className="text-xs text-slate-500">
+          ※ 係数は運用しながら調整できます。写真AIスコア(I)をDBで持っている場合は次段階でR_aiへ合成します。
+        </div>
+      </div>
 
       {publicUrl ? (
         <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
@@ -887,9 +879,7 @@ export default function KyReviewClient() {
               type="button"
               onClick={loadReadLogs}
               disabled={readLoading}
-              className={`rounded-lg border px-4 py-2 text-sm ${
-                readLoading ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
-              }`}
+              className={`rounded-lg border px-4 py-2 text-sm ${readLoading ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
             >
               {readLoading ? "既読 更新中..." : "既読を更新"}
             </button>
@@ -898,9 +888,7 @@ export default function KyReviewClient() {
               type="button"
               onClick={loadUnread}
               disabled={unreadLoading}
-              className={`rounded-lg border px-4 py-2 text-sm ${
-                unreadLoading ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
-              }`}
+              className={`rounded-lg border px-4 py-2 text-sm ${unreadLoading ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
             >
               {unreadLoading ? "未読 更新中..." : "未読を更新"}
             </button>
@@ -953,7 +941,6 @@ export default function KyReviewClient() {
             )}
           </div>
 
-          {/* ✅ 未読ブロックは印刷に出さない（no-print） */}
           <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 space-y-2 no-print">
             <div className="flex items-center justify-between gap-2">
               <div className="text-sm font-semibold text-rose-800">
@@ -986,11 +973,7 @@ export default function KyReviewClient() {
               <div className="bg-white rounded-xl p-4 max-w-md w-full" onClick={(e) => e.stopPropagation()}>
                 <div className="flex items-center justify-between mb-3">
                   <div className="text-sm font-semibold text-slate-800">QRコード（拡大）</div>
-                  <button
-                    type="button"
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-1 text-sm hover:bg-slate-50"
-                    onClick={() => setQrOpen(false)}
-                  >
+                  <button type="button" className="rounded-lg border border-slate-300 bg-white px-3 py-1 text-sm hover:bg-slate-50" onClick={() => setQrOpen(false)}>
                     閉じる
                   </button>
                 </div>
@@ -1017,64 +1000,9 @@ export default function KyReviewClient() {
         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.partner_company_name ?? "（未入力）"}</div>
       </div>
 
-      {/* ✅ R_base / 写真スコア(I) */}
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
-        <div className="flex items-center justify-between gap-3">
-          <div className="text-sm font-semibold text-slate-800">リスク評価</div>
-          {isHighRisk ? (
-            <div className="text-xs font-semibold rounded-full px-2 py-0.5 bg-rose-100 text-rose-800">高リスク：承認時に確認必須</div>
-          ) : null}
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2">
-            <div className="text-xs text-slate-600">R_base（0〜100）</div>
-            {riskView ? (
-              <div className="mt-1 flex items-center gap-2">
-                <div className="text-lg font-bold text-slate-900">{riskView.value}</div>
-                <div
-                  className={`text-xs font-semibold rounded-full px-2 py-0.5 ${
-                    riskView.tone === "high"
-                      ? "bg-rose-100 text-rose-800"
-                      : riskView.tone === "mid"
-                      ? "bg-amber-100 text-amber-800"
-                      : "bg-emerald-100 text-emerald-800"
-                  }`}
-                >
-                  {riskView.label}
-                </div>
-              </div>
-            ) : (
-              <div className="mt-1 text-sm text-slate-500">（未計算）</div>
-            )}
-          </div>
-
-          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2">
-            <div className="text-xs text-slate-600">写真スコア I（0〜1）</div>
-            {photoScoreView ? (
-              <div className="mt-1 text-lg font-bold text-slate-900">{photoScoreView}</div>
-            ) : (
-              <div className="mt-1 text-sm text-slate-500">（なし）</div>
-            )}
-            {ky?.photo_score_meta ? (
-              <div className="mt-1 text-xs text-slate-500">
-                {typeof ky.photo_score_meta === "object" ? `engine: ${s((ky.photo_score_meta as any)?.engine)}` : ""}
-              </div>
-            ) : null}
-          </div>
-        </div>
-
-        <div className="text-xs text-slate-500">
-          ※ R_base は「作業員数・第三者・気象（適用）・作業内容/危険語」から算出（初期版）。係数は後で調整可能です。
-        </div>
-      </div>
-
-      {/* ✅ 本日の作業員数 */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
         <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
-          {ky?.worker_count != null ? `${ky.worker_count} 人` : "（未入力）"}
-        </div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.worker_count != null ? `${ky.worker_count} 人` : "（未入力）"}</div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
@@ -1190,7 +1118,7 @@ export default function KyReviewClient() {
               aiGenerating || acting || !!ky?.is_approved ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
             }`}
           >
-            {!!ky?.is_approved ? "承認済み（再生成不可）" : aiGenerating ? "AI補足 生成中..." : "AI補足 再生成"}
+            {!!ky?.is_approved ? "承認済み（再生成不可）" : aiGenerating ? "AI補足 生成中..." : "AI補足 再生成（R_ai更新）"}
           </button>
         </div>
 
@@ -1216,11 +1144,7 @@ export default function KyReviewClient() {
       </div>
 
       <div className="flex items-center justify-between gap-3 no-print">
-        <button
-          type="button"
-          onClick={() => router.push(`/projects/${projectId}/ky`)}
-          className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
-        >
+        <button type="button" onClick={() => router.push(`/projects/${projectId}/ky`)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50">
           戻る
         </button>
 
@@ -1234,19 +1158,12 @@ export default function KyReviewClient() {
               type="button"
               disabled={acting}
               onClick={onUnapprove}
-              className={`rounded-lg border px-4 py-2 text-sm ${
-                acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
-              }`}
+              className={`rounded-lg border px-4 py-2 text-sm ${acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
             >
               承認解除
             </button>
           ) : (
-            <button
-              type="button"
-              disabled={acting}
-              onClick={onApprove}
-              className={`rounded-lg px-4 py-2 text-sm text-white ${acting ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}
-            >
+            <button type="button" disabled={acting} onClick={onApprove} className={`rounded-lg px-4 py-2 text-sm text-white ${acting ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}>
               承認
             </button>
           )}
@@ -1255,9 +1172,7 @@ export default function KyReviewClient() {
             type="button"
             onClick={() => load()}
             disabled={acting}
-            className={`rounded-lg border px-4 py-2 text-sm ${
-              acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
-            }`}
+            className={`rounded-lg border px-4 py-2 text-sm ${acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
           >
             再読み込み
           </button>

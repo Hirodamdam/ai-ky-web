@@ -133,127 +133,133 @@ function slotSummary(slot: WeatherSlot | null | undefined): string {
   return `${w} / 気温${t} / 風${wd} ${ws} / 降水${p}`;
 }
 
-/* ===========================
-   ✅ R_base / 写真スコア(I)
-   =========================== */
+/* =========================
+   リスク計算（B：ボタン確定）
+   ========================= */
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
-
-function safeNum(v: any): number | null {
-  if (v == null) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
+function countHits(text: string, words: string[]) {
+  const t = (text || "").toLowerCase();
+  let c = 0;
+  for (const w of words) {
+    if (!w) continue;
+    if (t.includes(w.toLowerCase())) c++;
+  }
+  return c;
 }
 
-/**
- * ✅ R_base（0〜100）
- * 画面に既にある情報で同期演算（差分最小）。
- */
-function computeRBase(args: {
+// ✅ 人入力リスク（R_human）
+function calcRHuman(args: {
   workerCount: number | null;
   thirdPartyLevel: string | null;
-  appliedSlot: WeatherSlot | null; // 「気象を適用」優先
   workDetail: string;
   hazards: string;
-}): number {
-  let score = 10;
+  countermeasures: string;
+}) {
+  let score = 0;
 
-  // 作業員数（上限30で頭打ち）
-  if (args.workerCount != null) {
-    score += clamp(args.workerCount, 0, 30) * 1.2; // 最大+36
+  const wc = args.workerCount ?? null;
+  if (wc != null) {
+    // 人数：0〜40
+    score += clamp(Math.round((wc / 20) * 40), 0, 40);
   }
 
-  // 第三者
-  if ((args.thirdPartyLevel || "").includes("多い")) score += 18;
-  else if ((args.thirdPartyLevel || "").includes("少ない")) score += 6;
+  // 第三者：最大15
+  if (args.thirdPartyLevel === "多い") score += 15;
+  else if (args.thirdPartyLevel === "少ない") score += 5;
 
-  // 気象（適用中枠）
-  const w = args.appliedSlot;
-  if (w) {
-    const wind = safeNum(w.wind_speed_ms);
-    const rain = safeNum(w.precipitation_mm);
-
-    if (wind != null) {
-      if (wind >= 10) score += 18;
-      else if (wind >= 7) score += 12;
-      else if (wind >= 5) score += 6;
-    }
-    if (rain != null) {
-      if (rain >= 10) score += 18;
-      else if (rain >= 5) score += 12;
-      else if (rain >= 1) score += 6;
-    }
-
-    const wt = (w.weather_text || "").toLowerCase();
-    if (wt.includes("雷") || wt.includes("thunder")) score += 10;
-    if (wt.includes("雪") || wt.includes("snow")) score += 8;
-    if (wt.includes("雨") || wt.includes("rain")) score += 6;
-  }
-
-  // 作業内容/危険予知の危険語
-  const text = `${args.workDetail}\n${args.hazards}`.toLowerCase();
+  // 危険語：最大35
   const dangerWords = [
-    "高所",
-    "墜落",
-    "転落",
-    "法面",
     "重機",
     "バックホウ",
     "クレーン",
     "吊",
     "玉掛",
-    "車両",
-    "誘導",
-    "通行",
-    "第三者",
+    "高所",
+    "法面",
+    "斜面",
+    "転落",
+    "墜落",
+    "崩壊",
     "掘削",
     "開口",
-    "埋設",
-    "倒壊",
-    "崩壊",
-    "落石",
+    "交通",
+    "車両",
+    "接触",
+    "挟ま",
+    "巻き込",
+    "飛来",
+    "落下",
+    "近接",
+    "立入",
     "感電",
   ];
-  let hits = 0;
-  for (const dw of dangerWords) if (text.includes(dw)) hits++;
-  score += clamp(hits, 0, 8) * 4; // 最大+32
+  const hit = countHits([args.workDetail, args.hazards].join("\n"), dangerWords);
+  score += clamp(hit * 5, 0, 35);
 
-  return Math.round(clamp(score, 0, 100));
+  // 対策があれば減点：最大 -15
+  const measureQualityWords = ["立入禁止", "誘導員", "区画", "声掛け", "点検", "合図", "保護具", "ヘルメット", "注意喚起"];
+  const mHit = countHits(args.countermeasures, measureQualityWords);
+  score -= clamp(mHit * 3, 0, 15);
+
+  return clamp(score, 0, 100);
 }
 
-/**
- * ✅ 写真スコア(I)（失敗しても保存は継続）
- */
-async function fetchPhotoScore(input: {
-  projectId: string;
-  workDate: string;
-  slopeUrl: string | null;
-  pathUrl: string | null;
-}): Promise<{ score: number | null; meta: any }> {
-  try {
-    const imageUrls = [input.slopeUrl, input.pathUrl].filter(Boolean) as string[];
-    if (!imageUrls.length) return { score: null, meta: { reason: "no_images" } };
+// ✅ AI/データリスク（R_ai）
+function calcRAi(args: {
+  weather: { wind_speed_ms: number | null; precipitation_mm: number | null; temperature_c: number | null } | null;
+  // 写真スコア（0〜1想定）。KyNew段階では未取得ならnullでOK
+  photoScore: number | null;
 
-    const res = await fetch("/api/photo-score", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      cache: "no-store",
-      body: JSON.stringify({
-        projectId: input.projectId,
-        workDate: input.workDate,
-        imageUrls,
-      }),
-    });
+  aiWork: string;
+  aiHazards: string;
+  aiCounter: string;
+  aiThird: string;
 
-    const j = await res.json().catch(() => ({}));
-    if (!res.ok) return { score: null, meta: { error: j?.error || "photo-score failed", status: res.status } };
+  thirdPartyLevel: string | null;
+}) {
+  let score = 0;
 
-    const sc = safeNum(j?.score);
-    return { score: sc, meta: j?.meta ?? null };
-  } catch (e: any) {
-    return { score: null, meta: { error: e?.message || "photo-score fetch failed" } };
+  // 気象：最大40
+  if (args.weather) {
+    const w = args.weather;
+
+    const wind = w.wind_speed_ms ?? null;
+    if (wind != null) score += clamp(Math.round((wind / 10) * 15), 0, 15);
+
+    const rain = w.precipitation_mm ?? null;
+    if (rain != null) score += clamp(Math.round((rain / 10) * 15), 0, 15);
+
+    const temp = w.temperature_c ?? null;
+    if (temp != null) {
+      if (temp >= 30) score += 8;
+      else if (temp >= 25) score += 4;
+      if (temp <= 5) score += 8;
+      else if (temp <= 10) score += 4;
+    }
   }
+
+  // 写真スコアI：最大20（危険寄りほど高い想定）
+  if (args.photoScore != null) {
+    score += clamp(Math.round(args.photoScore * 20), 0, 20);
+  }
+
+  // AI危険語：最大30
+  const aiDanger = ["転落", "墜落", "崩壊", "飛来", "落下", "接触", "挟ま", "巻き込", "第三者", "墓参者", "近接"];
+  const hit = countHits([args.aiHazards, args.aiWork, args.aiThird].join("\n"), aiDanger);
+  score += clamp(hit * 5, 0, 30);
+
+  // AI対策が弱い（短い）なら加点：最大10
+  const len = (args.aiCounter || "").trim().length;
+  if (len < 40) score += 10;
+  else if (len < 80) score += 5;
+
+  // 第三者：最大10
+  if (args.thirdPartyLevel === "多い") score += 10;
+  else if (args.thirdPartyLevel === "少ない") score += 3;
+
+  return clamp(score, 0, 100);
 }
 
 export default function KyNewClient() {
@@ -314,6 +320,12 @@ export default function KyNewClient() {
   const [aiThird, setAiThird] = useState("");
 
   const [aiGenerating, setAiGenerating] = useState(false);
+
+  // ✅ リスク（比較）
+  const [rHuman, setRHuman] = useState<number | null>(null);
+  const [rAi, setRAi] = useState<number | null>(null);
+  const [rHumanLocked, setRHumanLocked] = useState(false);
+  const [rAiLocked, setRAiLocked] = useState(false);
 
   const KY_PHOTO_BUCKET = process.env.NEXT_PUBLIC_KY_PHOTO_BUCKET || "ky-photos";
 
@@ -537,7 +549,7 @@ export default function KyNewClient() {
       countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
       third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
 
-      // ✅ 作業員数（AIへ渡す）
+      // ✅ 作業員数
       worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
 
       lat,
@@ -586,7 +598,6 @@ export default function KyNewClient() {
       const j = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(j?.error || "AI補足生成に失敗しました");
 
-      // ✅ 新API（JSON）優先：4項目をそのまま反映
       const w = normalizeText(s(j?.ai_work_detail));
       const h = normalizeText(s(j?.ai_hazards));
       const c = normalizeText(s(j?.ai_countermeasures));
@@ -598,7 +609,6 @@ export default function KyNewClient() {
         setAiCounter(c);
         setAiThird(t);
       } else {
-        // ✅ 互換：旧API（ai_supplement 1本）も拾う
         const combined = normalizeText(s(j?.ai_supplement));
         const split = splitAiCombined(combined);
 
@@ -639,24 +649,6 @@ export default function KyNewClient() {
       if (pathMode === "file" && pathFile) pathSavedUrl = await uploadToStorage(pathFile, "path");
       else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;
 
-      // ✅ ① R_base（0〜100）
-      const wc = workerCount.trim() ? Number(workerCount.trim()) : null;
-      const rBase = computeRBase({
-        workerCount: Number.isFinite(Number(wc)) ? Number(wc) : null,
-        thirdPartyLevel: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
-        appliedSlot: appliedSlotObj ?? null, // 「気象を適用」優先
-        workDetail: workDetail.trim(),
-        hazards: hazards.trim(),
-      });
-
-      // ✅ ② 写真スコア(I)（失敗しても保存は継続）
-      const photoScoreRes = await fetchPhotoScore({
-        projectId,
-        workDate,
-        slopeUrl: slopeSavedUrl,
-        pathUrl: pathSavedUrl,
-      });
-
       const insertPayload: any = {
         project_id: projectId,
         work_date: workDate,
@@ -667,14 +659,10 @@ export default function KyNewClient() {
         partner_company_name: partnerCompanyName.trim(),
         weather_slots: weatherSlots && weatherSlots.length ? weatherSlots : null,
 
-        // ✅ 本日の作業員数（worker_count）
+        // ✅ 作業員数
         worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
 
-        // ✅ 追加：R_base / 写真スコア(I)
-        r_base: rBase,
-        photo_score: photoScoreRes.score,
-        photo_score_meta: photoScoreRes.meta,
-
+        // ✅ AI補足（項目別）
         ai_work_detail: aiWork.trim() ? aiWork.trim() : null,
         ai_hazards: aiHazards.trim() ? aiHazards.trim() : null,
         ai_countermeasures: aiCounter.trim() ? aiCounter.trim() : null,
@@ -691,13 +679,23 @@ export default function KyNewClient() {
         ]
           .filter(Boolean)
           .join("\n"),
+
+        // ✅ リスク（確定したものだけ保存）
+        r_human: rHumanLocked ? rHuman : null,
+        r_ai: rAiLocked ? rAi : null,
+        r_compare_meta:
+          rHumanLocked || rAiLocked
+            ? {
+                v: 1,
+                method: "button_lock",
+                r_human: rHumanLocked ? rHuman : null,
+                r_ai: rAiLocked ? rAi : null,
+                note: "initial weights; adjustable",
+              }
+            : null,
       };
 
-      const { data: inserted, error: insErr } = await (supabase as any)
-        .from("ky_entries")
-        .insert(insertPayload)
-        .select("id")
-        .maybeSingle();
+      const { data: inserted, error: insErr } = await (supabase as any).from("ky_entries").insert(insertPayload).select("id").maybeSingle();
       if (insErr) throw insErr;
 
       const kyId = s(inserted?.id).trim();
@@ -764,32 +762,41 @@ export default function KyNewClient() {
     slopeUrlFromProject,
     pathUrlFromProject,
     workerCount,
-    appliedSlotObj,
+    rHuman,
+    rAi,
+    rHumanLocked,
+    rAiLocked,
   ]);
 
-  const WeatherCard = useCallback(
-    ({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) => {
-      const isApplied = appliedHour != null && slot.hour === appliedHour;
-      return (
-        <div className={`rounded-lg border p-3 ${isApplied ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`}>
-          <div className="flex items-center justify-between">
-            <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>
-            {isApplied && <div className="text-xs font-semibold text-emerald-700">適用中</div>}
-          </div>
-          <div className="mt-1 text-sm text-slate-700">{slot.weather_text || "（不明）"}</div>
-          <div className="mt-2 text-xs text-slate-600 space-y-1">
-            <div>気温：{slot.temperature_c ?? "—"} ℃</div>
-            <div>
-              風：{degToDirJp(slot.wind_direction_deg) || "—"}{" "}
-              {slot.wind_speed_ms !== null && slot.wind_speed_ms !== undefined ? `${slot.wind_speed_ms} m/s` : "—"}
-            </div>
-            <div>降水：{slot.precipitation_mm ?? "—"} mm</div>
-          </div>
+  const WeatherCard = useCallback(({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) => {
+    const isApplied = appliedHour != null && slot.hour === appliedHour;
+    return (
+      <div className={`rounded-lg border p-3 ${isApplied ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`}>
+        <div className="flex items-center justify-between">
+          <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>
+          {isApplied && <div className="text-xs font-semibold text-emerald-700">適用中</div>}
         </div>
-      );
-    },
-    []
-  );
+        <div className="mt-1 text-sm text-slate-700">{slot.weather_text || "（不明）"}</div>
+        <div className="mt-2 text-xs text-slate-600 space-y-1">
+          <div>気温：{slot.temperature_c ?? "—"} ℃</div>
+          <div>
+            風：{degToDirJp(slot.wind_direction_deg) || "—"}{" "}
+            {slot.wind_speed_ms !== null && slot.wind_speed_ms !== undefined ? `${slot.wind_speed_ms} m/s` : "—"}
+          </div>
+          <div>降水：{slot.precipitation_mm ?? "—"} mm</div>
+        </div>
+      </div>
+    );
+  }, []);
+
+  const canComputeAiRisk = useMemo(() => {
+    return !!(aiWork.trim() || aiHazards.trim() || aiCounter.trim() || aiThird.trim());
+  }, [aiWork, aiHazards, aiCounter, aiThird]);
+
+  const delta = useMemo(() => {
+    if (rHuman == null || rAi == null) return null;
+    return rAi - rHuman;
+  }, [rHuman, rAi]);
 
   if (loading) {
     return (
@@ -849,7 +856,7 @@ export default function KyNewClient() {
         <div className="text-xs text-slate-500">候補数：{partnerOptions.length}</div>
       </div>
 
-      {/* ✅ 本日の作業員数（worker_count） */}
+      {/* ✅ 本日の作業員数 */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
         <input
@@ -866,12 +873,7 @@ export default function KyNewClient() {
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">日付</div>
         <div className="flex items-center gap-3 flex-wrap">
-          <input
-            type="date"
-            value={workDate}
-            onChange={(e) => setWorkDate(e.target.value)}
-            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-          />
+          <input type="date" value={workDate} onChange={(e) => setWorkDate(e.target.value)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
           <div className="text-sm text-slate-600">{fmtDateJp(workDate)}</div>
         </div>
       </div>
@@ -901,11 +903,7 @@ export default function KyNewClient() {
                 ))}
               </select>
 
-              <button
-                type="button"
-                onClick={onApplyWeather}
-                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
-              >
+              <button type="button" onClick={onApplyWeather} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
                 気象を適用
               </button>
 
@@ -928,13 +926,7 @@ export default function KyNewClient() {
           <div className="text-xs text-slate-600">
             作業内容 <span className="text-rose-600">（必須）</span>
           </div>
-          <textarea
-            value={workDetail}
-            onChange={(e) => setWorkDetail(e.target.value)}
-            rows={3}
-            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-            placeholder="例：法面整形、転圧、土砂運搬 など"
-          />
+          <textarea value={workDetail} onChange={(e) => setWorkDetail(e.target.value)} rows={3} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" placeholder="例：法面整形、転圧、土砂運搬 など" />
         </div>
 
         <div className="space-y-2">
@@ -944,22 +936,121 @@ export default function KyNewClient() {
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">対策（1行でもOK）</div>
-          <textarea
-            value={countermeasures}
-            onChange={(e) => setCountermeasures(e.target.value)}
-            rows={3}
-            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-          />
+          <textarea value={countermeasures} onChange={(e) => setCountermeasures(e.target.value)} rows={3} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
+        </div>
+      </div>
+
+      {/* ✅ リスク評価（比較） */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="text-sm font-semibold text-slate-800">リスク評価（比較）</div>
+
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            type="button"
+            onClick={() => {
+              const wc = workerCount.trim() ? Number(workerCount.trim()) : null;
+              const v = calcRHuman({
+                workerCount: wc,
+                thirdPartyLevel: thirdPartyLevel || null,
+                workDetail,
+                hazards,
+                countermeasures,
+              });
+              setRHuman(v);
+              setRHumanLocked(true);
+              setStatus({ type: "success", text: "人入力リスク（R_human）を確定しました" });
+            }}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+          >
+            人入力でリスク評価（確定）
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              const slot = (() => {
+                if (appliedSlotHour) return weatherSlots.find((x) => x.hour === appliedSlotHour) ?? null;
+                return weatherSlots?.[0] ?? null;
+              })();
+
+              // KyNew段階では写真AIスコア(I)は未取得想定（保存後Reviewで補完・再計算も可能）
+              const photoScore: number | null = null;
+
+              const v = calcRAi({
+                weather: slot
+                  ? {
+                      wind_speed_ms: slot.wind_speed_ms ?? null,
+                      precipitation_mm: slot.precipitation_mm ?? null,
+                      temperature_c: slot.temperature_c ?? null,
+                    }
+                  : null,
+                photoScore,
+                aiWork,
+                aiHazards,
+                aiCounter,
+                aiThird,
+                thirdPartyLevel: thirdPartyLevel || null,
+              });
+
+              setRAi(v);
+              setRAiLocked(true);
+              setStatus({ type: "success", text: "AI/データリスク（R_ai）を確定しました" });
+            }}
+            disabled={!canComputeAiRisk}
+            className={`rounded-lg border px-3 py-2 text-sm ${
+              !canComputeAiRisk ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
+            }`}
+          >
+            AI/データでリスク評価（確定）
+          </button>
+
+          {(rHumanLocked || rAiLocked) ? (
+            <button
+              type="button"
+              onClick={() => {
+                setRHuman(null);
+                setRAi(null);
+                setRHumanLocked(false);
+                setRAiLocked(false);
+                setStatus({ type: "success", text: "リスク確定を解除しました" });
+              }}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+            >
+              確定を解除
+            </button>
+          ) : null}
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="text-xs text-slate-600">R_human（人の入力）</div>
+            <div className="mt-1 text-lg font-bold text-slate-900">{rHuman != null ? rHuman : "—"}</div>
+            <div className="text-xs text-slate-500">{rHumanLocked ? "確定済み" : "未確定"}</div>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="text-xs text-slate-600">R_ai（AI/データ）</div>
+            <div className="mt-1 text-lg font-bold text-slate-900">{rAi != null ? rAi : "—"}</div>
+            <div className="text-xs text-slate-500">{rAiLocked ? "確定済み" : "未確定（AI補足が必要）"}</div>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="text-xs text-slate-600">Δ（AI − 人）</div>
+            <div className="mt-1 text-lg font-bold text-slate-900">
+              {delta == null ? "—" : delta > 0 ? `+${delta}` : `${delta}`}
+            </div>
+            <div className="text-xs text-slate-500">AIが厳しい/甘いが一目</div>
+          </div>
+        </div>
+
+        <div className="text-xs text-slate-500">
+          ※ 現状のR_aiは「気象（適用枠）＋AI補足（危険/対策）＋第三者」を主に使用。写真AIスコア(I)は次段階で合成可能です。
         </div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">第三者（墓参者）の状況</div>
-        <select
-          value={thirdPartyLevel}
-          onChange={(e) => setThirdPartyLevel(e.target.value)}
-          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-        >
+        <select value={thirdPartyLevel} onChange={(e) => setThirdPartyLevel(e.target.value)} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm">
           <option value="">選択してください</option>
           <option value="多い">多い</option>
           <option value="少ない">少ない</option>
