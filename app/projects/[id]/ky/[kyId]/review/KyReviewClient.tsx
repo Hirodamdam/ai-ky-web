@@ -71,6 +71,29 @@ type ReadLog = {
   created_at: string | null;
 };
 
+type RiskBreakdownItem = { score: number; reasons: string[] };
+
+type RiskOut = {
+  total_human: number;
+  total_ai: number;
+  delta: number;
+  breakdown: {
+    weather: RiskBreakdownItem;
+    photo: RiskBreakdownItem;
+    third_party: RiskBreakdownItem;
+    workers: RiskBreakdownItem;
+    keyword: RiskBreakdownItem;
+    text_quality_human: RiskBreakdownItem;
+    text_quality_ai: RiskBreakdownItem;
+  };
+  meta: {
+    base_human: number;
+    base_ai: number;
+    bias_multiplier: number;
+    computed_at: string;
+  };
+};
+
 function s(v: any) {
   if (v == null) return "";
   return String(v);
@@ -214,131 +237,7 @@ async function postJsonTry(urls: string[], body: any): Promise<any> {
   throw lastErr ?? new Error("API呼び出しに失敗しました");
 }
 
-/** ============ リスク評価（表示専用） ============ */
-
-function clamp01(x: number) {
-  if (!Number.isFinite(x)) return 0;
-  return Math.max(0, Math.min(1, x));
-}
-function clamp100(x: number) {
-  if (!Number.isFinite(x)) return 0;
-  return Math.max(0, Math.min(100, Math.round(x)));
-}
-
-function calcThirdRisk(level: string): number {
-  const v = s(level).trim();
-  if (v === "多い") return 25;
-  if (v === "少ない") return 10;
-  return 0;
-}
-
-function calcWorkerRisk(workerCount: number | null | undefined): number {
-  const n = Number(workerCount ?? 0);
-  if (!Number.isFinite(n) || n <= 0) return 0;
-  if (n <= 5) return 5;
-  if (n <= 10) return 10;
-  if (n <= 20) return 15;
-  return 20;
-}
-
-function calcWeatherRisk(slot: WeatherSlot | null): { score: number; notes: string[] } {
-  if (!slot) return { score: 0, notes: ["気象データなし"] };
-
-  let score = 0;
-  const notes: string[] = [];
-
-  const p = slot.precipitation_mm == null ? 0 : Number(slot.precipitation_mm);
-  if (p >= 6) {
-    score += 30;
-    notes.push(`降水 ${p}mm（高）`);
-  } else if (p >= 3) {
-    score += 20;
-    notes.push(`降水 ${p}mm（中）`);
-  } else if (p >= 1) {
-    score += 10;
-    notes.push(`降水 ${p}mm（小）`);
-  } else {
-    notes.push(`降水 ${p}mm`);
-  }
-
-  const ws = slot.wind_speed_ms == null ? 0 : Number(slot.wind_speed_ms);
-  if (ws >= 10) {
-    score += 20;
-    notes.push(`風速 ${ws}m/s（強）`);
-  } else if (ws >= 5) {
-    score += 10;
-    notes.push(`風速 ${ws}m/s（やや強）`);
-  } else {
-    notes.push(`風速 ${ws}m/s`);
-  }
-
-  const wt = s(slot.weather_text);
-  if (/(雨|雷|強風|暴風|大雨|霧)/.test(wt)) {
-    score += 10;
-    notes.push(`天気「${wt}」`);
-  } else if (wt) {
-    notes.push(`天気「${wt}」`);
-  }
-
-  return { score: clamp100(score), notes };
-}
-
-function calcKeywordRisk(text: string): { score: number; hits: string[] } {
-  const t = s(text);
-  const rules: Array<{ re: RegExp; add: number; label: string }> = [
-    { re: /(バックホウ|ユンボ|重機|クレーン|玉掛|吊)/, add: 10, label: "重機/吊り" },
-    { re: /(法面|斜面|のり面|高所|転落)/, add: 10, label: "法面/高所" },
-    { re: /(掘削|床掘|開削|崩壊|土砂)/, add: 10, label: "掘削/崩壊" },
-    { re: /(車両|搬入|運搬|交通|誘導)/, add: 8, label: "車両/交通" },
-    { re: /(第三者|墓参者|通行人)/, add: 8, label: "第三者" },
-  ];
-
-  let score = 0;
-  const hits: string[] = [];
-  for (const r of rules) {
-    if (r.re.test(t)) {
-      score += r.add;
-      hits.push(r.label);
-    }
-  }
-  return { score: clamp100(score), hits };
-}
-
-function pseudoPhotoScore(slopeNowUrl: string, pathNowUrl: string): { I: number; engine: string } {
-  // DB保存しない前提の擬似値
-  const hasSlope = !!s(slopeNowUrl).trim();
-  const hasPath = !!s(pathNowUrl).trim();
-  if (hasSlope && hasPath) return { I: 0.85, engine: "pseudo-v1" };
-  if (hasSlope || hasPath) return { I: 0.65, engine: "pseudo-v1" };
-  return { I: 0.0, engine: "pseudo-v1" };
-}
-
-function aiTextRichnessScore(aiHazards: string, aiCounter: string, aiThird: string): { score: number; notes: string[] } {
-  // 文章量/箇条書き数を雑にスコア化（0-25）
-  const notes: string[] = [];
-  const countBullets = (x: string) => s(x).split("\n").map((l) => l.trim()).filter(Boolean).length;
-
-  const hN = countBullets(aiHazards);
-  const cN = countBullets(aiCounter);
-  const tN = countBullets(aiThird);
-
-  let score = 0;
-  if (hN >= 5) score += 10;
-  else if (hN >= 3) score += 7;
-  else if (hN >= 1) score += 4;
-
-  if (cN >= 5) score += 10;
-  else if (cN >= 3) score += 7;
-  else if (cN >= 1) score += 4;
-
-  if (tN >= 2) score += 5;
-  else if (tN >= 1) score += 3;
-
-  notes.push(`危険予知 ${hN}項目`, `対策 ${cN}項目`, `第三者 ${tN}項目`);
-  return { score: clamp100(score), notes };
-}
-
-/** 表示整形：危険予知＝「〜だから〜が起こる（恐れ）」っぽく見せる（断定しない） */
+/** 表示整形：危険予知＝断定しない（恐れ/可能性） */
 function formatHazardsForView(text: string): string[] {
   const lines = s(text)
     .replace(/\r\n/g, "\n")
@@ -351,14 +250,10 @@ function formatHazardsForView(text: string): string[] {
     const raw = line.replace(/^[•・\-*]\s*/, "").trim();
     if (!raw) continue;
 
-    // 既に「だから」「ため」「ので」などがあればそのまま
     if (/(だから|ため|ので|から)/.test(raw)) {
-      // 語尾が弱い場合だけ「恐れ」注記
       out.push(raw.endsWith("。") ? raw : `${raw}（事故につながる恐れ）`);
       continue;
     }
-
-    // 1文だけの場合：断定せず恐れ注記で補強
     out.push(`${raw}（事故につながる恐れ）`);
   }
   return out;
@@ -409,6 +304,11 @@ export default function KyReviewClient() {
   const [unreadList, setUnreadList] = useState<string[]>([]);
   const [unreadMode, setUnreadMode] = useState<"person" | "company" | "none">("none");
   const [unreadErr, setUnreadErr] = useState<string>("");
+
+  // ✅ リスク評価（API）
+  const [risk, setRisk] = useState<RiskOut | null>(null);
+  const [riskLoading, setRiskLoading] = useState(false);
+  const [riskErr, setRiskErr] = useState("");
 
   // ✅ 表示用：既読者を未読から除外（表記ゆれ対策）
   const unreadFiltered = useMemo(() => {
@@ -654,6 +554,60 @@ export default function KyReviewClient() {
     return weatherSlots.length ? weatherSlots[0] : null;
   }, [weatherSlots]);
 
+  // ✅ リスク評価をAPIで計算（レビューだけ表示／DB変更なし）
+  const loadRisk = useCallback(async () => {
+    if (!ky) return;
+
+    setRiskErr("");
+    setRiskLoading(true);
+    try {
+      const payload = {
+        human: {
+          work_detail: ky.work_detail ?? null,
+          hazards: ky.hazards ?? null,
+          countermeasures: ky.countermeasures ?? null,
+          third_party_level: ky.third_party_level ?? null,
+          worker_count: ky.worker_count ?? null,
+        },
+        ai: {
+          ai_hazards: ky.ai_hazards ?? null,
+          ai_countermeasures: ky.ai_countermeasures ?? null,
+          ai_third_party: ky.ai_third_party ?? null,
+        },
+        weather_applied: appliedWeather
+          ? {
+              hour: appliedWeather.hour,
+              weather_text: appliedWeather.weather_text,
+              temperature_c: appliedWeather.temperature_c ?? null,
+              wind_direction_deg: appliedWeather.wind_direction_deg ?? null,
+              wind_speed_ms: appliedWeather.wind_speed_ms ?? null,
+              precipitation_mm: appliedWeather.precipitation_mm ?? null,
+            }
+          : null,
+        photos: {
+          slope_now_url: slopeNowUrl || null,
+          slope_prev_url: slopePrevUrl || null,
+          path_now_url: pathNowUrl || null,
+          path_prev_url: pathPrevUrl || null,
+        },
+      };
+
+      const j = await postJsonTry(["/api/ky-risk-score"], payload);
+      setRisk(j as RiskOut);
+    } catch (e: any) {
+      setRisk(null);
+      setRiskErr(e?.message ?? "リスク評価の計算に失敗しました");
+    } finally {
+      setRiskLoading(false);
+    }
+  }, [ky, appliedWeather, slopeNowUrl, slopePrevUrl, pathNowUrl, pathPrevUrl]);
+
+  useEffect(() => {
+    // ky読込後・写真URL確定後に計算
+    if (!ky) return;
+    loadRisk();
+  }, [ky, slopeNowUrl, slopePrevUrl, pathNowUrl, pathPrevUrl, appliedWeather, loadRisk]);
+
   const onPrint = useCallback(() => {
     window.print();
   }, []);
@@ -763,12 +717,15 @@ export default function KyReviewClient() {
       if (error) throw error;
 
       setStatus({ type: "success", text: "AI補足を再生成して保存しました。" });
+
+      // ✅ AI再生成後はリスクも再計算
+      await loadRisk();
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "AI補足の再生成に失敗しました" });
     } finally {
       setAiGenerating(false);
     }
-  }, [ky, weatherSlots, slopeNowUrl, slopePrevUrl, pathNowUrl, pathPrevUrl]);
+  }, [ky, weatherSlots, slopeNowUrl, slopePrevUrl, pathNowUrl, pathPrevUrl, loadRisk]);
 
   const publicUrl = useMemo(() => {
     const token = s(ky?.public_token).trim();
@@ -826,56 +783,12 @@ export default function KyReviewClient() {
     }
   }, [publicUrl]);
 
-  /** ============ リスク評価（比較＋内訳） ============ */
-  const risk = useMemo(() => {
-    const third = calcThirdRisk(ky?.third_party_level || "");
-    const worker = calcWorkerRisk(ky?.worker_count ?? null);
-
-    const w0 = calcWeatherRisk(appliedWeather);
-    const kw = calcKeywordRisk(`${s(ky?.work_detail)}\n${s(ky?.hazards)}\n${s(ky?.countermeasures)}`);
-
-    // 人の入力：ベース + 作業員 + 第三者 + 気象 + キーワード
-    const rHuman = clamp100(10 + worker + third + w0.score + kw.score);
-
-    // 写真（擬似I）
-    const photo = pseudoPhotoScore(slopeNowUrl, pathNowUrl);
-    const rPhoto = clamp100(clamp01(photo.I) * 100);
-
-    // AI補足の情報量（表示専用の雑スコア）
-    const rich = aiTextRichnessScore(s(ky?.ai_hazards), s(ky?.ai_countermeasures), s(ky?.ai_third_party));
-    const rAiText = clamp100(rich.score); // 0-25想定だが100にしても問題ない
-
-    // AIデータ：気象・第三者・写真・AI補足量を合成（表示専用）
-    const rAi = clamp100(0.35 * w0.score + 0.25 * third + 0.25 * rPhoto + 0.15 * rAiText);
-
-    const delta = clamp100(rAi - rHuman);
-
-    return {
-      rHuman,
-      rAi,
-      delta: rAi - rHuman,
-      components: {
-        r_weather: w0.score,
-        weather_notes: w0.notes,
-        r_third: third,
-        r_worker: worker,
-        r_keyword: kw.score,
-        keyword_hits: kw.hits,
-        I: photo.I,
-        r_photo: rPhoto,
-        photo_engine: photo.engine,
-        r_ai_text: rAiText,
-        ai_text_notes: rich.notes,
-      },
-    };
-  }, [ky, appliedWeather, slopeNowUrl, pathNowUrl]);
-
   const riskBadge = useMemo(() => {
-    const v = risk.rAi;
+    const v = risk?.total_ai ?? 0;
     if (v >= 70) return { label: "高", cls: "bg-rose-100 text-rose-800 border-rose-200" };
     if (v >= 40) return { label: "中", cls: "bg-amber-100 text-amber-800 border-amber-200" };
     return { label: "低", cls: "bg-emerald-100 text-emerald-800 border-emerald-200" };
-  }, [risk.rAi]);
+  }, [risk?.total_ai]);
 
   const hazardsView = useMemo(() => formatHazardsForView(s(ky?.ai_hazards)), [ky?.ai_hazards]);
   const measuresView = useMemo(() => formatMeasuresForView(s(ky?.ai_countermeasures)), [ky?.ai_countermeasures]);
@@ -918,70 +831,135 @@ export default function KyReviewClient() {
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
         <div className="flex items-center justify-between gap-2">
           <div className="text-sm font-semibold text-slate-800">リスク評価（比較＋内訳）</div>
-          <div className={`text-xs px-2 py-1 rounded-full border ${riskBadge.cls}`}>AI総合：{risk.rAi}（{riskBadge.label}）</div>
-        </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-            <div className="text-xs text-slate-600 mb-1">R_human（人の入力）</div>
-            <div className="text-2xl font-bold text-slate-900">{risk.rHuman}</div>
-            <div className="text-xs text-slate-600 mt-1">作業員/第三者/気象/キーワード</div>
-          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={loadRisk}
+              disabled={riskLoading}
+              className={`rounded-lg border px-3 py-2 text-sm no-print ${
+                riskLoading ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
+              }`}
+            >
+              {riskLoading ? "計算中..." : "再計算"}
+            </button>
 
-          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-            <div className="text-xs text-slate-600 mb-1">R_ai（AIデータ）</div>
-            <div className="text-2xl font-bold text-slate-900">{risk.rAi}</div>
-            <div className="text-xs text-slate-600 mt-1">写真/第三者/気象/AI補足</div>
-          </div>
-
-          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-            <div className="text-xs text-slate-600 mb-1">Δ（AI − 人）</div>
-            <div className="text-2xl font-bold text-slate-900">{risk.delta >= 0 ? `+${risk.delta}` : `${risk.delta}`}</div>
-            <div className="text-xs text-slate-600 mt-1">{risk.delta >= 10 ? "AIが厳しめ" : risk.delta <= -10 ? "人が厳しめ" : "同程度"}</div>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <div className="rounded-lg border border-slate-200 bg-white p-3">
-            <div className="text-xs text-slate-600 mb-1">R_photo（写真）</div>
-            <div className="flex items-end gap-2">
-              <div className="text-xl font-bold text-slate-900">{risk.components.r_photo}</div>
-              <div className="text-xs text-slate-600">I={risk.components.I.toFixed(2)} / engine:{risk.components.photo_engine}</div>
+            <div className={`text-xs px-2 py-1 rounded-full border ${riskBadge.cls}`}>
+              {riskLoading ? "AI総合：計算中" : risk ? `AI総合：${risk.total_ai}（${riskBadge.label}）` : "AI総合：—"}
             </div>
-            <div className="text-xs text-slate-500 mt-2">※ 現在は擬似スコア（pseudo）</div>
           </div>
+        </div>
 
-          <div className="rounded-lg border border-slate-200 bg-white p-3">
-            <div className="text-xs text-slate-600 mb-1">R_third（第三者）</div>
-            <div className="text-xl font-bold text-slate-900">{risk.components.r_third}</div>
-            <div className="text-xs text-slate-600 mt-1">状況：{s(ky?.third_party_level).trim() || "（未入力）"}</div>
-          </div>
+        {riskErr ? <div className="text-xs text-rose-700">{riskErr}</div> : null}
 
-          <div className="rounded-lg border border-slate-200 bg-white p-3">
-            <div className="text-xs text-slate-600 mb-1">R_weather（気象：適用枠）</div>
-            <div className="text-xl font-bold text-slate-900">{risk.components.r_weather}</div>
-            <div className="text-xs text-slate-600 mt-1">
-              適用：{appliedWeather ? `${appliedWeather.hour}時` : "—"}
+        {!risk ? (
+          <div className="text-sm text-slate-600">{riskLoading ? "リスク評価を計算しています..." : "（リスク評価は未計算です）"}</div>
+        ) : (
+          <>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <div className="text-xs text-slate-600 mb-1">R_human（人の入力）</div>
+                <div className="text-2xl font-bold text-slate-900">{risk.total_human}</div>
+                <div className="text-xs text-slate-600 mt-1">作業員/第三者/気象/キーワード/文章不足</div>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <div className="text-xs text-slate-600 mb-1">R_ai（AIデータ）</div>
+                <div className="text-2xl font-bold text-slate-900">{risk.total_ai}</div>
+                <div className="text-xs text-slate-600 mt-1">写真/第三者/気象/AI補足（厳しめ係数あり）</div>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <div className="text-xs text-slate-600 mb-1">Δ（AI − 人）</div>
+                <div className="text-2xl font-bold text-slate-900">{risk.delta >= 0 ? `+${risk.delta}` : `${risk.delta}`}</div>
+                <div className="text-xs text-slate-600 mt-1">{risk.delta >= 10 ? "AIが厳しめ" : risk.delta <= -10 ? "人が厳しめ" : "同程度"}</div>
+              </div>
             </div>
-            <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
-              {risk.components.weather_notes.map((x, i) => (
-                <li key={`${x}-${i}`}>{x}</li>
-              ))}
-            </ul>
-          </div>
-        </div>
 
-        <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-          <div className="text-xs text-slate-600 mb-2">参考：人側内訳</div>
-          <div className="text-xs text-slate-700 flex flex-wrap gap-3">
-            <span>作業員：{risk.components.r_worker}</span>
-            <span>キーワード：{risk.components.r_keyword}{risk.components.keyword_hits.length ? `（${risk.components.keyword_hits.join(" / ")}）` : ""}</span>
-          </div>
-        </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-xs text-slate-600 mb-1">写真（内訳）</div>
+                <div className="text-xl font-bold text-slate-900">{risk.breakdown.photo.score}</div>
+                <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
+                  {risk.breakdown.photo.reasons.map((x, i) => (
+                    <li key={`ph-${i}`}>{x}</li>
+                  ))}
+                </ul>
+              </div>
 
-        <div className="text-xs text-slate-500">
-          ※ 係数は運用しながら調整できます。気象は「適用枠＝保存先頭」を使用。写真Iは現状pseudoです（DB保存なし）。
-        </div>
+              <div className="rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-xs text-slate-600 mb-1">第三者（内訳）</div>
+                <div className="text-xl font-bold text-slate-900">{risk.breakdown.third_party.score}</div>
+                <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
+                  {risk.breakdown.third_party.reasons.map((x, i) => (
+                    <li key={`th-${i}`}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-xs text-slate-600 mb-1">気象（適用枠の内訳）</div>
+                <div className="text-xl font-bold text-slate-900">{risk.breakdown.weather.score}</div>
+                <div className="text-xs text-slate-600 mt-1">適用：{appliedWeather ? `${appliedWeather.hour}時` : "—"}</div>
+                <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
+                  {risk.breakdown.weather.reasons.map((x, i) => (
+                    <li key={`we-${i}`}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <div className="text-xs text-slate-600 mb-1">作業員数（内訳）</div>
+                <div className="text-xl font-bold text-slate-900">{risk.breakdown.workers.score}</div>
+                <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
+                  {risk.breakdown.workers.reasons.map((x, i) => (
+                    <li key={`wk-${i}`}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <div className="text-xs text-slate-600 mb-1">人入力：キーワード加点</div>
+                <div className="text-xl font-bold text-slate-900">{risk.breakdown.keyword.score}</div>
+                <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
+                  {risk.breakdown.keyword.reasons.map((x, i) => (
+                    <li key={`kw-${i}`}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <div className="text-xs text-slate-600 mb-1">文章評価（不足＝加点）</div>
+                <div className="text-xs text-slate-700 mt-1">人：{risk.breakdown.text_quality_human.score} / AI：{risk.breakdown.text_quality_ai.score}</div>
+                <div className="mt-2 grid grid-cols-1 gap-2">
+                  <div className="rounded border border-slate-200 bg-white p-2">
+                    <div className="text-xs font-semibold text-slate-700">人入力</div>
+                    <ul className="mt-1 text-xs text-slate-600 list-disc pl-5 space-y-1">
+                      {risk.breakdown.text_quality_human.reasons.slice(0, 4).map((x, i) => (
+                        <li key={`tqh-${i}`}>{x}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div className="rounded border border-slate-200 bg-white p-2">
+                    <div className="text-xs font-semibold text-slate-700">AI補足</div>
+                    <ul className="mt-1 text-xs text-slate-600 list-disc pl-5 space-y-1">
+                      {risk.breakdown.text_quality_ai.reasons.slice(0, 5).map((x, i) => (
+                        <li key={`tqa-${i}`}>{x}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="text-xs text-slate-500">
+              ※ 0〜100は「危険度」ではなく「見逃し防止のための厳しめリスク指数」。写真/気象/第三者/作業員数を根拠付きで加点。<br />
+              ※ 厳しめ係数：×{risk.meta.bias_multiplier}（見逃し防止バイアス）
+            </div>
+          </>
+        )}
       </div>
 
       {publicUrl ? (
@@ -1135,9 +1113,7 @@ export default function KyReviewClient() {
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
         <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
-          {ky?.worker_count != null ? `${ky.worker_count} 人` : "（未入力）"}
-        </div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.worker_count != null ? `${ky.worker_count} 人` : "（未入力）"}</div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
