@@ -13,26 +13,22 @@ type WeatherSlot = {
 };
 
 type Body = {
-  // 人入力（あるものだけでOK）
   human?: {
     work_detail?: string | null;
     hazards?: string | null;
     countermeasures?: string | null;
-    third_party_level?: string | null; // "多い" | "少ない" | etc
+    third_party_level?: string | null;
     worker_count?: number | null;
   } | null;
 
-  // AI補足（あるものだけでOK）
   ai?: {
     ai_hazards?: string | null;
     ai_countermeasures?: string | null;
     ai_third_party?: string | null;
   } | null;
 
-  // 適用枠（レビュー側で先頭＝適用枠を渡す）
   weather_applied?: WeatherSlot | null;
 
-  // 写真URL（今/前回）
   photos?: {
     slope_now_url?: string | null;
     slope_prev_url?: string | null;
@@ -43,6 +39,13 @@ type Body = {
 
 type BreakdownItem = { score: number; reasons: string[] };
 
+type SummaryItem = {
+  key: "weather" | "photo" | "third_party" | "workers" | "text_quality_ai";
+  label: string;
+  score: number;
+  reason: string; // 1行だけ（要点）
+};
+
 type RiskOut = {
   total_human: number; // 0-100
   total_ai: number; // 0-100
@@ -52,14 +55,15 @@ type RiskOut = {
     photo: BreakdownItem;
     third_party: BreakdownItem;
     workers: BreakdownItem;
-    keyword: BreakdownItem; // 人入力側（簡易）
-    text_quality_human: BreakdownItem; // 因果/項目数ペナルティ
-    text_quality_ai: BreakdownItem; // 因果/項目数ペナルティ（＋厳しめ加点）
+    keyword: BreakdownItem;
+    text_quality_human: BreakdownItem;
+    text_quality_ai: BreakdownItem;
   };
+  ai_top5: SummaryItem[]; // ✅ 追加：人の入力以外（AI側）上位5の要点
   meta: {
     base_human: number;
     base_ai: number;
-    bias_multiplier: number; // 厳しめ係数（最後に掛ける）
+    bias_multiplier: number;
     computed_at: string;
   };
 };
@@ -123,7 +127,6 @@ function calcWeather(applied: WeatherSlot | null | undefined): BreakdownItem {
   const ws = n(applied.wind_speed_ms) ?? 0;
   const tc = n(applied.temperature_c);
 
-  // 降雨（法面/通路で効きやすい）
   if (pr >= 6) {
     score += 30;
     reasons.push(`降雨：${pr}mm（大）→ 滑り/視界低下/法面不安定化の恐れ`);
@@ -137,7 +140,6 @@ function calcWeather(applied: WeatherSlot | null | undefined): BreakdownItem {
     reasons.push(`降雨：${pr}mm`);
   }
 
-  // 風（飛散・転倒・吊荷）
   if (ws >= 10) {
     score += 20;
     reasons.push(`風速：${ws}m/s（強）→ 飛散/転倒/吊荷リスク増の恐れ`);
@@ -151,7 +153,6 @@ function calcWeather(applied: WeatherSlot | null | undefined): BreakdownItem {
     reasons.push(`風速：${ws}m/s`);
   }
 
-  // 気温（熱中症/低体温・凍結は季節で効く）
   if (tc != null) {
     if (tc >= 30) {
       score += 8;
@@ -189,7 +190,6 @@ function calcPhoto(photos: Body["photos"]): BreakdownItem {
   const reasons: string[] = [];
   let score = 0;
 
-  // 「差分がある」= 変化の可能性 → 加点（見逃し防止の思想）
   if (slopeNow && slopePrev) {
     if (slopeNow !== slopePrev) {
       score += 18;
@@ -255,7 +255,6 @@ function calcKeywordHuman(text: string): BreakdownItem {
 }
 
 function countCausalLines(lines: string[]): number {
-  // 因果表現の成立っぽい行をカウント（厳密じゃなくてOK）
   const causalRe = /(だから|ので|ため|したので|して.*(なる|なり|となる|事故|災害|負傷)|恐れ|可能性)/;
   let c = 0;
   for (const ln of lines) if (causalRe.test(ln)) c++;
@@ -269,7 +268,6 @@ function calcTextQualityHuman(haz: string, measures: string, third: string): Bre
 
   const causal = countCausalLines(hz);
 
-  // 人入力は「不足＝見落としの恐れ」で加点
   let score = 0;
   const reasons: string[] = [];
 
@@ -312,23 +310,17 @@ function calcTextQualityAi(aiHaz: string, aiMeasures: string, aiThird: string): 
 
   const causal = countCausalLines(hz);
 
-  // 設計思想：
-  // - 「危険抽出ができている」ほど、見逃しにくい＝AI評価は“厳しめ”に出やすい
-  // - 不足があるほど「リスク加点」
   let score = 0;
   const reasons: string[] = [];
 
-  // 危険抽出（多いほど“厳しめ”に加点）
   const hazardExtraction = Math.min(30, hz.length * 2 + causal * 1);
   score += hazardExtraction;
   reasons.push(`AI補足：危険抽出 ${hz.length}項目 / 因果らしき表現 ${causal}行 → 抽出加点 ${hazardExtraction}`);
 
-  // 不足ペナルティ（仕様：8〜12項目＆対策1対1＆第三者4以上）
   if (hz.length < 8) {
     score += 14;
     reasons.push("AI補足：危険予知が8項目未満 → 不足加点（見落としの恐れ）");
   } else if (hz.length > 12) {
-    // 多すぎも運用上は読み落としの恐れ
     score += 6;
     reasons.push("AI補足：危険予知が12項目超 → 読み落としの恐れ（整理推奨）");
   }
@@ -347,13 +339,53 @@ function calcTextQualityAi(aiHaz: string, aiMeasures: string, aiThird: string): 
     reasons.push(`AI補足：第三者対策 ${th.length}項目`);
   }
 
-  // 因果の成立が弱いと加点（文書の安全性）
   if (causal < Math.min(hz.length, 6)) {
     score += 8;
     reasons.push("AI補足：因果/恐れ表現が薄い可能性 → 加点（表現補強推奨）");
   }
 
   return { score: clamp100(score), reasons };
+}
+
+function buildAiTop5(breakdown: RiskOut["breakdown"]): SummaryItem[] {
+  // ✅ 人の入力以外に絞る（AI側で効く要因）
+  const items: SummaryItem[] = [
+    {
+      key: "weather",
+      label: "気象（適用枠）",
+      score: breakdown.weather.score,
+      reason: breakdown.weather.reasons[0] || "気象リスク",
+    },
+    {
+      key: "photo",
+      label: "写真（差分/不足）",
+      score: breakdown.photo.score,
+      reason: breakdown.photo.reasons[0] || "写真リスク",
+    },
+    {
+      key: "third_party",
+      label: "第三者",
+      score: breakdown.third_party.score,
+      reason: breakdown.third_party.reasons[0] || "第三者リスク",
+    },
+    {
+      key: "workers",
+      label: "作業員数",
+      score: breakdown.workers.score,
+      reason: breakdown.workers.reasons[0] || "作業員数リスク",
+    },
+    {
+      key: "text_quality_ai",
+      label: "AI補足（文章評価）",
+      score: breakdown.text_quality_ai.score,
+      reason: breakdown.text_quality_ai.reasons[0] || "AI補足リスク",
+    },
+  ];
+
+  // 0点を後ろへ、同点は順序維持
+  const sorted = [...items].sort((a, b) => b.score - a.score);
+
+  return sorted.slice(0, 5);
 }
 
 export async function POST(req: Request) {
@@ -379,13 +411,9 @@ export async function POST(req: Request) {
     const baseHuman = 12;
     const baseAi = 18;
 
-    // 人入力：ベース + 作業員 + 第三者 + 気象 + キーワード + 文章不足（ペナルティ）
     const rawHuman = baseHuman + workers.score + third.score + weather.score + keyword.score + tqHuman.score;
-
-    // AI：ベース + 作業員 + 第三者 + 気象 + 写真 + AI文章（抽出加点＋不足加点）
     const rawAi = baseAi + workers.score + third.score + weather.score + photo.score + tqAi.score;
 
-    // 厳しめ係数（最後に掛ける：見逃し防止）
     const biasMultiplier = 1.08;
 
     const totalHuman = clamp100(rawHuman * 1.0);
@@ -404,6 +432,7 @@ export async function POST(req: Request) {
         text_quality_human: tqHuman,
         text_quality_ai: tqAi,
       },
+      ai_top5: [] as SummaryItem[],
       meta: {
         base_human: baseHuman,
         base_ai: baseAi,
@@ -411,6 +440,8 @@ export async function POST(req: Request) {
         computed_at: new Date().toISOString(),
       },
     };
+
+    out.ai_top5 = buildAiTop5(out.breakdown);
 
     return NextResponse.json(out);
   } catch (e: any) {
