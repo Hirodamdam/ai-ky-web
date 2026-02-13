@@ -16,7 +16,6 @@ function s(v: any) {
   return v == null ? "" : String(v);
 }
 
-// ✅ 型ガード（string|unknown を string に確定させる）
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.trim().length > 0;
 }
@@ -28,15 +27,14 @@ function getBaseUrl(req: Request) {
   return host ? `${proto}://${host}` : "";
 }
 
-// ✅ 管理者（全通知受信）宛先を環境変数から取得
-// 例: LINE_ADMIN_RECIPIENT_IDS="Uxxxx,Cyyyy"
-function parseAdminRecipientsFromEnv(): string[] {
-  const raw = (process.env.LINE_ADMIN_RECIPIENT_IDS || "").trim();
-  if (!raw) return [];
-  return raw
-    .split(",")
-    .map((x) => x.trim())
-    .filter(isNonEmptyString);
+// 協力会社キー（空白除去）
+function partnerKeyOf(name: string) {
+  return s(name).replace(/[ 　\t]/g, "").trim();
+}
+
+function looksLikeMissingColumnError(msg: string, col: string) {
+  const m = s(msg);
+  return m.includes(col) && (m.includes("does not exist") || m.includes("column") || m.includes("schema cache"));
 }
 
 export async function POST(req: Request) {
@@ -63,10 +61,7 @@ export async function POST(req: Request) {
       );
     }
     if (!projectId || !kyId || !accessToken) {
-      return NextResponse.json(
-        { error: "Missing body: projectId / kyId / accessToken" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Missing body: projectId / kyId / accessToken" }, { status: 400 });
     }
 
     // 1) ログインユーザー確認（accessTokenで認証）
@@ -150,11 +145,13 @@ export async function POST(req: Request) {
     const publicUrl = `${baseUrl}${publicPath}`;
 
     // 3) ★承認成功後にLINE通知（失敗しても承認は成功扱い）
+    //    ルール：
+    //    - 協力会社は完全分岐（ここでは協力会社宛先のみ渡す）
+    //    - 所長（あなた）宛は push-ky 側で LINE_ADMIN_RECIPIENT_IDS を常に追加して全件受信
     let lineOk: boolean | null = null;
     let lineError: string | null = null;
 
-    // ✅ 宛先（協力会社 + 管理者）
-    let line_to_list: string[] = [];
+    let partnerTo: string | null = null;
 
     try {
       const pushSecret = (process.env.LINE_PUSH_SECRET || "").trim();
@@ -162,31 +159,46 @@ export async function POST(req: Request) {
         lineOk = null;
         lineError = "LINE_PUSH_SECRET missing (skip)";
       } else {
-        // ✅ 管理者（全通知受信）
-        const adminTos = parseAdminRecipientsFromEnv();
-
-        // ✅ 協力会社宛先（DBから取得：表記ゆれ対策で key で検索）
-        let partnerTo: string | null = null;
-
+        // ✅ 協力会社宛先（DBから取得）
         if (partnerName) {
-          const partnerKey = partnerName.replace(/\s+/g, ""); // 全角/半角スペース等を除去
+          const key = partnerKeyOf(partnerName);
 
-          const { data: tgt, error: tgtErr } = await adminClient
+          // まず partner_company_key で試す（存在しない環境はフォールバック）
+          let tgt: any = null;
+
+          const q1 = await adminClient
             .from("partner_line_targets")
             .select("line_to, notify_enabled")
             .eq("project_id", projectId)
-            .eq("partner_company_key", partnerKey)
+            .eq("partner_company_key", key)
             .maybeSingle();
 
-          if (tgtErr) {
-            console.warn("[ky-approve] partner_line_targets fetch error:", tgtErr.message);
-          } else if (tgt?.notify_enabled && tgt?.line_to) {
+          if (q1.error) {
+            // partner_company_key 列が無い/違う場合などは name でフォールバック
+            if (looksLikeMissingColumnError(q1.error.message, "partner_company_key")) {
+              const q2 = await adminClient
+                .from("partner_line_targets")
+                .select("line_to, notify_enabled")
+                .eq("project_id", projectId)
+                .eq("partner_company_name", partnerName)
+                .maybeSingle();
+
+              if (q2.error) {
+                console.warn("[ky-approve] partner_line_targets fetch error (fallback):", q2.error.message);
+              } else {
+                tgt = q2.data;
+              }
+            } else {
+              console.warn("[ky-approve] partner_line_targets fetch error:", q1.error.message);
+            }
+          } else {
+            tgt = q1.data;
+          }
+
+          if (tgt?.notify_enabled && tgt?.line_to) {
             partnerTo = s(tgt.line_to).trim() || null;
           }
         }
-
-        // ✅ 宛先合成（重複排除）
-        line_to_list = Array.from(new Set([partnerTo, ...adminTos].filter(isNonEmptyString)));
 
         const titleParts: string[] = [];
         if (projectName) titleParts.push(projectName);
@@ -205,7 +217,9 @@ export async function POST(req: Request) {
           body: JSON.stringify({
             title,
             url: publicUrl,
-            to: line_to_list.length ? line_to_list : undefined, // 0件ならpush-ky側がbroadcastへ（互換）
+            // ✅ 協力会社は完全分岐：ここでは協力会社宛先のみ渡す
+            // ✅ 所長（あなた）は push-ky 側で env から必ず追加される
+            to: partnerTo && isNonEmptyString(partnerTo) ? partnerTo : undefined,
           }),
         });
 
@@ -226,7 +240,11 @@ export async function POST(req: Request) {
       public_url: publicUrl,
       public_enabled: true,
       partner_company_name: partnerName || null,
-      line_to: line_to_list.length ? line_to_list : null,
+
+      // ✅ 協力会社宛（完全分岐の結果）
+      partner_line_to: partnerTo,
+
+      // ✅ push-ky の結果
       line_ok: lineOk,
       line_error: lineError,
     });
