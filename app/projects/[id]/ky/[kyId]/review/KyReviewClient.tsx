@@ -2,7 +2,7 @@
 "use client";
 
 import Link from "next/link";
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { supabase } from "@/app/lib/supabaseClient";
 import QRCode from "qrcode";
@@ -20,21 +20,33 @@ type WeatherSlot = {
   weather_code?: number | null;
 };
 
-type KyEntryRow = {
+type Project = {
   id: string;
-  project_id: string | null;
+  name: string | null;
+  contractor_name: string | null;
+  address: string | null;
+
+  lat?: number | null;
+  lon?: number | null;
+
+  slope_camera_snapshot_url?: string | null;
+  path_camera_snapshot_url?: string | null;
+};
+
+type KyEntry = {
+  id: string;
+  project_id: string;
 
   work_date: string | null;
-
-  work_detail: string | null;
-  hazards: string | null;
-  countermeasures: string | null;
-
-  third_party_level?: string | null;
+  title?: string | null;
 
   partner_company_name: string | null;
-
   worker_count?: number | null;
+
+  work_detail: string | null;
+  hazards?: string | null;
+  countermeasures?: string | null;
+  third_party_level?: string | null;
 
   weather_slots?: WeatherSlot[] | null;
 
@@ -45,43 +57,44 @@ type KyEntryRow = {
   ai_supplement?: string | null;
 
   is_approved?: boolean | null;
-
   approved_at?: string | null;
   approved_by?: string | null;
 
-  public_id?: string | null;
-  public_token?: string | null;
-  public_enabled?: boolean | null;
-  public_enabled_at?: string | null;
+  // リスク評価（DBに列があれば拾う / APIが返せば拾う）
+  risk_total?: number | null;
+  risk_level?: string | null;
+  risk_breakdown?: any | null;
+  risk_details?: any | null;
 
-  created_at?: string | null;
+  weather_risk?: number | null;
+  photo_risk?: number | null;
+  third_party_risk?: number | null;
+
+  // 写真スコア（あれば拾う）
+  slope_photo_score?: number | null;
+  path_photo_score?: number | null;
 };
 
-type ProjectRow = {
-  id: string;
-  name: string | null;
-  contractor_name: string | null;
-};
-
-type ReadLog = {
-  id: string;
-  reader_name: string | null;
-  reader_role: string | null;
-  reader_device: string | null;
-  created_at: string | null;
+type KyPhotoRow = {
+  id?: string;
+  project_id?: string;
+  ky_id?: string;
+  ky_entry_id?: string;
+  created_at?: string;
+  photo_kind?: string | null;
+  kind?: string | null;
+  type?: string | null;
+  category?: string | null;
+  image_url?: string | null;
+  photo_url?: string | null;
+  url?: string | null;
+  photo_path?: string | null;
+  path?: string | null;
 };
 
 function s(v: any) {
   if (v == null) return "";
   return String(v);
-}
-
-function normalizeName(v: any): string {
-  return s(v).replace(/[ 　\t]/g, "").trim();
-}
-
-function normEntrantNoLoose(v: any): string {
-  return s(v).trim().toUpperCase();
 }
 
 function fmtDateJp(iso: string): string {
@@ -90,21 +103,41 @@ function fmtDateJp(iso: string): string {
   return `${m[1]}年${Number(m[2])}月${Number(m[3])}日`;
 }
 
-function fmtDateTimeJp(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString("ja-JP");
-}
-
 function degToDirJp(deg: number | null | undefined): string {
-  if (deg === null || deg === undefined || Number.isNaN(Number(deg))) return "—";
+  if (deg === null || deg === undefined || Number.isNaN(Number(deg))) return "";
   const d = ((Number(deg) % 360) + 360) % 360;
   const dirs = ["北", "北東", "東", "南東", "南", "南西", "西", "北西"];
   const idx = Math.round(d / 45) % 8;
   return dirs[idx];
 }
 
-// ky_photos の列名差を吸収
+function slotSummary(slot: WeatherSlot | null | undefined): string {
+  if (!slot) return "";
+  const w = slot.weather_text || "（不明）";
+  const t = slot.temperature_c == null ? "—" : `${slot.temperature_c}℃`;
+  const wd = degToDirJp(slot.wind_direction_deg) || "—";
+  const ws = slot.wind_speed_ms == null ? "—" : `${slot.wind_speed_ms}m/s`;
+  const p = slot.precipitation_mm == null ? "—" : `${slot.precipitation_mm}mm`;
+  return `${w} / 気温${t} / 風${wd} ${ws} / 降水${p}`;
+}
+
+function normalizeText(text: string): string {
+  return (text || "").replace(/\r\n/g, "\n").replace(/\u3000/g, " ").trim();
+}
+
+// 表示側：箇条書きっぽい整形（AIが雑でも読めるように）
+function toBullets(text: string): string[] {
+  const t = normalizeText(text);
+  if (!t) return [];
+  const lines = t
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .map((x) => x.replace(/^[-*・•]\s*/, ""));
+  // 1行しかない場合でも配列化
+  return lines.length ? lines : [t];
+}
+
 function pickKind(row: any): string {
   return s(row?.photo_kind).trim() || s(row?.kind).trim() || s(row?.type).trim() || s(row?.category).trim() || "";
 }
@@ -118,826 +151,372 @@ function pickUrl(row: any): string {
     ""
   );
 }
-function canonicalKind(kindRaw: string): "slope" | "path" | "" {
-  const k = s(kindRaw).trim();
-  if (!k) return "";
-  if (k === "slope" || k === "slope_photo" || k === "法面") return "slope";
-  if (k === "path" || k === "path_photo" || k === "通路") return "path";
-  if (k.includes("slope") || k.includes("法面")) return "slope";
-  if (k.includes("path") || k.includes("通路")) return "path";
-  return "";
+
+function Badge({ children }: { children: React.ReactNode }) {
+  return <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-xs text-slate-700">{children}</span>;
 }
 
-function safeParseJson(text: string | null | undefined): any | null {
-  const t = s(text).trim();
-  if (!t) return null;
-  try {
-    return JSON.parse(t);
-  } catch {
-    return null;
-  }
+function ScorePill({ label, value }: { label: string; value: number | null | undefined }) {
+  const v = value == null || Number.isNaN(Number(value)) ? null : Number(value);
+  return (
+    <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2">
+      <div className="text-xs text-slate-600">{label}</div>
+      <div className="text-sm font-semibold text-slate-900">{v == null ? "—" : v}</div>
+    </div>
+  );
 }
-
-function pickAiFromSupplement(obj: any): { work: string; hazards: string; measures: string; third: string } {
-  const get = (keys: string[]) => {
-    for (const k of keys) {
-      const v = obj?.[k];
-      if (v != null && String(v).trim() !== "") return String(v);
-    }
-    return "";
-  };
-
-  return {
-    work: get(["work_detail", "workDetail", "ai_work_detail"]),
-    hazards: get(["hazards", "hazard", "ai_hazards"]),
-    measures: get(["countermeasures", "measures", "counterMeasures", "ai_countermeasures"]),
-    third: get(["third_party", "thirdParty", "ai_third_party"]),
-  };
-}
-
-function splitAiHeadedText(text: string): { work: string; hazards: string; counter: string; third: string } {
-  const src = s(text).replace(/\r\n/g, "\n").trim();
-  if (!src) return { work: "", hazards: "", counter: "", third: "" };
-
-  const normalizeLabel = (x: string) => x.replace(/[｜|]/g, "|");
-  const src2 = normalizeLabel(src);
-
-  const marks: Array<{ idx: number; key: "work" | "hazards" | "counter" | "third"; len: number }> = [];
-  const patterns: Array<{ key: "work" | "hazards" | "counter" | "third"; re: RegExp }> = [
-    { key: "work", re: /(?:^|\n)\s*[【\[]\s*AI補足\s*[｜|]\s*作業内容\s*[】\]]\s*/g },
-    { key: "hazards", re: /(?:^|\n)\s*[【\[]\s*AI補足\s*[｜|]\s*危険予知\s*[】\]]\s*/g },
-    { key: "counter", re: /(?:^|\n)\s*[【\[]\s*AI補足\s*[｜|]\s*対策\s*[】\]]\s*/g },
-    { key: "third", re: /(?:^|\n)\s*[【\[]\s*AI補足\s*[｜|]\s*第三者\s*[】\]]\s*/g },
-  ];
-
-  for (const p of patterns) {
-    let m: RegExpExecArray | null;
-    p.re.lastIndex = 0;
-    while ((m = p.re.exec(src2))) {
-      marks.push({ idx: m.index, key: p.key, len: m[0].length });
-    }
-  }
-  marks.sort((a, b) => a.idx - b.idx);
-
-  if (!marks.length) return { work: src, hazards: "", counter: "", third: "" };
-
-  const out = { work: "", hazards: "", counter: "", third: "" };
-  for (let i = 0; i < marks.length; i++) {
-    const cur = marks[i];
-    const next = marks[i + 1];
-    const start = cur.idx + cur.len;
-    const end = next ? next.idx : src2.length;
-    const chunk = src2.slice(start, end).trim();
-    if (!chunk) continue;
-    (out as any)[cur.key] = (out as any)[cur.key] ? `${(out as any)[cur.key]}\n${chunk}` : chunk;
-  }
-  return out;
-}
-
-async function postJsonTry(urls: string[], body: any): Promise<any> {
-  let lastErr: any = null;
-  for (const url of urls) {
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify(body),
-      });
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(j?.error || j?.message || `HTTP ${res.status}`);
-      return j;
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr ?? new Error("API呼び出しに失敗しました");
-}
-
-/** =========================
- *  AI補足：表示整形（要望対応）
- *  - 危険予知：右側（→以降）だけ採用
- *  - 「事故につながる恐れ」系の注記は削除
- *  - 最大5件
- *  - 対策：番号除去、複合行は分割、最大5件
- *  - 第三者：番号なしのまま
- * ========================= */
-
-function normalizeLineBase(raw: string): string {
-  return raw
-    .replace(/^[•・\-*]\s*/, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function stripGenericAccidentNote(x: string): string {
-  // 「（事故につながる恐れ）」等を削除（当たり前なので）
-  return x
-    .replace(/（\s*事故につながる恐れ\s*）/g, "")
-    .replace(/（\s*事故に繋がる恐れ\s*）/g, "")
-    .replace(/（\s*事故につながる可能性\s*）/g, "")
-    .replace(/（\s*事故に繋がる可能性\s*）/g, "")
-    .trim();
-}
-
-function takeRightOfArrow(line: string): string {
-  // 「〜 → 〜」の右側のみ採用（最初の文面は人入力と重複しがちなので捨てる）
-  const t = line;
-  const seps = ["→", "⇒", "->", "＞", "〉"];
-  for (const sep of seps) {
-    const idx = t.indexOf(sep);
-    if (idx >= 0) {
-      const right = t.slice(idx + sep.length).trim();
-      if (right) return right;
-    }
-  }
-  return t.trim();
-}
-
-function dedupeKeepOrder(arr: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const x of arr) {
-    const k = x.trim();
-    if (!k) continue;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(k);
-  }
-  return out;
-}
-
-function formatHazardsForView5(text: string): string[] {
-  const lines = s(text)
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-  const picked: string[] = [];
-
-  for (const l0 of lines) {
-    const base = normalizeLineBase(l0);
-    if (!base) continue;
-
-    // 右側だけ（重複しやすい前置きを捨てる）
-    let v = takeRightOfArrow(base);
-
-    // 「〜になる恐れ」「事故につながる恐れ」注記の除去
-    v = stripGenericAccidentNote(v);
-
-    // 末尾に付くことが多いので再除去
-    v = v.replace(/（\s*[^）]*恐れ\s*）\s*$/g, (m) => {
-      // 「事故につながる恐れ」系は消す。それ以外の恐れ注記は残してもよいが、
-      // 今回は「事故につながる〜」が主なのでそれだけ消す。
-      if (/事故/.test(m)) return "";
-      return m;
-    }).trim();
-
-    // まだ長すぎる／ただの見出しっぽい行は弾く
-    if (/^危険予知/i.test(v) || /^対策/i.test(v) || /^AI補足/i.test(v)) continue;
-
-    if (v) picked.push(v);
-  }
-
-  return dedupeKeepOrder(picked).slice(0, 5);
-}
-
-function splitMeasuresLine(line: string): string[] {
-  // 例）"[1] xxx、[2] yyy、[3] zzz" を分割して番号なしに
-  const t = line.trim();
-
-  // まず先頭の番号は落とす
-  const noLead = t.replace(/^\s*\[\s*\d+\s*\]\s*/g, "").replace(/^\s*\d+[)\.]\s*/g, "").trim();
-
-  // 行内に [n] が複数ある場合はそれを区切りとして分割
-  const hasMulti = /\[\s*\d+\s*\]/.test(noLead);
-  if (!hasMulti) return [noLead];
-
-  const parts = noLead
-    .split(/\[\s*\d+\s*\]/g)
-    .map((x) => x.replace(/^[、,\s]+/, "").trim())
-    .filter(Boolean);
-
-  return parts.length ? parts : [noLead];
-}
-
-function formatMeasuresForView5(text: string): string[] {
-  const lines = s(text)
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-  const items: string[] = [];
-  for (const l0 of lines) {
-    const base0 = normalizeLineBase(l0);
-    if (!base0) continue;
-
-    // 行を分割（番号は消す）
-    const parts = splitMeasuresLine(base0);
-
-    for (let p of parts) {
-      p = normalizeLineBase(p);
-      if (!p) continue;
-
-      // 「→」がある場合、人入力と重複しやすい左側は捨てて右側だけ
-      p = takeRightOfArrow(p);
-
-      // 見出し除去
-      if (/^対策/i.test(p) || /^AI補足/i.test(p)) continue;
-
-      if (p) items.push(p);
-    }
-  }
-
-  return dedupeKeepOrder(items).slice(0, 5);
-}
-
-function formatThirdForView(text: string): string[] {
-  // 第三者は番号なしでOK：そのまま箇条書き化（上限は付けない／必要なら後で）
-  return s(text)
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean)
-    .map((x) => x.replace(/^[•・\-*]\s*/, "").trim())
-    .filter(Boolean);
-}
-
-/** ============ リスク評価（API計算：0-100） ============ */
-
-type SummaryItem = {
-  key: "weather" | "photo" | "third_party" | "workers" | "text_quality_ai";
-  label: string;
-  score: number;
-  reason: string;
-};
-
-type BreakdownItem = { score: number; reasons: string[] };
-
-type RiskOut = {
-  total_human: number;
-  total_ai: number;
-  delta: number;
-  breakdown: {
-    weather: BreakdownItem;
-    photo: BreakdownItem;
-    third_party: BreakdownItem;
-    workers: BreakdownItem;
-    keyword: BreakdownItem;
-    text_quality_human: BreakdownItem;
-    text_quality_ai: BreakdownItem;
-  };
-  ai_top5: SummaryItem[];
-  meta?: any;
-};
 
 export default function KyReviewClient() {
-  const params = useParams() as { id?: string; kyId?: string };
+  const params = useParams<{ id: string; kyId: string }>();
   const router = useRouter();
 
-  const projectId = useMemo(() => String(params?.id ?? ""), [params?.id]);
-  const kyId = useMemo(() => String(params?.kyId ?? ""), [params?.kyId]);
+  const projectId = useMemo(() => String((params as any)?.id ?? ""), [params]);
+  const kyId = useMemo(() => String((params as any)?.kyId ?? ""), [params]);
+
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const [status, setStatus] = useState<Status>({ type: null, text: "" });
   const [loading, setLoading] = useState(true);
 
-  const [project, setProject] = useState<ProjectRow | null>(null);
-  const [ky, setKy] = useState<KyEntryRow | null>(null);
+  const [project, setProject] = useState<Project | null>(null);
+  const [ky, setKy] = useState<KyEntry | null>(null);
 
+  // 写真（今回／前回）
   const [slopeNowUrl, setSlopeNowUrl] = useState<string>("");
-  const [slopePrevUrl, setSlopePrevUrl] = useState<string>("");
   const [pathNowUrl, setPathNowUrl] = useState<string>("");
+  const [slopePrevUrl, setSlopePrevUrl] = useState<string>("");
   const [pathPrevUrl, setPathPrevUrl] = useState<string>("");
 
-  const [acting, setActing] = useState(false);
-  const [aiGenerating, setAiGenerating] = useState(false);
-
+  // 公開リンク（QR）
+  const [publicToken, setPublicToken] = useState<string>("");
   const [qrDataUrl, setQrDataUrl] = useState<string>("");
-  const [qrOpen, setQrOpen] = useState(false);
 
-  // ✅ 既読一覧
-  const [readLoading, setReadLoading] = useState(false);
-  const [readLogs, setReadLogs] = useState<ReadLog[]>([]);
-  const [readErr, setReadErr] = useState<string>("");
-
-  // ✅ 未読（入場登録ベース）
-  const [unreadLoading, setUnreadLoading] = useState(false);
-  const [unreadList, setUnreadList] = useState<string[]>([]);
-  const [unreadMode, setUnreadMode] = useState<"person" | "company" | "none">("none");
-  const [unreadErr, setUnreadErr] = useState<string>("");
-
-  // ✅ リスク（API）
-  const [risk, setRisk] = useState<RiskOut | null>(null);
+  // リスク評価（API結果を優先で格納）
+  const [risk, setRisk] = useState<any | null>(null);
   const [riskLoading, setRiskLoading] = useState(false);
-  const [riskErr, setRiskErr] = useState("");
 
-  // ✅ 表示用：既読者を未読から除外（表記ゆれ対策）
-  const unreadFiltered = useMemo(() => {
-    const readNameSet = new Set(readLogs.map((r) => normalizeName(r.reader_name)));
-    const readNoSet = new Set(
-      readLogs
-        .map((r) => normalizeName(r.reader_name))
-        .filter(Boolean)
-        .map((x) => {
-          const m = x.match(/^No:([0-9A-Za-z_-]{1,32})$/i);
-          if (!m) return "";
-          return `No:${normEntrantNoLoose(m[1])}`;
-        })
-        .filter(Boolean)
-    );
+  const slopeUrlFromProject = useMemo(() => s(project?.slope_camera_snapshot_url).trim(), [project?.slope_camera_snapshot_url]);
+  const pathUrlFromProject = useMemo(() => s(project?.path_camera_snapshot_url).trim(), [project?.path_camera_snapshot_url]);
 
-    return (unreadList || []).filter((name) => {
-      const n = normalizeName(name);
-      if (!n) return false;
+  const workDateJp = useMemo(() => (ky?.work_date ? fmtDateJp(ky.work_date) : ""), [ky?.work_date]);
 
-      if (readNameSet.has(n)) return false;
+  const weatherSlotsSorted = useMemo(() => {
+    const slots = Array.isArray(ky?.weather_slots) ? (ky!.weather_slots as WeatherSlot[]) : [];
+    // 保存仕様：先頭が「適用枠」。表示は 9/12/15 の並びにしたいのでソート
+    return [...slots].filter(Boolean).sort((a, b) => a.hour - b.hour);
+  }, [ky]);
 
-      const m = n.match(/^No:([0-9A-Za-z_-]{1,32})$/i);
-      if (m) {
-        const key = `No:${normEntrantNoLoose(m[1])}`;
-        if (readNoSet.has(key)) return false;
+  const appliedWeatherSlot = useMemo(() => {
+    const slots = Array.isArray(ky?.weather_slots) ? (ky!.weather_slots as WeatherSlot[]) : [];
+    const first = slots?.[0];
+    if (first && (first.hour === 9 || first.hour === 12 || first.hour === 15)) return first;
+    // フォールバック：9→12→15 の先頭
+    return weatherSlotsSorted[0] ?? null;
+  }, [ky, weatherSlotsSorted]);
+
+  const titleForList = useMemo(() => {
+    const t = normalizeText(s(ky?.title));
+    if (t) return t;
+    const wd = normalizeText(s(ky?.work_detail));
+    return wd ? wd.split("\n")[0].slice(0, 60) : "KYレビュー";
+  }, [ky?.title, ky?.work_detail]);
+
+  const fetchPublicToken = useCallback(async () => {
+    // ky_public_links 等の設計差を吸収：APIがあればそちら優先、無ければDBから探す
+    try {
+      // 1) APIがある場合
+      const res = await fetch("/api/ky-public-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ projectId, kyId }),
+      });
+      if (res.ok) {
+        const j = await res.json().catch(() => ({}));
+        const token = s(j?.token).trim();
+        if (token) return token;
+      }
+    } catch {
+      // ignore
+    }
+
+    // 2) DBから（存在するなら）
+    try {
+      const { data, error } = await (supabase as any)
+        .from("ky_public_links")
+        .select("token")
+        .eq("project_id", projectId)
+        .eq("ky_id", kyId)
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (!error && Array.isArray(data) && data[0]?.token) return s(data[0].token).trim();
+    } catch {
+      // ignore
+    }
+
+    return "";
+  }, [projectId, kyId]);
+
+  const buildQr = useCallback(async (token: string) => {
+    if (!token) {
+      setQrDataUrl("");
+      return;
+    }
+    const origin =
+      typeof window !== "undefined" && window.location?.origin ? window.location.origin : "";
+    const url = `${origin}/ky/public/${token}`;
+    const dataUrl = await QRCode.toDataURL(url, { margin: 1, scale: 6 });
+    setQrDataUrl(dataUrl);
+  }, []);
+
+  const fetchPhotosNowPrev = useCallback(
+    async (workDateIso: string | null) => {
+      // 「今回」：このKYに紐づく最新（なければプロジェクト定点URL）
+      // 「前回」：同プロジェクトの別KYのky_photosから、直近の1件を拾う（work_dateが取れればそれより前を優先）
+      try {
+        const { data: nowPhotos, error: nowErr } = await (supabase as any)
+          .from("ky_photos")
+          .select("*")
+          .eq("project_id", projectId)
+          .eq("ky_id", kyId)
+          .order("created_at", { ascending: false })
+          .limit(50);
+
+        let slopeNow = "";
+        let pathNow = "";
+        if (!nowErr && Array.isArray(nowPhotos)) {
+          for (const p of nowPhotos as KyPhotoRow[]) {
+            const kind = pickKind(p);
+            const url = pickUrl(p);
+            if (!url) continue;
+            if (!slopeNow && (kind === "slope" || kind === "法面" || kind === "slope_photo" || kind === "")) slopeNow = url;
+            if (!pathNow && (kind === "path" || kind === "通路" || kind === "path_photo" || kind === "")) pathNow = url;
+            if (slopeNow && pathNow) break;
+          }
+        }
+
+        if (!slopeNow) slopeNow = slopeUrlFromProject || "";
+        if (!pathNow) pathNow = pathUrlFromProject || "";
+
+        // 「前回」候補：同プロジェクトで ky_id != 現KY の最新写真
+        const { data: prevPhotos, error: prevErr } = await (supabase as any)
+          .from("ky_photos")
+          .select("*")
+          .eq("project_id", projectId)
+          .neq("ky_id", kyId)
+          .order("created_at", { ascending: false })
+          .limit(80);
+
+        let slopePrev = "";
+        let pathPrev = "";
+        if (!prevErr && Array.isArray(prevPhotos)) {
+          for (const p of prevPhotos as KyPhotoRow[]) {
+            const kind = pickKind(p);
+            const url = pickUrl(p);
+            if (!url) continue;
+            if (!slopePrev && (kind === "slope" || kind === "法面" || kind === "slope_photo" || kind === "")) slopePrev = url;
+            if (!pathPrev && (kind === "path" || kind === "通路" || kind === "path_photo" || kind === "")) pathPrev = url;
+            if (slopePrev && pathPrev) break;
+          }
+        }
+
+        if (mountedRef.current) {
+          setSlopeNowUrl(slopeNow);
+          setPathNowUrl(pathNow);
+          setSlopePrevUrl(slopePrev);
+          setPathPrevUrl(pathPrev);
+        }
+      } catch {
+        if (mountedRef.current) {
+          setSlopeNowUrl(slopeUrlFromProject || "");
+          setPathNowUrl(pathUrlFromProject || "");
+          setSlopePrevUrl("");
+          setPathPrevUrl("");
+        }
+      }
+    },
+    [projectId, kyId, slopeUrlFromProject, pathUrlFromProject]
+  );
+
+  const fetchRisk = useCallback(
+    async (kyRow: KyEntry | null, force = false) => {
+      if (!kyRow) return;
+
+      // 1) 既に API/DB で埋まってるならそれを採用（force=false のとき）
+      const embedded =
+        kyRow.risk_breakdown ?? kyRow.risk_details ?? null;
+
+      if (!force && (kyRow.risk_total != null || embedded != null || kyRow.weather_risk != null || kyRow.photo_risk != null || kyRow.third_party_risk != null)) {
+        setRisk({
+          total: kyRow.risk_total ?? null,
+          level: kyRow.risk_level ?? null,
+          breakdown: embedded ?? null,
+          weather: kyRow.weather_risk ?? null,
+          photo: kyRow.photo_risk ?? null,
+          third_party: kyRow.third_party_risk ?? null,
+        });
+        return;
       }
 
-      return true;
-    });
-  }, [unreadList, readLogs]);
+      // 2) APIがあれば取得（無ければ未計算扱い）
+      setRiskLoading(true);
+      try {
+        const res = await fetch("/api/ky-risk-evaluate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          cache: "no-store",
+          body: JSON.stringify({ projectId, kyId }),
+        });
 
-  const statusClass = useMemo(() => {
-    if (status.type === "success") return "border border-emerald-200 bg-emerald-50 text-emerald-800";
-    if (status.type === "error") return "border border-rose-200 bg-rose-50 text-rose-800";
-    return "border border-slate-200 bg-slate-50 text-slate-700";
-  }, [status.type]);
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          throw new Error(j?.error || "リスク評価の取得に失敗しました（未実装の可能性）");
+        }
 
-  const latestReadAt = useMemo(() => {
-    const t = readLogs?.[0]?.created_at;
-    return t ? fmtDateTimeJp(t) : "";
-  }, [readLogs]);
+        const j = await res.json().catch(() => ({}));
+        setRisk(j ?? null);
+      } catch (e: any) {
+        // ここは「未計算」のままにしたいので、エラーはステータスにだけ出す
+        setRisk(null);
+        setStatus({ type: "error", text: e?.message ?? "リスク評価の取得に失敗しました" });
+      } finally {
+        setRiskLoading(false);
+      }
+    },
+    [projectId, kyId]
+  );
 
-  const loadReadLogs = useCallback(async () => {
-    setReadErr("");
-    setReadLoading(true);
-    try {
-      const { data } = await supabase.auth.getSession();
-      const accessToken = data?.session?.access_token;
-      if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
-
-      const j = await postJsonTry(["/api/ky-read-list"], { projectId, kyId, accessToken });
-      const arr = Array.isArray(j?.logs) ? (j.logs as ReadLog[]) : [];
-      setReadLogs(arr);
-    } catch (e: any) {
-      setReadErr(e?.message ?? "既読一覧の取得に失敗しました");
-      setReadLogs([]);
-    } finally {
-      setReadLoading(false);
-    }
-  }, [projectId, kyId]);
-
-  const loadUnread = useCallback(async () => {
-    setUnreadErr("");
-    setUnreadLoading(true);
-    try {
-      const { data } = await supabase.auth.getSession();
-      const accessToken = data?.session?.access_token;
-      if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
-
-      const j = await postJsonTry(["/api/ky-unread-list"], { projectId, kyId, accessToken });
-
-      const mode = s(j?.mode).trim();
-      if (mode === "person" || mode === "company" || mode === "none") setUnreadMode(mode);
-      else setUnreadMode("none");
-
-      const arr = Array.isArray(j?.unread) ? (j.unread as string[]) : [];
-      setUnreadList(arr.map((x) => s(x).trim()).filter(Boolean));
-    } catch (e: any) {
-      setUnreadErr(e?.message ?? "未読一覧の取得に失敗しました");
-      setUnreadList([]);
-      setUnreadMode("none");
-    } finally {
-      setUnreadLoading(false);
-    }
-  }, [projectId, kyId]);
-
-  const load = useCallback(async () => {
+  const fetchInitial = useCallback(async () => {
     if (!projectId || !kyId) return;
 
     setLoading(true);
     setStatus({ type: null, text: "" });
 
     try {
-      const { data: kyRow, error: kyErr } = await supabase
+      const { data: proj, error: projErr } = await (supabase as any)
+        .from("projects")
+        .select("id,name,contractor_name,address,lat,lon,slope_camera_snapshot_url,path_camera_snapshot_url")
+        .eq("id", projectId)
+        .maybeSingle();
+      if (projErr) throw projErr;
+
+      const { data: kyRow, error: kyErr } = await (supabase as any)
         .from("ky_entries")
+        // 存在差があっても壊れにくいよう、必要最低限＋オプションをまとめて指定
         .select(
-          [
-            "id",
-            "project_id",
-            "work_date",
-            "work_detail",
-            "hazards",
-            "countermeasures",
-            "third_party_level",
-            "partner_company_name",
-            "worker_count",
-            "weather_slots",
-            "ai_work_detail",
-            "ai_hazards",
-            "ai_countermeasures",
-            "ai_third_party",
-            "ai_supplement",
-            "is_approved",
-            "approved_at",
-            "approved_by",
-            "public_id",
-            "public_token",
-            "public_enabled",
-            "public_enabled_at",
-            "created_at",
-          ].join(",")
+          "id,project_id,work_date,title,partner_company_name,worker_count,work_detail,hazards,countermeasures,third_party_level,weather_slots,ai_work_detail,ai_hazards,ai_countermeasures,ai_third_party,ai_supplement,is_approved,approved_at,approved_by,risk_total,risk_level,risk_breakdown,risk_details,weather_risk,photo_risk,third_party_risk,slope_photo_score,path_photo_score"
         )
         .eq("id", kyId)
         .maybeSingle();
-
       if (kyErr) throw kyErr;
+      if (!kyRow) throw new Error("KYが見つかりません");
 
-      const kyData: KyEntryRow | null = (kyRow as any) ?? null;
-      if (kyData) {
-        const sup = safeParseJson(kyData.ai_supplement);
-        if (sup) {
-          const parsed = pickAiFromSupplement(sup);
-          if (!s(kyData.ai_work_detail).trim() && parsed.work) kyData.ai_work_detail = parsed.work;
-          if (!s(kyData.ai_hazards).trim() && parsed.hazards) kyData.ai_hazards = parsed.hazards;
-          if (!s(kyData.ai_countermeasures).trim() && parsed.measures) kyData.ai_countermeasures = parsed.measures;
-          if (!s(kyData.ai_third_party).trim() && parsed.third) kyData.ai_third_party = parsed.third;
-        } else {
-          const parts = splitAiHeadedText(kyData.ai_supplement || "");
-          if (!s(kyData.ai_work_detail).trim() && parts.work) kyData.ai_work_detail = parts.work;
-          if (!s(kyData.ai_hazards).trim() && parts.hazards) kyData.ai_hazards = parts.hazards;
-          if (!s(kyData.ai_countermeasures).trim() && parts.counter) kyData.ai_countermeasures = parts.counter;
-          if (!s(kyData.ai_third_party).trim() && parts.third) kyData.ai_third_party = parts.third;
-        }
-      }
-      setKy(kyData);
+      if (!mountedRef.current) return;
 
-      const projectTargetId = kyData?.project_id || projectId;
-      const { data: pRow, error: pErr } = await supabase.from("projects").select("id,name,contractor_name").eq("id", projectTargetId).maybeSingle();
-      if (pErr) throw pErr;
-      setProject((pRow as any) ?? null);
+      setProject((proj as any) ?? null);
+      setKy((kyRow as any) ?? null);
 
-      const photoProjectId = kyData?.project_id || projectId;
-      const { data: photos, error: phErr } = await supabase
-        .from("ky_photos")
-        .select("*")
-        .eq("project_id", photoProjectId)
-        .order("created_at", { ascending: false })
-        .limit(200);
+      // 写真
+      await fetchPhotosNowPrev(s(kyRow.work_date) || null);
 
-      if (phErr) throw phErr;
+      // 公開リンク token
+      const token = await fetchPublicToken();
+      setPublicToken(token);
+      await buildQr(token);
 
-      let slopeNow = "";
-      let slopePrev = "";
-      let pathNow = "";
-      let pathPrev = "";
-
-      const curKyKey = s(kyId).trim();
-
-      if (Array.isArray(photos)) {
-        for (const row of photos as any[]) {
-          const url = pickUrl(row);
-          if (!url) continue;
-
-          const k = canonicalKind(pickKind(row));
-          if (!k) continue;
-
-          const rowKy = s(row?.ky_id).trim() || s(row?.ky_entry_id).trim();
-          const isCurrent = rowKy === curKyKey;
-
-          if (k === "slope") {
-            if (!slopeNow && isCurrent) {
-              slopeNow = url;
-              continue;
-            }
-            if (!slopePrev && !isCurrent) {
-              slopePrev = url;
-              continue;
-            }
-          }
-
-          if (k === "path") {
-            if (!pathNow && isCurrent) {
-              pathNow = url;
-              continue;
-            }
-            if (!pathPrev && !isCurrent) {
-              pathPrev = url;
-              continue;
-            }
-          }
-
-          if (slopeNow && slopePrev && pathNow && pathPrev) break;
-        }
-      }
-
-      setSlopeNowUrl(slopeNow);
-      setSlopePrevUrl(slopePrev);
-      setPathNowUrl(pathNow);
-      setPathPrevUrl(pathPrev);
-
-      if (kyData?.is_approved) {
-        await loadReadLogs();
-        await loadUnread();
-      } else {
-        setReadLogs([]);
-        setReadErr("");
-        setUnreadList([]);
-        setUnreadErr("");
-        setUnreadMode("none");
-      }
+      // リスク評価
+      await fetchRisk(kyRow as any, false);
     } catch (e: any) {
-      setStatus({ type: "error", text: e?.message ?? "読み込みに失敗しました" });
+      if (mountedRef.current) setStatus({ type: "error", text: e?.message ?? "読み込みに失敗しました" });
     } finally {
-      setLoading(false);
+      if (mountedRef.current) setLoading(false);
     }
-  }, [projectId, kyId, loadReadLogs, loadUnread]);
+  }, [projectId, kyId, fetchPhotosNowPrev, fetchPublicToken, buildQr, fetchRisk]);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    fetchInitial();
+  }, [fetchInitial]);
 
-  const weatherSlots = useMemo(() => {
-    const raw = ky?.weather_slots ?? null;
-    const arr = Array.isArray(raw) ? (raw as WeatherSlot[]) : [];
-    const filtered = arr.filter((x) => x && (x.hour === 9 || x.hour === 12 || x.hour === 15));
-    // ✅ 保存時に「適用枠を先頭」にしているので、ここでは順序を崩さない
-    return filtered;
-  }, [ky?.weather_slots]);
-
-  // ✅ 適用枠（保存順の先頭）
-  const appliedWeather = useMemo(() => {
-    return weatherSlots.length ? weatherSlots[0] : null;
-  }, [weatherSlots]);
-
-  const onPrint = useCallback(() => {
-    window.print();
-  }, []);
-
-  const onApprove = useCallback(async () => {
+  const onApproveToggle = useCallback(async () => {
     setStatus({ type: null, text: "" });
-    setActing(true);
+
     try {
-      const { data } = await supabase.auth.getSession();
-      const accessToken = data?.session?.access_token;
-      if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
+      const {
+        data: { session },
+        error: sessErr,
+      } = await supabase.auth.getSession();
+      if (sessErr) throw sessErr;
+      const accessToken = session?.access_token || "";
+      if (!accessToken) throw new Error("ログイン情報が取得できません（再ログインしてください）");
 
-      const j = await postJsonTry(["/api/ky-approve"], { projectId, kyId, accessToken });
+      const action = ky?.is_approved ? "unapprove" : "approve";
 
-      let token = s(j?.public_token || j?.token || j?.publicToken).trim();
-      if (!token) {
-        const { data: row, error } = await supabase.from("ky_entries").select("public_token").eq("id", kyId).maybeSingle();
-        if (error) throw error;
-        token = s((row as any)?.public_token).trim();
-      }
-      if (!token) throw new Error("公開トークンが取得できませんでした（public_tokenが空です）。");
+      const res = await fetch("/api/ky-approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ projectId, kyId, accessToken, action }),
+      });
 
-      const origin = typeof window !== "undefined" ? window.location.origin : "";
-      const url = `${origin}/ky/public/${token}`;
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j?.error || "承認処理に失敗しました");
 
-      const msg = `KY承認しました\n${project?.name ? `工事：${project.name}\n` : ""}${url}`;
-      const lineUrl = `https://line.me/R/msg/text/?${encodeURIComponent(msg)}`;
+      setStatus({ type: "success", text: action === "approve" ? "承認しました" : "承認を取り消しました" });
 
-      setStatus({ type: "success", text: "承認しました（LINEを開きます）" });
-      await load();
-      window.location.href = lineUrl;
+      // 再読込
+      await fetchInitial();
+      router.refresh();
     } catch (e: any) {
-      setStatus({ type: "error", text: e?.message ?? "承認に失敗しました" });
-    } finally {
-      setActing(false);
+      setStatus({ type: "error", text: e?.message ?? "承認処理に失敗しました" });
     }
-  }, [projectId, kyId, load, project?.name]);
+  }, [projectId, kyId, ky?.is_approved, fetchInitial, router]);
 
-  const onUnapprove = useCallback(async () => {
-    setStatus({ type: null, text: "" });
-    setActing(true);
-    try {
-      const { data } = await supabase.auth.getSession();
-      const accessToken = data?.session?.access_token;
-      if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
-
-      await postJsonTry(["/api/ky-unapprove", "/api/ky-approve"], { projectId, kyId, accessToken, action: "unapprove" });
-
-      setStatus({ type: "success", text: "承認解除しました（公開停止）" });
-      await load();
-    } catch (e: any) {
-      setStatus({ type: "error", text: e?.message ?? "承認解除に失敗しました" });
-    } finally {
-      setActing(false);
-    }
-  }, [projectId, kyId, load]);
-
-  const onRegenerateAi = useCallback(async () => {
+  const onRecalcRisk = useCallback(async () => {
     if (!ky) return;
+    setStatus({ type: null, text: "リスク評価を再計算中..." });
+    await fetchRisk(ky, true);
+    setStatus({ type: "success", text: "リスク評価を更新しました（取得できた場合のみ反映）" });
+  }, [ky, fetchRisk]);
 
-    if (ky.is_approved) {
-      setStatus({ type: "error", text: "承認済みのため、AI補足の再生成はできません。" });
-      return;
-    }
+  const aiWorkLines = useMemo(() => toBullets(ky?.ai_work_detail || ""), [ky?.ai_work_detail]);
+  const aiHazardLines = useMemo(() => toBullets(ky?.ai_hazards || ""), [ky?.ai_hazards]);
+  const aiCounterLines = useMemo(() => toBullets(ky?.ai_countermeasures || ""), [ky?.ai_countermeasures]);
+  const aiThirdLines = useMemo(() => toBullets(ky?.ai_third_party || ""), [ky?.ai_third_party]);
 
-    setStatus({ type: null, text: "" });
-    setAiGenerating(true);
+  const riskTotal = useMemo(() => {
+    const v = risk?.total ?? risk?.risk_total ?? risk?.score_total ?? ky?.risk_total ?? null;
+    return v == null || Number.isNaN(Number(v)) ? null : Number(v);
+  }, [risk, ky?.risk_total]);
 
-    try {
-      const payload = {
-        work_detail: ky.work_detail,
-        hazards: ky.hazards,
-        countermeasures: ky.countermeasures,
-        third_party_level: ky.third_party_level,
-        weather_slots: weatherSlots,
-        slope_photo_url: slopeNowUrl || null,
-        slope_prev_photo_url: slopePrevUrl || null,
-        path_photo_url: pathNowUrl || null,
-        path_prev_photo_url: pathPrevUrl || null,
-        worker_count: ky.worker_count ?? null,
-      };
+  const riskLevel = useMemo(() => {
+    return s(risk?.level ?? risk?.risk_level ?? ky?.risk_level).trim() || "";
+  }, [risk, ky?.risk_level]);
 
-      const data = await postJsonTry(["/api/ky-ai-supplement"], payload);
+  const riskBreakdownObj = useMemo(() => {
+    return risk?.breakdown ?? risk?.details ?? risk?.risk_breakdown ?? ky?.risk_breakdown ?? ky?.risk_details ?? null;
+  }, [risk, ky]);
 
-      const next: KyEntryRow = {
-        ...ky,
-        ai_work_detail: s(data?.ai_work_detail).trim(),
-        ai_hazards: s(data?.ai_hazards).trim(),
-        ai_countermeasures: s(data?.ai_countermeasures).trim(),
-        ai_third_party: s(data?.ai_third_party).trim(),
-        ai_supplement: s(data?.ai_supplement).trim() || ky.ai_supplement || null,
-      };
+  const weatherRisk = useMemo(() => {
+    const v = risk?.weather ?? risk?.weather_risk ?? ky?.weather_risk ?? null;
+    return v == null || Number.isNaN(Number(v)) ? null : Number(v);
+  }, [risk, ky?.weather_risk]);
 
-      setKy(next);
+  const photoRisk = useMemo(() => {
+    const v = risk?.photo ?? risk?.photo_risk ?? ky?.photo_risk ?? null;
+    return v == null || Number.isNaN(Number(v)) ? null : Number(v);
+  }, [risk, ky?.photo_risk]);
 
-      const { error } = await supabase
-        .from("ky_entries")
-        .update({
-          ai_work_detail: next.ai_work_detail || null,
-          ai_hazards: next.ai_hazards || null,
-          ai_countermeasures: next.ai_countermeasures || null,
-          ai_third_party: next.ai_third_party || null,
-          ai_supplement: next.ai_supplement || null,
-        })
-        .eq("id", ky.id);
-
-      if (error) throw error;
-
-      setStatus({ type: "success", text: "AI補足を再生成して保存しました。" });
-    } catch (e: any) {
-      setStatus({ type: "error", text: e?.message ?? "AI補足の再生成に失敗しました" });
-    } finally {
-      setAiGenerating(false);
-    }
-  }, [ky, weatherSlots, slopeNowUrl, slopePrevUrl, pathNowUrl, pathPrevUrl]);
-
-  const publicUrl = useMemo(() => {
-    const token = s(ky?.public_token).trim();
-    const approved = !!ky?.is_approved;
-    if (!approved || !token) return "";
-    const origin = typeof window !== "undefined" ? window.location.origin : "";
-    if (!origin) return "";
-    return `${origin}/ky/public/${token}`;
-  }, [ky?.public_token, ky?.is_approved]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const run = async () => {
-      if (!publicUrl) {
-        setQrDataUrl("");
-        return;
-      }
-      try {
-        const dataUrl = await QRCode.toDataURL(publicUrl, {
-          errorCorrectionLevel: "M",
-          margin: 2,
-          width: 320,
-        });
-        if (!cancelled) setQrDataUrl(dataUrl);
-      } catch {
-        if (!cancelled) setQrDataUrl("");
-      }
-    };
-    run();
-    return () => {
-      cancelled = true;
-    };
-  }, [publicUrl]);
-
-  const onCopyPublicUrl = useCallback(async () => {
-    const url = publicUrl;
-    if (!url) return;
-
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(url);
-      } else {
-        const ta = document.createElement("textarea");
-        ta.value = url;
-        ta.style.position = "fixed";
-        ta.style.left = "-9999px";
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        document.body.removeChild(ta);
-      }
-      setStatus({ type: "success", text: "公開リンクをコピーしました" });
-    } catch (e: any) {
-      setStatus({ type: "error", text: e?.message ?? "コピーに失敗しました" });
-    }
-  }, [publicUrl]);
-
-  /** ============ リスク（API呼び出し） ============ */
-  const loadRisk = useCallback(async () => {
-    setRiskErr("");
-    if (!ky) {
-      setRisk(null);
-      return;
-    }
-
-    setRiskLoading(true);
-    try {
-      const payload = {
-        human: {
-          work_detail: ky.work_detail ?? null,
-          hazards: ky.hazards ?? null,
-          countermeasures: ky.countermeasures ?? null,
-          third_party_level: ky.third_party_level ?? null,
-          worker_count: ky.worker_count ?? null,
-        },
-        ai: {
-          ai_hazards: ky.ai_hazards ?? null,
-          ai_countermeasures: ky.ai_countermeasures ?? null,
-          ai_third_party: ky.ai_third_party ?? null,
-        },
-        weather_applied: appliedWeather
-          ? {
-              hour: appliedWeather.hour,
-              weather_text: appliedWeather.weather_text,
-              temperature_c: appliedWeather.temperature_c ?? null,
-              wind_direction_deg: appliedWeather.wind_direction_deg ?? null,
-              wind_speed_ms: appliedWeather.wind_speed_ms ?? null,
-              precipitation_mm: appliedWeather.precipitation_mm ?? null,
-            }
-          : null,
-        photos: {
-          slope_now_url: slopeNowUrl || null,
-          slope_prev_url: slopePrevUrl || null,
-          path_now_url: pathNowUrl || null,
-          path_prev_url: pathPrevUrl || null,
-        },
-      };
-
-      const j = await postJsonTry(["/api/ky-risk-score"], payload);
-      setRisk(j as RiskOut);
-    } catch (e: any) {
-      setRisk(null);
-      setRiskErr(e?.message ?? "リスク評価の取得に失敗しました");
-    } finally {
-      setRiskLoading(false);
-    }
-  }, [ky, appliedWeather, slopeNowUrl, slopePrevUrl, pathNowUrl, pathPrevUrl]);
-
-  useEffect(() => {
-    if (!ky) return;
-    const t = setTimeout(() => {
-      loadRisk();
-    }, 120);
-    return () => clearTimeout(t);
-  }, [
-    ky?.id,
-    ky?.work_detail,
-    ky?.hazards,
-    ky?.countermeasures,
-    ky?.third_party_level,
-    ky?.worker_count,
-    ky?.ai_hazards,
-    ky?.ai_countermeasures,
-    ky?.ai_third_party,
-    appliedWeather?.hour,
-    appliedWeather?.weather_text,
-    appliedWeather?.wind_speed_ms,
-    appliedWeather?.precipitation_mm,
-    slopeNowUrl,
-    slopePrevUrl,
-    pathNowUrl,
-    pathPrevUrl,
-    loadRisk,
-  ]);
-
-  const riskBadge = useMemo(() => {
-    const v = risk?.total_ai ?? 0;
-    if (v >= 70) return { label: "高", cls: "bg-rose-100 text-rose-800 border-rose-200" };
-    if (v >= 40) return { label: "中", cls: "bg-amber-100 text-amber-800 border-amber-200" };
-    return { label: "低", cls: "bg-emerald-100 text-emerald-800 border-emerald-200" };
-  }, [risk?.total_ai]);
-
-  // ✅ 表示：危険予知/対策は「5項目」「右側のみ」「番号なし」「恐れ注記なし」
-  const hazardsView = useMemo(() => formatHazardsForView5(s(ky?.ai_hazards)), [ky?.ai_hazards]);
-  const measuresView = useMemo(() => formatMeasuresForView5(s(ky?.ai_countermeasures)), [ky?.ai_countermeasures]);
-  const thirdView = useMemo(() => formatThirdForView(s(ky?.ai_third_party)), [ky?.ai_third_party]);
+  const thirdRisk = useMemo(() => {
+    const v = risk?.third_party ?? risk?.third_party_risk ?? ky?.third_party_risk ?? null;
+    return v == null || Number.isNaN(Number(v)) ? null : Number(v);
+  }, [risk, ky?.third_party_risk]);
 
   if (loading) {
     return (
@@ -947,508 +526,401 @@ export default function KyReviewClient() {
     );
   }
 
+  if (!ky) {
+    return (
+      <div className="p-4">
+        <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800">KYが見つかりません</div>
+        <div className="mt-3">
+          <Link className="text-blue-600 underline" href={`/projects/${projectId}/ky`}>
+            KY一覧へ戻る
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  const approved = !!ky.is_approved;
+
   return (
     <div className="p-4 space-y-4">
-      <div className="flex items-start justify-between gap-3 no-print">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-3">
         <div>
           <div className="text-lg font-bold text-slate-900">KY レビュー</div>
-          <div className="mt-1 text-sm text-slate-600">日付：{ky?.work_date ? fmtDateJp(ky.work_date) : "（不明）"}</div>
+          <div className="mt-1 text-sm text-slate-600">工事件名：{project?.name ?? "（不明）"}</div>
+          <div className="mt-1 text-sm text-slate-600">日付：{ky.work_date ? workDateJp : "（不明）"}</div>
+          <div className="mt-1 text-xs text-slate-500">KY ID：{kyId}</div>
         </div>
 
         <div className="flex flex-col gap-2 shrink-0">
+          <Link className="text-sm text-blue-600 underline text-right" href={`/projects/${projectId}/ky/${kyId}/edit`}>
+            編集
+          </Link>
           <Link className="text-sm text-blue-600 underline text-right" href={`/projects/${projectId}/ky`}>
-            KY一覧へ
+            KY一覧
           </Link>
         </div>
       </div>
 
-      {!!status.text && <div className={`rounded-lg px-3 py-2 text-sm ${statusClass} no-print`}>{status.text}</div>}
-
-      {ky?.is_approved ? (
-        <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 print-avoid-break">
-          承認済み{ky.approved_at ? `（${fmtDateTimeJp(ky.approved_at)}）` : ""}
-        </div>
-      ) : (
-        <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 print-avoid-break">未承認</div>
-      )}
-
-      {/* ✅ リスク評価（比較＋内訳）：レビューだけに表示 */}
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
+      {/* タイトル */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="flex items-center justify-between gap-2">
-          <div className="text-sm font-semibold text-slate-800">リスク評価（比較＋内訳）</div>
-          <div className={`text-xs px-2 py-1 rounded-full border ${riskBadge.cls}`}>
-            AI総合：{risk ? risk.total_ai : "—"}（{riskBadge.label}）
-          </div>
+          <div className="text-sm font-semibold text-slate-800">タイトル</div>
+          <Badge>{approved ? "承認済" : "未承認"}</Badge>
         </div>
-
-        {riskLoading ? (
-          <div className="text-sm text-slate-600">リスク評価 計算中...</div>
-        ) : riskErr ? (
-          <div className="text-sm text-rose-700">リスク評価：{riskErr}</div>
-        ) : risk ? (
-          <>
-            {/* ✅ まとめ：人入力以外 TOP5 */}
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-              <div className="text-xs font-semibold text-slate-800 mb-2">要注意ポイント（人入力以外：高い順 TOP5）</div>
-              {risk.ai_top5?.length ? (
-                <ol className="list-decimal pl-5 text-sm text-slate-800 space-y-1">
-                  {risk.ai_top5.slice(0, 5).map((it, i) => (
-                    <li key={`${it.key}-${i}`}>
-                      <span className="font-semibold">{it.label}</span>
-                      <span className="ml-2 text-slate-600">[{it.score}]</span>
-                      <div className="text-xs text-slate-600 mt-0.5">{it.reason}</div>
-                    </li>
-                  ))}
-                </ol>
-              ) : (
-                <div className="text-sm text-slate-600">（要注意ポイントはありません）</div>
-              )}
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                <div className="text-xs text-slate-600 mb-1">R_human（人の入力）</div>
-                <div className="text-2xl font-bold text-slate-900">{risk.total_human}</div>
-                <div className="text-xs text-slate-600 mt-1">作業員/第三者/気象/キーワード/文章</div>
-              </div>
-
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                <div className="text-xs text-slate-600 mb-1">R_ai（AIデータ）</div>
-                <div className="text-2xl font-bold text-slate-900">{risk.total_ai}</div>
-                <div className="text-xs text-slate-600 mt-1">写真/第三者/気象/AI文章</div>
-              </div>
-
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                <div className="text-xs text-slate-600 mb-1">Δ（AI − 人）</div>
-                <div className="text-2xl font-bold text-slate-900">
-                  {risk.total_ai - risk.total_human >= 0 ? `+${risk.total_ai - risk.total_human}` : `${risk.total_ai - risk.total_human}`}
-                </div>
-                <div className="text-xs text-slate-600 mt-1">
-                  {risk.total_ai - risk.total_human >= 10 ? "AIが厳しめ" : risk.total_ai - risk.total_human <= -10 ? "人が厳しめ" : "同程度"}
-                </div>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              <div className="rounded-lg border border-slate-200 bg-white p-3">
-                <div className="text-xs text-slate-600 mb-1">R_photo（写真）</div>
-                <div className="text-xl font-bold text-slate-900">{risk.breakdown.photo.score}</div>
-                <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
-                  {risk.breakdown.photo.reasons.slice(0, 3).map((x, i) => (
-                    <li key={`${x}-${i}`}>{x}</li>
-                  ))}
-                </ul>
-              </div>
-
-              <div className="rounded-lg border border-slate-200 bg-white p-3">
-                <div className="text-xs text-slate-600 mb-1">R_third（第三者）</div>
-                <div className="text-xl font-bold text-slate-900">{risk.breakdown.third_party.score}</div>
-                <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
-                  {risk.breakdown.third_party.reasons.slice(0, 3).map((x, i) => (
-                    <li key={`${x}-${i}`}>{x}</li>
-                  ))}
-                </ul>
-              </div>
-
-              <div className="rounded-lg border border-slate-200 bg-white p-3">
-                <div className="text-xs text-slate-600 mb-1">R_weather（気象：適用枠）</div>
-                <div className="text-xl font-bold text-slate-900">{risk.breakdown.weather.score}</div>
-                <div className="text-xs text-slate-600 mt-1">適用：{appliedWeather ? `${appliedWeather.hour}時` : "—"}</div>
-                <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
-                  {risk.breakdown.weather.reasons.slice(0, 4).map((x, i) => (
-                    <li key={`${x}-${i}`}>{x}</li>
-                  ))}
-                </ul>
-              </div>
-            </div>
-
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-              <div className="text-xs text-slate-600 mb-2">参考：人側内訳</div>
-              <div className="text-xs text-slate-700 flex flex-wrap gap-3">
-                <span>作業員：{risk.breakdown.workers.score}</span>
-                <span>キーワード：{risk.breakdown.keyword.score}</span>
-                <span>文章（人）：{risk.breakdown.text_quality_human.score}</span>
-              </div>
-            </div>
-
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-              <div className="text-xs text-slate-600 mb-2">参考：AI側内訳</div>
-              <div className="text-xs text-slate-700 flex flex-wrap gap-3">
-                <span>AI文章：{risk.breakdown.text_quality_ai.score}</span>
-              </div>
-            </div>
-
-            <div className="text-xs text-slate-500">
-              ※ リスクは /api/ky-risk-score で計算（0〜100）。要注意TOP5は「人入力以外（写真/気象/第三者/作業員/AI文章）」を高い順に抽出。
-            </div>
-          </>
-        ) : (
-          <div className="text-sm text-slate-600">（リスク評価なし）</div>
+        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900">{titleForList}</div>
+        {approved && (
+          <div className="text-xs text-slate-500">
+            承認日時：{ky.approved_at ? s(ky.approved_at) : "—"} / 承認者：{ky.approved_by ? s(ky.approved_by) : "—"}
+          </div>
         )}
       </div>
 
-      {publicUrl ? (
-        <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
-          <div className="text-sm font-semibold text-slate-800">公開リンク（作業員閲覧用）</div>
+      {/* 基本情報 */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="text-sm font-semibold text-slate-800">基本情報</div>
 
-          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm break-all">{publicUrl}</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-1">
+            <div className="text-xs text-slate-600">施工会社</div>
+            <div className="text-sm text-slate-900">{project?.contractor_name ?? "（未入力）"}</div>
+          </div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-1">
+            <div className="text-xs text-slate-600">協力会社</div>
+            <div className="text-sm text-slate-900">{ky.partner_company_name ?? "（未入力）"}</div>
+          </div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-1">
+            <div className="text-xs text-slate-600">作業員数</div>
+            <div className="text-sm text-slate-900">{ky.worker_count == null ? "—" : ky.worker_count}</div>
+          </div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-1">
+            <div className="text-xs text-slate-600">第三者（墓参者）</div>
+            <div className="text-sm text-slate-900">{ky.third_party_level ? ky.third_party_level : "—"}</div>
+          </div>
+        </div>
 
-          <div className="flex items-center gap-3 flex-wrap no-print">
-            <button type="button" onClick={onCopyPublicUrl} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50">
-              コピー
+        {project?.address ? <div className="text-xs text-slate-500">現場住所：{project.address}</div> : null}
+      </div>
+
+      {/* 気象 */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-sm font-semibold text-slate-800">気象（9/12/15）</div>
+          <Badge>{appliedWeatherSlot ? `適用：${appliedWeatherSlot.hour}時` : "—"}</Badge>
+        </div>
+
+        {appliedWeatherSlot ? (
+          <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+            <div className="font-semibold">適用気象：{appliedWeatherSlot.hour}時</div>
+            <div className="mt-1">{slotSummary(appliedWeatherSlot)}</div>
+          </div>
+        ) : (
+          <div className="text-sm text-slate-500">（気象情報がありません）</div>
+        )}
+
+        {weatherSlotsSorted.length ? (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {weatherSlotsSorted.map((slot) => {
+              const isApplied = appliedWeatherSlot && slot.hour === appliedWeatherSlot.hour;
+              return (
+                <div
+                  key={slot.hour}
+                  className={`rounded-lg border p-3 ${isApplied ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>
+                    {isApplied ? <div className="text-xs font-semibold text-emerald-700">適用</div> : null}
+                  </div>
+                  <div className="mt-1 text-sm text-slate-700">{slot.weather_text || "（不明）"}</div>
+                  <div className="mt-2 text-xs text-slate-600 space-y-1">
+                    <div>気温：{slot.temperature_c ?? "—"} ℃</div>
+                    <div>
+                      風：{degToDirJp(slot.wind_direction_deg) || "—"}{" "}
+                      {slot.wind_speed_ms !== null && slot.wind_speed_ms !== undefined ? `${slot.wind_speed_ms} m/s` : "—"}
+                    </div>
+                    <div>降水：{slot.precipitation_mm ?? "—"} mm</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+      </div>
+
+      {/* リスク評価（レビューにだけ表示） */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-sm font-semibold text-slate-800">リスク評価（レビュー専用）</div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onRecalcRisk}
+              disabled={riskLoading}
+              className={`rounded-lg border px-3 py-2 text-sm ${riskLoading ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
+            >
+              {riskLoading ? "再計算中..." : "再計算（取得）"}
             </button>
-            <a className="text-sm text-blue-600 underline" href={publicUrl} target="_blank" rel="noreferrer">
-              別タブで開く
-            </a>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <ScorePill label="総合" value={riskTotal} />
+          <ScorePill label="気象" value={weatherRisk} />
+          <ScorePill label="写真" value={photoRisk} />
+          <ScorePill label="第三者" value={thirdRisk} />
+        </div>
+
+        <div className="flex items-center gap-2 flex-wrap">
+          <Badge>判定：{riskLevel || "—"}</Badge>
+          {riskTotal == null && !riskBreakdownObj ? <Badge>未計算（または取得不可）</Badge> : null}
+        </div>
+
+        {riskBreakdownObj ? (
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="text-xs font-semibold text-slate-700">内訳（JSON）</div>
+            <pre className="mt-2 whitespace-pre-wrap break-words text-xs text-slate-700">{JSON.stringify(riskBreakdownObj, null, 2)}</pre>
+          </div>
+        ) : (
+          <div className="text-xs text-slate-500">
+            ※ リスク評価の内訳は「演算部/API」が返す構造に依存します。現時点で未計算なら「再計算（取得）」を押してください。
+          </div>
+        )}
+      </div>
+
+      {/* 写真（今回/前回） + スコア */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-sm font-semibold text-slate-800">写真（今回／前回）</div>
+          <div className="flex items-center gap-2">
+            <Badge>法面スコア：{ky.slope_photo_score == null ? "—" : ky.slope_photo_score}</Badge>
+            <Badge>通路スコア：{ky.path_photo_score == null ? "—" : ky.path_photo_score}</Badge>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {/* 法面 */}
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2">
+            <div className="text-sm font-semibold text-slate-800">法面</div>
+            <div className="grid grid-cols-1 gap-2">
+              <div className="rounded-lg border border-slate-200 bg-white p-2">
+                <div className="text-xs text-slate-600">今回</div>
+                {slopeNowUrl ? (
+                  <>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={slopeNowUrl} alt="法面（今回）" className="mt-2 w-full rounded-md border border-slate-200 object-cover" />
+                    <div className="mt-2 text-xs break-all text-slate-600">{slopeNowUrl}</div>
+                  </>
+                ) : (
+                  <div className="text-sm text-slate-500">（画像なし）</div>
+                )}
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-white p-2">
+                <div className="text-xs text-slate-600">前回</div>
+                {slopePrevUrl ? (
+                  <>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={slopePrevUrl} alt="法面（前回）" className="mt-2 w-full rounded-md border border-slate-200 object-cover" />
+                    <div className="mt-2 text-xs break-all text-slate-600">{slopePrevUrl}</div>
+                  </>
+                ) : (
+                  <div className="text-sm text-slate-500">（前回なし）</div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* 通路 */}
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2">
+            <div className="text-sm font-semibold text-slate-800">通路</div>
+            <div className="grid grid-cols-1 gap-2">
+              <div className="rounded-lg border border-slate-200 bg-white p-2">
+                <div className="text-xs text-slate-600">今回</div>
+                {pathNowUrl ? (
+                  <>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={pathNowUrl} alt="通路（今回）" className="mt-2 w-full rounded-md border border-slate-200 object-cover" />
+                    <div className="mt-2 text-xs break-all text-slate-600">{pathNowUrl}</div>
+                  </>
+                ) : (
+                  <div className="text-sm text-slate-500">（画像なし）</div>
+                )}
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-white p-2">
+                <div className="text-xs text-slate-600">前回</div>
+                {pathPrevUrl ? (
+                  <>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={pathPrevUrl} alt="通路（前回）" className="mt-2 w-full rounded-md border border-slate-200 object-cover" />
+                    <div className="mt-2 text-xs break-all text-slate-600">{pathPrevUrl}</div>
+                  </>
+                ) : (
+                  <div className="text-sm text-slate-500">（前回なし）</div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="text-xs text-slate-500">
+          ※ 写真スコアは KyNew 側で pseudo 表示されている前提。演算部がスコアを保存する場合は上のスコア欄に反映されます。
+        </div>
+      </div>
+
+      {/* 人の入力 */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="text-sm font-semibold text-slate-800">人の入力</div>
+
+        <div className="space-y-1">
+          <div className="text-xs text-slate-600">作業内容</div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm whitespace-pre-wrap text-slate-900">
+            {ky.work_detail ? ky.work_detail : "—"}
+          </div>
+        </div>
+
+        <div className="space-y-1">
+          <div className="text-xs text-slate-600">危険予知</div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm whitespace-pre-wrap text-slate-900">
+            {ky.hazards ? ky.hazards : "—"}
+          </div>
+        </div>
+
+        <div className="space-y-1">
+          <div className="text-xs text-slate-600">対策</div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm whitespace-pre-wrap text-slate-900">
+            {ky.countermeasures ? ky.countermeasures : "—"}
+          </div>
+        </div>
+      </div>
+
+      {/* AI補足（厳しめ運用を前提：レビューで確認） */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="text-sm font-semibold text-slate-800">AI補足（レビュー専用表示）</div>
+
+        <div className="space-y-2">
+          <div className="text-xs font-semibold text-slate-700">作業内容の補足</div>
+          {aiWorkLines.length ? (
+            <ul className="list-disc pl-5 space-y-1 text-sm text-slate-900">
+              {aiWorkLines.map((x, i) => (
+                <li key={i} className="whitespace-pre-wrap">{x}</li>
+              ))}
+            </ul>
+          ) : (
+            <div className="text-sm text-slate-500">—</div>
+          )}
+        </div>
+
+        <div className="space-y-2">
+          <div className="text-xs font-semibold text-slate-700">危険予知の補足（因果が分かる形が理想）</div>
+          {aiHazardLines.length ? (
+            <ul className="list-disc pl-5 space-y-1 text-sm text-slate-900">
+              {aiHazardLines.map((x, i) => (
+                <li key={i} className="whitespace-pre-wrap">{x}</li>
+              ))}
+            </ul>
+          ) : (
+            <div className="text-sm text-slate-500">—</div>
+          )}
+        </div>
+
+        <div className="space-y-2">
+          <div className="text-xs font-semibold text-slate-700">対策の補足（具体策の箇条書きが理想）</div>
+          {aiCounterLines.length ? (
+            <ul className="list-disc pl-5 space-y-1 text-sm text-slate-900">
+              {aiCounterLines.map((x, i) => (
+                <li key={i} className="whitespace-pre-wrap">{x}</li>
+              ))}
+            </ul>
+          ) : (
+            <div className="text-sm text-slate-500">—</div>
+          )}
+        </div>
+
+        <div className="space-y-2">
+          <div className="text-xs font-semibold text-slate-700">第三者（墓参者）の補足</div>
+          {aiThirdLines.length ? (
+            <ul className="list-disc pl-5 space-y-1 text-sm text-slate-900">
+              {aiThirdLines.map((x, i) => (
+                <li key={i} className="whitespace-pre-wrap">{x}</li>
+              ))}
+            </ul>
+          ) : (
+            <div className="text-sm text-slate-500">—</div>
+          )}
+        </div>
+      </div>
+
+      {/* 公開リンク（QR） */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="text-sm font-semibold text-slate-800">公開リンク（現場閲覧用）</div>
+
+        {publicToken ? (
+          <div className="space-y-2">
+            <div className="text-xs text-slate-600 break-all">
+              URL：{typeof window !== "undefined" ? `${window.location.origin}/ky/public/${publicToken}` : `/ky/public/${publicToken}`}
+            </div>
 
             {qrDataUrl ? (
-              <button type="button" onClick={() => setQrOpen(true)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50">
-                QRを表示
-              </button>
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={qrDataUrl} alt="KY公開QR" className="w-44 rounded-lg border border-slate-200 bg-white p-2" />
             ) : null}
 
-            <button
-              type="button"
-              onClick={loadReadLogs}
-              disabled={readLoading}
-              className={`rounded-lg border px-4 py-2 text-sm ${
-                readLoading ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
-              }`}
-            >
-              {readLoading ? "既読 更新中..." : "既読を更新"}
-            </button>
-
-            <button
-              type="button"
-              onClick={loadUnread}
-              disabled={unreadLoading}
-              className={`rounded-lg border px-4 py-2 text-sm ${
-                unreadLoading ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
-              }`}
-            >
-              {unreadLoading ? "未読 更新中..." : "未読を更新"}
-            </button>
-          </div>
-
-          {qrDataUrl ? (
-            <div className="flex items-start gap-4 flex-wrap">
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={qrDataUrl} alt="公開リンクQR" className="w-40 h-40" />
-              </div>
-              <div className="text-xs text-slate-500 leading-relaxed">
-                ・スマホのカメラでQRを読み取り→そのまま閲覧できます。<br />
-                ・このページは閲覧専用（編集不可）です。<br />
-                ・承認解除すると公開停止になります。
-              </div>
-            </div>
-          ) : null}
-
-          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2 no-print">
-            <div className="flex items-center justify-between gap-2">
-              <div className="text-sm font-semibold text-slate-800">既読状況</div>
-              <div className="text-right">
-                <div className="text-sm text-slate-700">
-                  既読：<span className="font-semibold">{readLogs.length}</span> 名
-                </div>
-                {latestReadAt ? <div className="text-xs text-slate-500">最新：{latestReadAt}</div> : null}
-              </div>
-            </div>
-
-            {readErr ? <div className="text-xs text-rose-700">{readErr}</div> : null}
-
-            {readLogs.length ? (
-              <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
-                <div className="grid grid-cols-12 gap-0 border-b border-slate-200 bg-slate-50 text-xs text-slate-600">
-                  <div className="col-span-5 px-3 py-2">氏名</div>
-                  <div className="col-span-2 px-3 py-2">役割</div>
-                  <div className="col-span-5 px-3 py-2">時刻</div>
-                </div>
-                {readLogs.map((r) => (
-                  <div key={r.id} className="grid grid-cols-12 gap-0 border-b border-slate-100 text-sm">
-                    <div className="col-span-5 px-3 py-2 text-slate-800">{s(r.reader_name) || "（不明）"}</div>
-                    <div className="col-span-2 px-3 py-2 text-slate-700">{s(r.reader_role) || "—"}</div>
-                    <div className="col-span-5 px-3 py-2 text-slate-700">{r.created_at ? fmtDateTimeJp(r.created_at) : "—"}</div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="text-sm text-slate-600">（まだ既読がありません）</div>
-            )}
-          </div>
-
-          <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 space-y-2 no-print">
-            <div className="flex items-center justify-between gap-2">
-              <div className="text-sm font-semibold text-rose-800">
-                未読状況（入場登録ベース）{unreadMode === "company" ? "：会社単位" : unreadMode === "person" ? "：個人単位" : ""}
-              </div>
-              <div className="text-sm text-rose-800">
-                未読：<span className="font-semibold">{unreadFiltered.length}</span>
-              </div>
-            </div>
-
-            {unreadErr ? <div className="text-xs text-rose-700">{unreadErr}</div> : null}
-
-            {unreadLoading ? (
-              <div className="text-sm text-rose-700">（未読一覧 更新中...）</div>
-            ) : unreadFiltered.length ? (
-              <div className="rounded-lg border border-rose-200 bg-white p-3">
-                <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                  {unreadFiltered.map((x, i) => (
-                    <li key={`${x}-${i}`}>{x}</li>
-                  ))}
-                </ul>
-              </div>
-            ) : (
-              <div className="text-sm text-rose-700">（未読はありません）</div>
-            )}
-          </div>
-
-          {qrOpen && qrDataUrl ? (
-            <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4 no-print" onClick={() => setQrOpen(false)}>
-              <div className="bg-white rounded-xl p-4 max-w-md w-full" onClick={(e) => e.stopPropagation()}>
-                <div className="flex items-center justify-between mb-3">
-                  <div className="text-sm font-semibold text-slate-800">QRコード（拡大）</div>
-                  <button type="button" className="rounded-lg border border-slate-300 bg-white px-3 py-1 text-sm hover:bg-slate-50" onClick={() => setQrOpen(false)}>
-                    閉じる
-                  </button>
-                </div>
-                <div className="flex justify-center">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={qrDataUrl} alt="公開リンクQR（拡大）" className="w-72 h-72" />
-                </div>
-                <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs break-all">{publicUrl}</div>
-              </div>
-            </div>
-          ) : null}
-        </div>
-      ) : null}
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
-        <div className="text-sm font-semibold text-slate-800">施工会社（固定）</div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{project?.contractor_name ?? "（未入力）"}</div>
-      </div>
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
-        <div className="text-sm font-semibold text-slate-800">
-          協力会社 <span className="text-rose-600">（必須）</span>
-        </div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.partner_company_name ?? "（未入力）"}</div>
-      </div>
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
-        <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">{ky?.worker_count != null ? `${ky.worker_count} 人` : "（未入力）"}</div>
-      </div>
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
-        <div className="text-sm font-semibold text-slate-800">作業内容</div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.work_detail).trim() || "（未入力）"}</div>
-      </div>
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
-        <div className="text-sm font-semibold text-slate-800">危険予知</div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.hazards).trim() || "（未入力）"}</div>
-      </div>
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
-        <div className="text-sm font-semibold text-slate-800">対策</div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.countermeasures).trim() || "（未入力）"}</div>
-      </div>
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2 print-avoid-break">
-        <div className="text-sm font-semibold text-slate-800">第三者（墓参者）</div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.third_party_level).trim() || "（未入力）"}</div>
-      </div>
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
-        <div className="text-sm font-semibold text-slate-800">気象（先頭＝適用枠）</div>
-        {weatherSlots.length ? (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            {weatherSlots.map((slot, idx) => (
-              <div
-                key={`${slot.hour}-${idx}`}
-                className={`rounded-lg border p-3 print-avoid-break ${idx === 0 ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`}
-              >
-                <div className="flex items-center justify-between">
-                  <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>
-                  {idx === 0 ? <div className="text-xs font-semibold text-emerald-700">適用</div> : null}
-                </div>
-                <div className="mt-1 text-sm text-slate-700">{slot.weather_text || "（不明）"}</div>
-                <div className="mt-2 text-xs text-slate-600 space-y-1">
-                  <div>気温：{slot.temperature_c ?? "—"} ℃</div>
-                  <div>
-                    風：{degToDirJp(slot.wind_direction_deg)} {slot.wind_speed_ms != null ? `${slot.wind_speed_ms} m/s` : "—"}
-                  </div>
-                  <div>降水：{slot.precipitation_mm ?? "—"} mm</div>
-                </div>
-              </div>
-            ))}
+            <div className="text-xs text-slate-500">※ QRは現場スマホ閲覧に使用</div>
           </div>
         ) : (
-          <div className="text-sm text-slate-500">（気象データがありません）</div>
+          <div className="text-sm text-slate-500">
+            （公開トークンが見つかりません。公開リンク生成API/テーブルが未設定の可能性があります）
+          </div>
         )}
       </div>
 
-      <div className="print-page-break" />
-
+      {/* 承認 */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
-        <div className="text-sm font-semibold text-slate-800">写真（今回／前回）</div>
-
-        <div className="space-y-3">
-          <div className="print-avoid-break">
-            <div className="text-sm font-semibold text-slate-800">法面（定点）</div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
-                <div className="text-xs text-slate-600 mb-2">今回写真</div>
-                {slopeNowUrl ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={slopeNowUrl} alt="法面（今回）" className="w-full rounded-md border border-slate-200" />
-                ) : (
-                  <div className="text-sm text-slate-500">（なし）</div>
-                )}
-              </div>
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
-                <div className="text-xs text-slate-600 mb-2">前回写真</div>
-                {slopePrevUrl ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={slopePrevUrl} alt="法面（前回）" className="w-full rounded-md border border-slate-200" />
-                ) : (
-                  <div className="text-sm text-slate-500">（なし）</div>
-                )}
-              </div>
-            </div>
-          </div>
-
-          <div className="print-avoid-break">
-            <div className="text-sm font-semibold text-slate-800">通路（定点）</div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
-                <div className="text-xs text-slate-600 mb-2">今回写真</div>
-                {pathNowUrl ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={pathNowUrl} alt="通路（今回）" className="w-full rounded-md border border-slate-200" />
-                ) : (
-                  <div className="text-sm text-slate-500">（なし）</div>
-                )}
-              </div>
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 print-avoid-break">
-                <div className="text-xs text-slate-600 mb-2">前回写真</div>
-                {pathPrevUrl ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={pathPrevUrl} alt="通路（前回）" className="w-full rounded-md border border-slate-200" />
-                ) : (
-                  <div className="text-sm text-slate-500">（なし）</div>
-                )}
-              </div>
-            </div>
-          </div>
+        <div className="text-sm font-semibold text-slate-800">承認</div>
+        <div className="text-xs text-slate-600">
+          ※ 承認すると LINE自動配信などのトリガー（設計済み）に使います。
         </div>
+
+        <button
+          type="button"
+          onClick={onApproveToggle}
+          className={`w-full rounded-lg px-4 py-3 text-sm font-semibold text-white ${approved ? "bg-slate-700 hover:bg-slate-800" : "bg-black hover:bg-slate-900"}`}
+        >
+          {approved ? "承認を取り消す" : "承認する"}
+        </button>
       </div>
 
-      <div className="print-page-break" />
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
-        <div className="flex items-center justify-between gap-3">
-          <div className="text-sm font-semibold text-slate-800">AI補足（見やすく表示）</div>
-
-          <button
-            type="button"
-            onClick={onRegenerateAi}
-            disabled={aiGenerating || acting || !!ky?.is_approved}
-            className={`rounded-lg border px-4 py-2 text-sm no-print ${
-              aiGenerating || acting || !!ky?.is_approved ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
-            }`}
-          >
-            {!!ky?.is_approved ? "承認済み（再生成不可）" : aiGenerating ? "AI補足 生成中..." : "AI補足 再生成"}
-          </button>
+      {!!status.text && (
+        <div
+          className={`rounded-lg px-3 py-2 text-sm ${
+            status.type === "success"
+              ? "border border-emerald-200 bg-emerald-50 text-emerald-800"
+              : status.type === "error"
+              ? "border border-rose-200 bg-rose-50 text-rose-800"
+              : "border border-slate-200 bg-slate-50 text-slate-700"
+          }`}
+        >
+          {status.text}
         </div>
+      )}
 
-        <div className="space-y-2 print-avoid-break">
-          <div className="text-xs text-slate-600">作業内容の補足</div>
-          <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm whitespace-pre-wrap">{s(ky?.ai_work_detail).trim() || "（なし）"}</div>
-        </div>
-
-        <div className="space-y-2 print-avoid-break">
-          <div className="text-xs text-slate-600">危険予知の補足（5項目：右側のみ）</div>
-          {hazardsView.length ? (
-            <div className="rounded-lg border border-slate-300 bg-white p-3">
-              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {hazardsView.map((x, i) => (
-                  <li key={`${x}-${i}`}>{x}</li>
-                ))}
-              </ul>
-            </div>
-          ) : (
-            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
-          )}
-        </div>
-
-        <div className="space-y-2 print-avoid-break">
-          <div className="text-xs text-slate-600">対策の補足（5項目：番号なし）</div>
-          {measuresView.length ? (
-            <div className="rounded-lg border border-slate-300 bg-white p-3">
-              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {measuresView.map((x, i) => (
-                  <li key={`${x}-${i}`}>{x}</li>
-                ))}
-              </ul>
-            </div>
-          ) : (
-            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
-          )}
-        </div>
-
-        <div className="space-y-2 print-avoid-break">
-          <div className="text-xs text-slate-600">第三者（墓参者）の補足（番号なし）</div>
-          {thirdView.length ? (
-            <div className="rounded-lg border border-slate-300 bg-white p-3">
-              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {thirdView.map((x, i) => (
-                  <li key={`${x}-${i}`}>{x}</li>
-                ))}
-              </ul>
-            </div>
-          ) : (
-            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
-          )}
-        </div>
-      </div>
-
-      <div className="flex items-center justify-between gap-3 no-print">
-        <button type="button" onClick={() => router.push(`/projects/${projectId}/ky`)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50">
-          戻る
+      {/* Footer */}
+      <div className="flex items-center justify-between gap-3">
+        <button
+          type="button"
+          onClick={() => router.push(`/projects/${projectId}/ky`)}
+          className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
+        >
+          一覧へ戻る
         </button>
 
-        <div className="flex items-center gap-2">
-          <button type="button" onClick={onPrint} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50">
-            印刷
-          </button>
-
-          {ky?.is_approved ? (
-            <button
-              type="button"
-              disabled={acting}
-              onClick={onUnapprove}
-              className={`rounded-lg border px-4 py-2 text-sm ${acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
-            >
-              承認解除
-            </button>
-          ) : (
-            <button type="button" disabled={acting} onClick={onApprove} className={`rounded-lg px-4 py-2 text-sm text-white ${acting ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}>
-              承認
-            </button>
-          )}
-
-          <button
-            type="button"
-            onClick={() => load()}
-            disabled={acting}
-            className={`rounded-lg border px-4 py-2 text-sm ${acting ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
-          >
-            再読み込み
-          </button>
-        </div>
+        <Link
+          className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
+          href={`/projects/${projectId}/ky/${kyId}/edit`}
+        >
+          編集へ
+        </Link>
       </div>
     </div>
   );
