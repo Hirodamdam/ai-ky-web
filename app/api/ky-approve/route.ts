@@ -16,11 +16,27 @@ function s(v: any) {
   return v == null ? "" : String(v);
 }
 
+// ✅ 型ガード（string|unknown を string に確定させる）
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.trim().length > 0;
+}
+
 // Vercel/Proxy環境で正しいURLを組み立てる
 function getBaseUrl(req: Request) {
   const proto = req.headers.get("x-forwarded-proto") || "https";
   const host = req.headers.get("x-forwarded-host") || req.headers.get("host") || "";
   return host ? `${proto}://${host}` : "";
+}
+
+// ✅ 管理者（全通知受信）宛先を環境変数から取得
+// 例: LINE_ADMIN_RECIPIENT_IDS="Uxxxx,Cyyyy"
+function parseAdminRecipientsFromEnv(): string[] {
+  const raw = (process.env.LINE_ADMIN_RECIPIENT_IDS || "").trim();
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((x) => x.trim())
+    .filter(isNonEmptyString);
 }
 
 export async function POST(req: Request) {
@@ -47,7 +63,10 @@ export async function POST(req: Request) {
       );
     }
     if (!projectId || !kyId || !accessToken) {
-      return NextResponse.json({ error: "Missing body: projectId / kyId / accessToken" }, { status: 400 });
+      return NextResponse.json(
+        { error: "Missing body: projectId / kyId / accessToken" },
+        { status: 400 }
+      );
     }
 
     // 1) ログインユーザー確認（accessTokenで認証）
@@ -76,7 +95,9 @@ export async function POST(req: Request) {
 
     if (curErr) return NextResponse.json({ error: `Fetch ky failed: ${curErr.message}` }, { status: 500 });
     if (!current) return NextResponse.json({ error: "KY not found" }, { status: 404 });
-    if (s((current as any).project_id).trim() !== projectId) return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
+    if (s((current as any).project_id).trim() !== projectId) {
+      return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
+    }
 
     // 工事名（通知タイトル用）
     const { data: proj } = await adminClient.from("projects").select("name").eq("id", projectId).maybeSingle();
@@ -131,7 +152,9 @@ export async function POST(req: Request) {
     // 3) ★承認成功後にLINE通知（失敗しても承認は成功扱い）
     let lineOk: boolean | null = null;
     let lineError: string | null = null;
-    let lineTo: string | null = null;
+
+    // ✅ 宛先（協力会社 + 管理者）
+    let line_to_list: string[] = [];
 
     try {
       const pushSecret = (process.env.LINE_PUSH_SECRET || "").trim();
@@ -139,22 +162,31 @@ export async function POST(req: Request) {
         lineOk = null;
         lineError = "LINE_PUSH_SECRET missing (skip)";
       } else {
-        // ✅ 協力会社別の送信先を引く（見つからなければ to=null で broadcast にフォールバック）
+        // ✅ 管理者（全通知受信）
+        const adminTos = parseAdminRecipientsFromEnv();
+
+        // ✅ 協力会社宛先（DBから取得：表記ゆれ対策で key で検索）
+        let partnerTo: string | null = null;
+
         if (partnerName) {
+          const partnerKey = partnerName.replace(/\s+/g, ""); // 全角/半角スペース等を除去
+
           const { data: tgt, error: tgtErr } = await adminClient
             .from("partner_line_targets")
             .select("line_to, notify_enabled")
             .eq("project_id", projectId)
-            .eq("partner_company_name", partnerName)
+            .eq("partner_company_key", partnerKey)
             .maybeSingle();
 
           if (tgtErr) {
-            // DBエラーでも承認自体は成功扱い、通知だけフォールバック
             console.warn("[ky-approve] partner_line_targets fetch error:", tgtErr.message);
           } else if (tgt?.notify_enabled && tgt?.line_to) {
-            lineTo = s(tgt.line_to).trim() || null;
+            partnerTo = s(tgt.line_to).trim() || null;
           }
         }
+
+        // ✅ 宛先合成（重複排除）
+        line_to_list = Array.from(new Set([partnerTo, ...adminTos].filter(isNonEmptyString)));
 
         const titleParts: string[] = [];
         if (projectName) titleParts.push(projectName);
@@ -164,7 +196,6 @@ export async function POST(req: Request) {
 
         const endpoint = new URL("/api/line/push-ky", baseUrl).toString();
 
-        // ✅ to があれば「協力会社別 push」、無ければ従来通り broadcast
         const res = await fetch(endpoint, {
           method: "POST",
           headers: {
@@ -174,11 +205,11 @@ export async function POST(req: Request) {
           body: JSON.stringify({
             title,
             url: publicUrl,
-            to: lineTo ?? undefined,
+            to: line_to_list.length ? line_to_list : undefined, // 0件ならpush-ky側がbroadcastへ（互換）
           }),
         });
 
-        const txt = await res.text();
+        const txt = await res.text().catch(() => "");
         lineOk = res.ok;
         if (!res.ok) lineError = `push-ky failed: ${res.status} ${txt}`;
       }
@@ -195,7 +226,7 @@ export async function POST(req: Request) {
       public_url: publicUrl,
       public_enabled: true,
       partner_company_name: partnerName || null,
-      line_to: lineTo,
+      line_to: line_to_list.length ? line_to_list : null,
       line_ok: lineOk,
       line_error: lineError,
     });
