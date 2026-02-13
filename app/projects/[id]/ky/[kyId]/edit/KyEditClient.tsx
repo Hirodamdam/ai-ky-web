@@ -177,47 +177,6 @@ function normalizeText(text: string): string {
   return (text || "").replace(/\r\n/g, "\n").replace(/\u3000/g, " ").trim();
 }
 
-function splitAiCombined(text: string): { work: string; hazards: string; countermeasures: string; third: string } {
-  const src = (text || "").trim();
-  if (!src) return { work: "", hazards: "", countermeasures: "", third: "" };
-
-  const makeBracketRe = (label: string) =>
-    new RegExp(String.raw`(?:^|\n)\s*(?:[•・\-*]\s*)?[【\[]\s*AI補足\s*[｜|]\s*${label}\s*[】\]]`, "g");
-
-  const headings: Array<{ key: "work" | "hazards" | "countermeasures" | "third"; re: RegExp }> = [
-    { key: "work", re: makeBracketRe("作業内容") },
-    { key: "hazards", re: makeBracketRe("危険予知") },
-    { key: "countermeasures", re: makeBracketRe("対策") },
-    { key: "third", re: makeBracketRe("第三者(?:\\s*（\\s*墓参者\\s*）)?") },
-    { key: "work", re: /(?:^|\n)\s*(作業内容)\s*[:：]/g },
-    { key: "hazards", re: /(?:^|\n)\s*(危険予知)\s*[:：]/g },
-    { key: "countermeasures", re: /(?:^|\n)\s*(対策)\s*[:：]/g },
-    { key: "third", re: /(?:^|\n)\s*(第三者|墓参者)\s*[:：]/g },
-  ];
-
-  const marks: Array<{ idx: number; key: "work" | "hazards" | "countermeasures" | "third"; len: number }> = [];
-  for (const h of headings) {
-    let m: RegExpExecArray | null;
-    h.re.lastIndex = 0;
-    while ((m = h.re.exec(src))) marks.push({ idx: m.index, key: h.key, len: m[0].length });
-  }
-  marks.sort((a, b) => a.idx - b.idx);
-
-  if (!marks.length) return { work: src, hazards: "", countermeasures: "", third: "" };
-
-  const out = { work: "", hazards: "", countermeasures: "", third: "" };
-  for (let i = 0; i < marks.length; i++) {
-    const cur = marks[i];
-    const next = marks[i + 1];
-    const start = cur.idx + cur.len;
-    const end = next ? next.idx : src.length;
-    const chunk = src.slice(start, end).trim();
-    if (!chunk) continue;
-    (out as any)[cur.key] = (out as any)[cur.key] ? `${(out as any)[cur.key]}\n${chunk}` : chunk;
-  }
-  return out;
-}
-
 function isApprovedLike(row: KyRow | null): boolean {
   if (!row) return false;
   const a = (row as any)?.approved_at;
@@ -303,11 +262,7 @@ export default function KyEditClient() {
       if (!ky) throw new Error("KYが見つかりません");
 
       // ✅ lat/lon を取得
-      const { data: proj, error: projErr } = await supabase
-        .from("projects")
-        .select("id,name,lat,lon")
-        .eq("id", projectId)
-        .maybeSingle();
+      const { data: proj, error: projErr } = await supabase.from("projects").select("id,name,lat,lon").eq("id", projectId).maybeSingle();
       if (projErr) throw projErr;
 
       setRow(ky as any);
@@ -341,6 +296,7 @@ export default function KyEditClient() {
     load();
   }, [load]);
 
+  // ✅ 修正版：APIの戻り値（ai_*）を正しく読む＋空で上書きして全消ししない
   const onRegenerateAi = useCallback(async () => {
     if (isApprovedLike(row)) {
       setStatus({ type: "error", text: "承認済みのため、AI補足の再生成はできません。" });
@@ -374,6 +330,7 @@ export default function KyEditClient() {
         hazards: (hazards ?? "").trim() ? (hazards ?? "").trim() : null,
         countermeasures: (countermeasures ?? "").trim() ? (countermeasures ?? "").trim() : null,
         third_party_level: third ? third : null,
+        worker_count: null, // 編集画面に無ければnullでOK（APIがあれば使う）
         weather_slots: slotsForAi.length ? slotsForAi : null,
         lat,
         lon,
@@ -395,13 +352,20 @@ export default function KyEditClient() {
       const j = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(j?.error || "AI補足生成に失敗しました");
 
-      const combined = normalizeText(s(j?.ai_supplement));
-      const split = splitAiCombined(combined);
+      const nextWork = normalizeText(s(j?.ai_work_detail));
+      const nextHaz = normalizeText(s(j?.ai_hazards));
+      const nextCtr = normalizeText(s(j?.ai_countermeasures));
+      const nextThird = normalizeText(s(j?.ai_third_party));
 
-      setAiWork(normalizeText(split.work));
-      setAiHazards(normalizeText(split.hazards));
-      setAiCounter(normalizeText(split.countermeasures));
-      setAiThird(normalizeText(split.third));
+      // ✅ 空で上書きしない（全消し防止）
+      if (nextWork) setAiWork(nextWork);
+      if (nextHaz) setAiHazards(nextHaz);
+      if (nextCtr) setAiCounter(nextCtr);
+      if (nextThird) setAiThird(nextThird);
+
+      if (!nextWork && !nextHaz && !nextCtr && !nextThird) {
+        throw new Error("AI補足の返却が空でした（API応答を確認してください）");
+      }
 
       setStatus({ type: "success", text: "AI補足を再生成しました（未保存）" });
     } catch (e: any) {
