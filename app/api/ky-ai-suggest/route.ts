@@ -58,7 +58,12 @@ export async function POST(req: Request) {
     const input: any[] = [
       {
         role: "user",
-        content: [{ type: "text", text: prompt }],
+        content: [
+          {
+            type: "input_text",
+            text: prompt,
+          },
+        ],
       },
     ];
 
@@ -67,7 +72,9 @@ export async function POST(req: Request) {
     for (const url of images) {
       input[0].content.push({
         type: "input_image",
-        image_url: url,
+        image_url: {
+          url: url,
+        },
       });
     }
 
@@ -90,6 +97,7 @@ export async function POST(req: Request) {
     }
 
     const data = await response.json();
+
     const content =
       data?.output?.[0]?.content?.find((c: any) => c.type === "output_text")?.text || "";
 
