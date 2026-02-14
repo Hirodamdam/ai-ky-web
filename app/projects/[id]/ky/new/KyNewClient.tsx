@@ -88,7 +88,6 @@ function splitBullets(text: string): string[] {
     .split("\n")
     .map((x) => x.replace(/^\s*[・\-\*]\s*/, "").trim())
     .filter(Boolean);
-  // 文章が1行で長い場合はそのまま1項目扱い
   return lines.length ? lines : [t];
 }
 
@@ -102,7 +101,6 @@ function buildRiskItemsFromTexts(hazardsText: string, measuresText: string): Ris
   for (let i = 0; i < n; i++) {
     const hz = s(hazardLines[i] || "").replace(/^・\s*/, "").trim();
     const msRaw = s(measureLines[i] || "").replace(/^・\s*/, "").trim();
-    // 「（1）」などの番号を落として内容だけに
     const ms = msRaw.replace(/^\（?\(?\d+\)?\）?\s*/, "").trim();
     if (!hz && !ms) continue;
     items.push({
@@ -183,7 +181,7 @@ export default function KyNewClient() {
   const [aiCounter, setAiCounter] = useState<string>("");
   const [aiThird, setAiThird] = useState<string>("");
 
-  // AIリスク項目（レビューで使う前提：新規でも見せたい場合はここで表示）
+  // AIリスク項目
   const [aiRiskItems, setAiRiskItems] = useState<RiskItem[]>([]);
 
   // 初期読み込み：project / partner options / 前回写真
@@ -216,7 +214,7 @@ export default function KyNewClient() {
         }
       }
 
-      // ✅ 前回写真（代表=kind:slope / 通路=kind:path）を復活
+      // ✅ 前回写真（代表=kind:slope / 通路=kind:path）
       const { data: photos, error: photoErr } = await (supabase as any)
         .from("ky_photos")
         .select("kind,image_url,created_at")
@@ -224,25 +222,22 @@ export default function KyNewClient() {
         .order("created_at", { ascending: false })
         .limit(50);
 
-      if (photoErr) {
-        // 失敗しても画面は動かす
-        console.warn("[KyNew] ky_photos load failed", photoErr);
-      }
+      if (photoErr) console.warn("[KyNew] ky_photos load failed", photoErr);
 
       let prevRep = "";
-      let prevPath = "";
+      let prevPth = "";
       if (Array.isArray(photos)) {
         const rep = photos.find((p: any) => s(p?.kind) === "slope" && s(p?.image_url).trim());
         const pth = photos.find((p: any) => s(p?.kind) === "path" && s(p?.image_url).trim());
         prevRep = s(rep?.image_url).trim();
-        prevPath = s(pth?.image_url).trim();
+        prevPth = s(pth?.image_url).trim();
       }
 
       if (mountedRef.current) {
         setProject((proj as any) ?? null);
         setPartnerOptions(opts);
         setPrevRepresentativeUrl(prevRep);
-        setPrevPathUrl(prevPath);
+        setPrevPathUrl(prevPth);
       }
     } catch (e: any) {
       if (mountedRef.current) setStatus({ type: "error", text: e?.message ?? "読み込みに失敗しました" });
@@ -298,9 +293,11 @@ export default function KyNewClient() {
 
       if (mountedRef.current) {
         setWeatherSlots(slots);
-        // 初回：選択を9時に寄せる（存在すれば）
         const has9 = slots.some((x) => x.hour === 9);
         setSelectedSlotHour(has9 ? 9 : (slots[0]?.hour ?? null));
+
+        // ✅ 日付や再取得で「適用」は外す（誤保存防止）
+        setAppliedSlotHour(null);
       }
     } catch (e: any) {
       if (mountedRef.current) {
@@ -329,25 +326,29 @@ export default function KyNewClient() {
     setStatus({ type: "success", text: `気象を適用しました：${selectedSlotHour}時` });
   }, [selectedSlotHour]);
 
-  const uploadToStorage = useCallback(async (file: File, kind: "slope" | "path"): Promise<string> => {
-    const { data: sess } = await supabase.auth.getSession();
-    const accessToken = s(sess?.session?.access_token).trim();
-    if (!accessToken) throw new Error("ログインが必要です");
+  const uploadToStorage = useCallback(
+    async (file: File, kind: "slope" | "path"): Promise<string> => {
+      // セッション確認（念のため）
+      const { data: sess } = await supabase.auth.getSession();
+      const accessToken = s(sess?.session?.access_token).trim();
+      if (!accessToken) throw new Error("ログインが必要です");
 
-    const ext = extFromName(file.name);
-    const fileName = `${projectId}/${Date.now()}_${kind}.${ext}`;
+      const ext = extFromName(file.name);
+      const fileName = `${projectId}/${Date.now()}_${kind}.${ext}`;
 
-    const { data, error } = await (supabase as any).storage.from("ky-photos").upload(fileName, file, {
-      cacheControl: "3600",
-      upsert: true,
-    });
-    if (error) throw error;
+      const { data, error } = await (supabase as any).storage.from("ky-photos").upload(fileName, file, {
+        cacheControl: "3600",
+        upsert: true,
+      });
+      if (error) throw error;
 
-    const { data: pub } = (supabase as any).storage.from("ky-photos").getPublicUrl(data?.path);
-    const url = s(pub?.publicUrl).trim();
-    if (!url) throw new Error("写真URLが取得できませんでした");
-    return url;
-  }, [projectId]);
+      const { data: pub } = (supabase as any).storage.from("ky-photos").getPublicUrl(data?.path);
+      const url = s(pub?.publicUrl).trim();
+      if (!url) throw new Error("写真URLが取得できませんでした");
+      return url;
+    },
+    [projectId]
+  );
 
   const onPickSlopeFile = useCallback(() => {
     slopeFileRef.current?.click();
@@ -383,19 +384,19 @@ export default function KyNewClient() {
         slopeMode === "file" && slopeFile
           ? "(upload)"
           : slopeMode === "url"
-          ? (representativeUrlFromProject || "")
+          ? representativeUrlFromProject || ""
           : "";
       const pathNow =
         pathMode === "file" && pathFile
           ? "(upload)"
           : pathMode === "url"
-          ? (pathUrlFromProject || "")
+          ? pathUrlFromProject || ""
           : "";
 
       let slopeNowUrl = slopeNow;
       let pathNowUrl = pathNow;
 
-      // 生成時点でアップロードしてURL化（補足の精度を上げるため）
+      // 生成時点でアップロードしてURL化（精度UP）
       if (slopeMode === "file" && slopeFile) {
         setStatus({ type: null, text: "写真アップロード中（法面）..." });
         slopeNowUrl = await uploadToStorage(slopeFile, "slope");
@@ -444,7 +445,9 @@ export default function KyNewClient() {
       setAiThird(ai_third_party);
 
       // ai_risk_items が来れば優先、無ければhazards/countermeasuresから簡易生成
-      const items = Array.isArray(j?.ai_risk_items) ? j.ai_risk_items : buildRiskItemsFromTexts(ai_hazards, ai_countermeasures);
+      const items = Array.isArray(j?.ai_risk_items)
+        ? j.ai_risk_items
+        : buildRiskItemsFromTexts(ai_hazards, ai_countermeasures);
       setAiRiskItems(items);
 
       setStatus({ type: "success", text: "AI補足を生成しました（厳しめ）" });
@@ -586,7 +589,7 @@ export default function KyNewClient() {
     );
   }, [weatherSlots, selectedSlotHour, appliedSlotHour, onApplyWeather]);
 
-  // ✅ 保存（既存運用そのまま：ky-createへ送るwork_contentは後で修正が必要）
+  // ✅ 保存（ky-createのallowedに合わせる）
   const onSave = useCallback(async () => {
     setStatus({ type: null, text: "" });
 
@@ -605,43 +608,64 @@ export default function KyNewClient() {
       const accessToken = s(sess?.session?.access_token).trim();
       if (!accessToken) throw new Error("ログインが必要です（access tokenなし）");
 
-      let slopeSavedUrl: string | null = null;
-      let pathSavedUrl: string | null = null;
+      // ✅ 保存時にファイル選択ならアップロード（未アップロードなら）
+      let slopeNowUrl: string | null = null;
+      let pathNowUrl: string | null = null;
 
-      if (slopeNowUrlCached) slopeSavedUrl = slopeNowUrlCached;
+      if (slopeNowUrlCached) slopeNowUrl = slopeNowUrlCached;
       else {
-        if (slopeMode === "file" && slopeFile) slopeSavedUrl = await uploadToStorage(slopeFile, "slope");
-        else if (slopeMode === "url") slopeSavedUrl = representativeUrlFromProject || null;
+        if (slopeMode === "file" && slopeFile) slopeNowUrl = await uploadToStorage(slopeFile, "slope");
+        else if (slopeMode === "url") slopeNowUrl = representativeUrlFromProject || null;
       }
 
-      if (pathNowUrlCached) pathSavedUrl = pathNowUrlCached;
+      if (pathNowUrlCached) pathNowUrl = pathNowUrlCached;
       else {
-        if (pathMode === "file" && pathFile) pathSavedUrl = await uploadToStorage(pathFile, "path");
-        else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;
+        if (pathMode === "file" && pathFile) pathNowUrl = await uploadToStorage(pathFile, "path");
+        else if (pathMode === "url") pathNowUrl = pathUrlFromProject || null;
       }
 
+      const nowIso = new Date().toISOString();
+
+      // ✅ ky-createは work_content を保存する（work_detail は入らない）
+      // ✅ 気象は適用枠を weather_applied_* へ（運用仕様）
+      // ✅ 写真は photo_urls に集約（ky-create allowed）
       const createPayload: any = {
         project_id: projectId,
         work_date: workDate,
         partner_company_name: partnerCompanyName.trim(),
         worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
 
-        // ⚠️ ky-create / DB側のカラム差分は次ステップで直す（work_content vs work_detail）
         work_content: workDetail.trim(),
 
         hazards: hazards.trim() ? hazards.trim() : null,
         countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
         third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
 
-        weather_slots: appliedSlots && appliedSlots.length ? appliedSlots : null,
+        // 任意：全スロットも残す（後の検証に便利）
+        weather_slots: weatherSlots.length ? weatherSlots : null,
 
-        ai_work_detail: null,
+        // 正本：適用枠
+        weather_applied_slots: appliedSlots && appliedSlots.length ? appliedSlots : null,
+        weather_applied_at: appliedSlots && appliedSlots.length ? nowIso : null,
+
+        // 写真（将来スコアの元）
+        photo_urls: {
+          slope_now: slopeNowUrl,
+          path_now: pathNowUrl,
+          slope_prev: prevRepresentativeUrl || null,
+          path_prev: prevPathUrl || null,
+        },
+
+        // AI（生成済みなら保存）
+        ai_work_detail: aiWork.trim() ? aiWork.trim() : null,
         ai_hazards: aiHazards.trim() ? aiHazards.trim() : null,
         ai_countermeasures: aiCounter.trim() ? aiCounter.trim() : null,
         ai_third_party: aiThird.trim() ? aiThird.trim() : null,
 
+        // AI正本
         ai_risk_items: aiRiskItems.length ? aiRiskItems : null,
         ai_profile: "strict",
+        ai_generated_at: aiRiskItems.length ? nowIso : null,
       };
 
       const resp = await fetch("/api/ky-create", {
@@ -656,7 +680,8 @@ export default function KyNewClient() {
       const jr = await resp.json().catch(() => ({}));
       if (!resp.ok) throw new Error(jr?.error || jr?.detail || "保存に失敗しました");
 
-      const kyId = s(jr?.ky?.id || jr?.id).trim();
+      // ✅ ky-createの戻りは kyId
+      const kyId = s(jr?.kyId).trim();
       if (!kyId) throw new Error("kyIdが取得できませんでした");
 
       setStatus({ type: "success", text: "保存しました。レビューへ移動します..." });
@@ -676,6 +701,8 @@ export default function KyNewClient() {
     countermeasures,
     thirdPartyLevel,
     appliedSlots,
+    weatherSlots,
+    aiWork,
     aiHazards,
     aiCounter,
     aiThird,
@@ -689,6 +716,8 @@ export default function KyNewClient() {
     pathUrlFromProject,
     slopeNowUrlCached,
     pathNowUrlCached,
+    prevRepresentativeUrl,
+    prevPathUrl,
     uploadToStorage,
   ]);
 
@@ -797,7 +826,11 @@ export default function KyNewClient() {
       {renderWeatherBox()}
 
       {/* 写真：前回/今回 */}
-      {renderPhotoBox("法面写真", slopeNowUrlCached || (slopeMode === "url" ? representativeUrlFromProject : ""), prevRepresentativeUrl)}
+      {renderPhotoBox(
+        "法面写真",
+        slopeNowUrlCached || (slopeMode === "url" ? representativeUrlFromProject : ""),
+        prevRepresentativeUrl
+      )}
       {renderPhotoBox("通路写真", pathNowUrlCached || (pathMode === "url" ? pathUrlFromProject : ""), prevPathUrl)}
 
       {/* 写真入力 */}
@@ -841,8 +874,18 @@ export default function KyNewClient() {
 
             {slopeMode === "file" ? (
               <div className="space-y-2">
-                <input ref={slopeFileRef} type="file" accept="image/*" className="hidden" onChange={onSlopeFileChange} />
-                <button type="button" className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50" onClick={onPickSlopeFile}>
+                <input
+                  ref={slopeFileRef}
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={onSlopeFileChange}
+                />
+                <button
+                  type="button"
+                  className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+                  onClick={onPickSlopeFile}
+                >
                   写真を選択
                 </button>
                 <div className="text-xs text-slate-600 break-all">{slopeFileName || "（未選択）"}</div>
@@ -890,8 +933,18 @@ export default function KyNewClient() {
 
             {pathMode === "file" ? (
               <div className="space-y-2">
-                <input ref={pathFileRef} type="file" accept="image/*" className="hidden" onChange={onPathFileChange} />
-                <button type="button" className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50" onClick={onPickPathFile}>
+                <input
+                  ref={pathFileRef}
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={onPathFileChange}
+                />
+                <button
+                  type="button"
+                  className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+                  onClick={onPickPathFile}
+                >
                   写真を選択
                 </button>
                 <div className="text-xs text-slate-600 break-all">{pathFileName || "（未選択）"}</div>
@@ -951,9 +1004,7 @@ export default function KyNewClient() {
             AI補足を生成
           </button>
 
-          <div className="text-xs text-slate-500">
-            ※ 気象は「適用」した内容がAI補足に反映されます
-          </div>
+          <div className="text-xs text-slate-500">※ 気象は「適用」した内容がAI補足に反映されます</div>
         </div>
       </div>
 
@@ -1005,7 +1056,6 @@ export default function KyNewClient() {
           )}
         </div>
 
-        {/* 生成できていれば「対策」の箇条書きプレビュー（任意・書式変更しない範囲） */}
         {aiRiskItems.length ? (
           <div className="space-y-2">
             <div className="text-xs text-slate-600">（参考）AI対策 箇条書き</div>
@@ -1047,7 +1097,9 @@ export default function KyNewClient() {
           type="button"
           onClick={onSave}
           disabled={saving}
-          className={`rounded-lg px-4 py-2 text-sm text-white ${saving ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}
+          className={`rounded-lg px-4 py-2 text-sm text-white ${
+            saving ? "bg-slate-400" : "bg-black hover:bg-slate-900"
+          }`}
         >
           {saving ? "保存中..." : "保存"}
         </button>
