@@ -88,9 +88,13 @@ function bulletsFromItemsMeasures(items: RiskItem[]) {
   return items.map((x) => `・（${x.rank}）${x.countermeasure}`).join("\n");
 }
 
-// ✅ 箇条書き文字列（・）から配列へ復元（APIが ai_risk_items を返さない場合の互換）
+// ✅ "\\n" を実改行へ（¥n対策）
+function normalizeNewlines(text: string) {
+  return s(text).replace(/\r\n/g, "\n").replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").trim();
+}
+
 function parseBulletLines(text: string): string[] {
-  return s(text)
+  return normalizeNewlines(text)
     .split("\n")
     .map((x) => x.trim())
     .filter(Boolean)
@@ -98,19 +102,22 @@ function parseBulletLines(text: string): string[] {
     .filter(Boolean);
 }
 
-function rebuildRiskItemsFromTexts(aiHazardsText: string, aiCounterText: string): RiskItem[] {
+// ✅ ai_hazards / ai_countermeasures から ai_risk_items を復元
+function buildItemsFromTexts(aiHazardsText: string, aiCounterText: string): RiskItem[] {
   const hs = parseBulletLines(aiHazardsText);
   const csRaw = parseBulletLines(aiCounterText);
 
-  // 対策側に「（1）」等が混ざっていても消す
+  // 対策の先頭に（1）等が付いても剥がす
   const cs = csRaw.map((x) => x.replace(/^\(?\d+\)?\s*[）)]?\s*/, "").trim());
 
-  const n = Math.min(hs.length, cs.length, 5);
+  const n = Math.min(5, Math.max(hs.length, 0));
   const items: RiskItem[] = [];
   for (let i = 0; i < n; i++) {
+    const hazard = hs[i] || "";
+    if (!hazard) continue;
     items.push({
       rank: i + 1,
-      hazard: hs[i] || "",
+      hazard,
       countermeasure: cs[i] || "",
     });
   }
@@ -339,7 +346,7 @@ export default function KyNewClient() {
     [KY_PHOTO_BUCKET, projectId]
   );
 
-  // ✅ AI生成：/api/ky-ai-suggest（返却が配列でも文字列でも表示できるように互換対応）
+  // ✅ AI生成：レスポンスが揺れても「消えない」ように復元する
   const onGenerateAi = useCallback(async () => {
     setStatus({ type: null, text: "生成中..." });
     setAiGenerating(true);
@@ -348,41 +355,14 @@ export default function KyNewClient() {
       const w = workDetail.trim();
       if (!w) throw new Error("作業内容（必須）を入力してください");
 
-      // ✅ 気象（適用枠）を要約文字列で渡す（UIは変えない）
-      const weatherTextForAi =
-        appliedSlotObj ? `適用：${appliedSlotHour}時 / ${slotSummary(appliedSlotObj)}` : "";
-
-      // ✅ 写真URL（URLモードはそのまま渡せる。fileモードは未アップロードなので空でOK）
-      const slopeUrlForAi =
-        slopeNowUrlCached ||
-        (slopeMode === "url" ? (slopeUrlFromProject || "") : "");
-
-      const pathUrlForAi =
-        pathNowUrlCached ||
-        (pathMode === "url" ? (pathUrlFromProject || "") : "");
-
       const res = await fetch("/api/ky-ai-suggest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
         body: JSON.stringify({
-          // ✅ API側が拾えるように複数キーで送る（中身だけ強化）
           workContent: w,
-          work_detail: w,
-
-          // 参考入力（人の入力も渡す）
           hazardsText: hazards || "",
-          countermeasuresText: countermeasures || "",
-
-          // 第三者・作業員数・気象
           thirdPartyLevel: thirdPartyLevel || "",
-          worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
-          weather_text: weatherTextForAi,
-
-          // 写真（法面/通路）
-          photo_slope_url: slopeUrlForAi || "",
-          photo_path_url: pathUrlForAi || "",
-
           profile: aiProfile,
         }),
       });
@@ -390,74 +370,64 @@ export default function KyNewClient() {
       const j = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(j?.error || "AI補足生成に失敗しました");
 
-      // ✅ 1) 配列が返るならそれを正として採用
-      const itemsFromApi = Array.isArray(j?.ai_risk_items) ? (j.ai_risk_items as RiskItem[]) : [];
+      // ✅ まず文字列を正規化（¥n/\\n対策）
+      const hazText = normalizeNewlines(j?.ai_hazards ?? j?.hazards ?? j?.hazards_text ?? "");
+      const meaText = normalizeNewlines(j?.ai_countermeasures ?? j?.countermeasures ?? j?.countermeasures_text ?? "");
 
-      // ✅ 2) 文字列キー（ai_hazards/ai_countermeasures）が返るなら互換で復元
-      const hazardsText =
-        s(j?.ai_hazards || j?.aiHazards || j?.hazards || j?.hazards_text || "");
-      const counterText =
-        s(j?.ai_countermeasures || j?.aiCountermeasures || j?.countermeasures || j?.countermeasures_text || "");
+      // ✅ items は「配列優先」→ 無ければ文字列から復元
+      const apiItemsRaw = Array.isArray(j?.ai_risk_items) ? (j.ai_risk_items as any[]) : [];
+      let items: RiskItem[] = apiItemsRaw
+        .map((x, idx) => ({
+          rank: Number(x?.rank) || idx + 1,
+          hazard: s(x?.hazard).trim(),
+          countermeasure: s(x?.countermeasure).trim(),
+          score: x?.score,
+          tags: Array.isArray(x?.tags) ? x.tags : undefined,
+        }))
+        .filter((x) => x.hazard);
 
-      const itemsFallback =
-        !itemsFromApi.length && (hazardsText.trim() || counterText.trim())
-          ? rebuildRiskItemsFromTexts(hazardsText, counterText)
-          : [];
-
-      const finalItems = itemsFromApi.length ? itemsFromApi : itemsFallback;
-
-      setAiRiskItems(finalItems);
-
-      // 互換テキスト（保存用）
-      setAiHazards(hazardsText.trim() ? hazardsText : bulletsFromItemsHazards(finalItems));
-      setAiCounter(counterText.trim() ? counterText : bulletsFromItemsMeasures(finalItems));
-
-      // 第三者：APIが返すなら優先、無ければ従来のローカル文で補完
-      const thirdFromApi = s(j?.ai_third_party || j?.aiThirdParty || j?.third_party || j?.third_party_text || "");
-      if (thirdFromApi.trim()) {
-        setAiThird(thirdFromApi);
-      } else {
-        const third = (() => {
-          if (thirdPartyLevel === "多い") {
-            return [
-              "・誘導員を配置し、墓参者の動線を常時監視すること",
-              "・作業区画をコーン・バーで明確化し、立入規制を行うこと",
-              "・接近があれば作業を一時中断し、安全確保後に再開すること",
-            ].join("\n");
-          }
-          if (thirdPartyLevel === "少ない") {
-            return [
-              "・出入口付近に注意喚起表示を行い、声掛けを徹底すること",
-              "・接近時は作業を一時停止し、誘導して安全を確保すること",
-            ].join("\n");
-          }
-          return "";
-        })();
-        setAiThird(third);
+      if (!items.length) {
+        items = buildItemsFromTexts(hazText, meaText);
       }
+
+      // ✅ ここ重要：itemsが空なら「消さない」
+      if (!items.length) {
+        throw new Error("AIの出力が不十分でした（危険予知/対策が空）。もう一度生成してください。");
+      }
+
+      setAiRiskItems(items.slice(0, 5));
+
+      // 互換文字列（保存・レビュー用）
+      setAiHazards(hazText || bulletsFromItemsHazards(items));
+      setAiCounter(meaText || bulletsFromItemsMeasures(items));
+
+      // 第三者（ローカル固定）
+      const third = (() => {
+        if (thirdPartyLevel === "多い") {
+          return [
+            "・誘導員を配置し、墓参者の動線を常時監視すること",
+            "・作業区画をコーン・バーで明確化し、立入規制を行うこと",
+            "・接近があれば作業を一時中断し、安全確保後に再開すること",
+          ].join("\n");
+        }
+        if (thirdPartyLevel === "少ない") {
+          return [
+            "・出入口付近に注意喚起表示を行い、声掛けを徹底すること",
+            "・接近時は作業を一時停止し、誘導して安全を確保すること",
+          ].join("\n");
+        }
+        return "";
+      })();
+      setAiThird(third);
 
       setStatus({ type: "success", text: "AI補足を生成しました" });
     } catch (e: any) {
+      // ✅ エラー時に aiRiskItems を空にしない（消さない）
       setStatus({ type: "error", text: e?.message ?? "AI補足生成に失敗しました" });
     } finally {
       setAiGenerating(false);
     }
-  }, [
-    workDetail,
-    hazards,
-    countermeasures,
-    thirdPartyLevel,
-    aiProfile,
-    workerCount,
-    appliedSlotObj,
-    appliedSlotHour,
-    slopeMode,
-    pathMode,
-    slopeNowUrlCached,
-    pathNowUrlCached,
-    slopeUrlFromProject,
-    pathUrlFromProject,
-  ]);
+  }, [workDetail, hazards, thirdPartyLevel, aiProfile]);
 
   const WeatherCard = useCallback(({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) => {
     const isApplied = appliedHour != null && slot.hour === appliedHour;
@@ -770,7 +740,6 @@ export default function KyNewClient() {
         <div className="text-xs text-slate-500">※ 墓参者の多少に応じて、誘導・区画分離・声掛け等をAI補足に反映します。</div>
       </div>
 
-      {/* 写真（最小：URL or ファイル） */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
         <div className="text-sm font-semibold text-slate-800">写真（任意）</div>
 
