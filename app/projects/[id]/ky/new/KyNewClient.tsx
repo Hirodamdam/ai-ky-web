@@ -136,10 +136,7 @@ function slotSummary(slot: WeatherSlot | null | undefined): string {
 /** ===== 表示用整形（レビューと同じ） ===== */
 
 function normalizeLineBase(raw: string): string {
-  return raw
-    .replace(/^[•・\-*]\s*/, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  return raw.replace(/^[•・\-*]\s*/, "").replace(/\s+/g, " ").trim();
 }
 
 function stripGenericAccidentNote(x: string): string {
@@ -202,10 +199,7 @@ function formatHazardsForView5(text: string): string[] {
 
 function splitMeasuresLine(line: string): string[] {
   const t = line.trim();
-  const noLead = t
-    .replace(/^\s*\[\s*\d+\s*\]\s*/g, "")
-    .replace(/^\s*\d+[)\.]\s*/g, "")
-    .trim();
+  const noLead = t.replace(/^\s*\[\s*\d+\s*\]\s*/g, "").replace(/^\s*\d+[)\.]\s*/g, "").trim();
 
   const hasMulti = /\[\s*\d+\s*\]/.test(noLead);
   if (!hasMulti) return [noLead];
@@ -315,6 +309,10 @@ export default function KyNewClient() {
 
   const [aiGenerating, setAiGenerating] = useState(false);
 
+  // ✅ AI生成時にアップロード済みのURLをキャッシュ（保存時の二重アップ防止）
+  const [slopeNowUrlCached, setSlopeNowUrlCached] = useState<string>("");
+  const [pathNowUrlCached, setPathNowUrlCached] = useState<string>("");
+
   const KY_PHOTO_BUCKET = process.env.NEXT_PUBLIC_KY_PHOTO_BUCKET || "ky-photos";
 
   const slopeUrlFromProject = useMemo(() => s(project?.slope_camera_snapshot_url).trim(), [project?.slope_camera_snapshot_url]);
@@ -368,8 +366,9 @@ export default function KyNewClient() {
           const url = pickUrl(p);
           if (!url) continue;
 
-          if (!prevSlope && (kind === "slope" || kind === "法面" || kind === "slope_photo" || kind === "")) prevSlope = url;
-          if (!prevPath && (kind === "path" || kind === "通路" || kind === "path_photo" || kind === "")) prevPath = url;
+          // ✅ kind=="" を両方に入れる事故を避ける（空は採用しない）
+          if (!prevSlope && (kind === "slope" || kind === "法面" || kind === "slope_photo")) prevSlope = url;
+          if (!prevPath && (kind === "path" || kind === "通路" || kind === "path_photo")) prevPath = url;
 
           if (prevSlope && prevPath) break;
         }
@@ -475,6 +474,7 @@ export default function KyNewClient() {
     setSlopeMode("file");
     setSlopeFile(f);
     setSlopeFileName(f.name);
+    setSlopeNowUrlCached(""); // ✅ 切り替えたらキャッシュを破棄
   }, []);
 
   const onPathFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -484,6 +484,7 @@ export default function KyNewClient() {
     setPathMode("file");
     setPathFile(f);
     setPathFileName(f.name);
+    setPathNowUrlCached(""); // ✅ 切り替えたらキャッシュを破棄
   }, []);
 
   const uploadToStorage = useCallback(
@@ -513,11 +514,22 @@ export default function KyNewClient() {
     let slopeNowUrl: string | null = null;
     let pathNowUrl: string | null = null;
 
-    if (slopeMode === "url") slopeNowUrl = slopeUrlFromProject || null;
-    if (slopeMode === "file" && slopeFile) slopeNowUrl = await uploadToStorage(slopeFile, "slope");
+    // ✅ まずキャッシュがあればそれを使う
+    if (slopeNowUrlCached) slopeNowUrl = slopeNowUrlCached;
+    else {
+      if (slopeMode === "url") slopeNowUrl = slopeUrlFromProject || null;
+      if (slopeMode === "file" && slopeFile) slopeNowUrl = await uploadToStorage(slopeFile, "slope");
+    }
 
-    if (pathMode === "url") pathNowUrl = pathUrlFromProject || null;
-    if (pathMode === "file" && pathFile) pathNowUrl = await uploadToStorage(pathFile, "path");
+    if (pathNowUrlCached) pathNowUrl = pathNowUrlCached;
+    else {
+      if (pathMode === "url") pathNowUrl = pathUrlFromProject || null;
+      if (pathMode === "file" && pathFile) pathNowUrl = await uploadToStorage(pathFile, "path");
+    }
+
+    // ✅ AI生成で一度アップしたURLは保存時にも使えるようにキャッシュ
+    if (slopeNowUrl) setSlopeNowUrlCached(slopeNowUrl);
+    if (pathNowUrl) setPathNowUrlCached(pathNowUrl);
 
     const slotsForAi = (appliedSlots || []).map((x) => ({
       hour: x.hour,
@@ -566,6 +578,8 @@ export default function KyNewClient() {
     pathPrevUrl,
     project?.lat,
     project?.lon,
+    slopeNowUrlCached,
+    pathNowUrlCached,
   ]);
 
   const onGenerateAi = useCallback(async () => {
@@ -630,11 +644,18 @@ export default function KyNewClient() {
       let slopeSavedUrl: string | null = null;
       let pathSavedUrl: string | null = null;
 
-      if (slopeMode === "file" && slopeFile) slopeSavedUrl = await uploadToStorage(slopeFile, "slope");
-      else if (slopeMode === "url") slopeSavedUrl = slopeUrlFromProject || null;
+      // ✅ AI生成でアップ済みならそれを使う（重複アップ防止）
+      if (slopeNowUrlCached) slopeSavedUrl = slopeNowUrlCached;
+      else {
+        if (slopeMode === "file" && slopeFile) slopeSavedUrl = await uploadToStorage(slopeFile, "slope");
+        else if (slopeMode === "url") slopeSavedUrl = slopeUrlFromProject || null;
+      }
 
-      if (pathMode === "file" && pathFile) pathSavedUrl = await uploadToStorage(pathFile, "path");
-      else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;
+      if (pathNowUrlCached) pathSavedUrl = pathNowUrlCached;
+      else {
+        if (pathMode === "file" && pathFile) pathSavedUrl = await uploadToStorage(pathFile, "path");
+        else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;
+      }
 
       const insertPayload: any = {
         project_id: projectId,
@@ -701,12 +722,12 @@ export default function KyNewClient() {
         if (photoErr) throw photoErr;
       }
 
-      setStatus({ type: "success", text: "保存しました" });
-      router.push(`/projects/${projectId}/ky`);
+      setStatus({ type: "success", text: "保存しました（レビューへ移動）" });
+
+      // ✅ ここが正解：レビューへ移動（一覧へは戻さない）
+      router.push(`/projects/${projectId}/ky/${kyId}/review`);
       router.refresh();
-      setTimeout(() => {
-        window.location.href = `/projects/${projectId}/ky`;
-      }, 200);
+      return;
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "保存に失敗しました" });
     } finally {
@@ -734,6 +755,8 @@ export default function KyNewClient() {
     slopeUrlFromProject,
     pathUrlFromProject,
     workerCount,
+    slopeNowUrlCached,
+    pathNowUrlCached,
   ]);
 
   const WeatherCard = useCallback(({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) => {
@@ -928,7 +951,14 @@ export default function KyNewClient() {
         <div className="text-sm font-semibold text-slate-800">法面（定点）写真（任意）</div>
 
         <div className="flex items-center gap-2">
-          <button type="button" onClick={() => setSlopeMode("url")} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+          <button
+            type="button"
+            onClick={() => {
+              setSlopeMode("url");
+              setSlopeNowUrlCached(""); // ✅ 切り替えたらキャッシュ破棄
+            }}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+          >
             URLで使用
           </button>
 
@@ -940,7 +970,9 @@ export default function KyNewClient() {
         <input ref={slopeFileRef} type="file" accept="image/*" onChange={onSlopeFileChange} className="hidden" />
 
         <div className="mt-1 text-sm text-slate-700">
-          {slopeMode === "file" && slopeFileName
+          {slopeNowUrlCached
+            ? `アップロード済み（保存時も同じURLを使用）：${slopeNowUrlCached}`
+            : slopeMode === "file" && slopeFileName
             ? `選択中：${slopeFileName}`
             : slopeMode === "url"
             ? slopeUrlFromProject
@@ -960,7 +992,14 @@ export default function KyNewClient() {
         <div className="text-sm font-semibold text-slate-800">通路（定点）写真（任意）</div>
 
         <div className="flex items-center gap-2">
-          <button type="button" onClick={() => setPathMode("url")} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+          <button
+            type="button"
+            onClick={() => {
+              setPathMode("url");
+              setPathNowUrlCached(""); // ✅ 切り替えたらキャッシュ破棄
+            }}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+          >
             URLで使用
           </button>
 
@@ -972,7 +1011,9 @@ export default function KyNewClient() {
         <input ref={pathFileRef} type="file" accept="image/*" onChange={onPathFileChange} className="hidden" />
 
         <div className="mt-1 text-sm text-slate-700">
-          {pathMode === "file" && pathFileName
+          {pathNowUrlCached
+            ? `アップロード済み（保存時も同じURLを使用）：${pathNowUrlCached}`
+            : pathMode === "file" && pathFileName
             ? `選択中：${pathFileName}`
             : pathMode === "url"
             ? pathUrlFromProject
