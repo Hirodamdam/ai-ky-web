@@ -36,55 +36,42 @@ export async function POST(req: Request) {
     const prompt = `
 あなたは建設現場の安全管理（KY）の専門家です。
 
-【作業内容】
-${workContent}
-
-【気象条件】
+作業内容：${workContent}
 気温：${temperature}℃
 風速：${windSpeed}m/s
 風向：${windDir}
 降水量：${rain}mm
+第三者状況：${thirdParty}
 
-【第三者状況】
-${thirdParty}
-
-【写真比較指示】
 前回と今回の写真を比較し、
-・新たに発生した危険
-・改善された点
-・悪化した点
-を必ず危険予知へ反映してください。
+新たな危険や悪化点を反映してください。
 
 不足指摘は禁止。
-作業内容と気象条件を必ず反映してください。
 
-【出力形式】
 危険予知：
-・〇〇だから、〇〇が起こる
-（5項目以上）
+・〇〇だから、〇〇が起こる（5件以上）
 
 対策：
 ・（1）〇〇
-（危険予知と対応）
 `;
 
-    const userContent: any[] = [
-      { type: "text", text: prompt },
+    const input: any[] = [
+      {
+        role: "user",
+        content: [{ type: "text", text: prompt }],
+      },
     ];
 
-    if (representativeNow)
-      userContent.push({ type: "image_url", image_url: { url: representativeNow } });
+    const images = [representativeNow, representativePrev, pathNow, pathPrev].filter(Boolean);
 
-    if (representativePrev)
-      userContent.push({ type: "image_url", image_url: { url: representativePrev } });
+    for (const url of images) {
+      input[0].content.push({
+        type: "input_image",
+        image_url: url,
+      });
+    }
 
-    if (pathNow)
-      userContent.push({ type: "image_url", image_url: { url: pathNow } });
-
-    if (pathPrev)
-      userContent.push({ type: "image_url", image_url: { url: pathPrev } });
-
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -92,24 +79,22 @@ ${thirdParty}
       },
       body: JSON.stringify({
         model: "gpt-5.2",
-        messages: [
-          { role: "system", content: "建設現場KY専門AI。必ず箇条書きで出力。" },
-          { role: "user", content: userContent },
-        ],
+        input,
         temperature: 0.2,
       }),
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      return NextResponse.json({ error: "openai_error", detail: errText }, { status: 502 });
+      const err = await response.text();
+      return NextResponse.json({ error: "openai_error", detail: err }, { status: 502 });
     }
 
     const data = await response.json();
-    const content = s(data?.choices?.[0]?.message?.content).trim();
+    const content =
+      data?.output?.[0]?.content?.find((c: any) => c.type === "output_text")?.text || "";
 
     return NextResponse.json({
-      ai_text: content,
+      ai_text: content.trim(),
     });
   } catch (e: any) {
     return NextResponse.json(
