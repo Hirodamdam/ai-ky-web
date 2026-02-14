@@ -24,7 +24,8 @@ function nf(v: unknown): number | null {
   return Number.isFinite(x) ? x : null;
 }
 
-function normalizeNewlines(text: string): string {
+// ✅ string固定だとビルドで落ちるので unknown 受けにする（中で s() するため安全）
+function normalizeNewlines(text: unknown): string {
   return s(text).replace(/\r\n/g, "\n").replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").trim();
 }
 
@@ -42,7 +43,6 @@ function pickInput(body: Body) {
   const thirdPartyLevel = firstNonEmpty(body, ["thirdPartyLevel", "third_party_level", "thirdParty", "third_party"]);
   const profile = (firstNonEmpty(body, ["profile"]) || "strict").trim();
 
-  // 気象（将来拡張含む）
   const weather_text = firstNonEmpty(body, ["weather_text", "weatherText", "weather"]);
   const wbgt = nf((body as any)?.wbgt ?? (body as any)?.wbgt_c ?? (body as any)?.WBGT);
   const temperature_c = nf((body as any)?.temperature_c ?? (body as any)?.temp_c ?? (body as any)?.temperature);
@@ -50,7 +50,6 @@ function pickInput(body: Body) {
   const precipitation_mm = nf((body as any)?.precipitation_mm ?? (body as any)?.rain_mm ?? (body as any)?.precipitation);
   const wind_direction = firstNonEmpty(body, ["wind_direction", "windDirection", "wind_dir", "windDir"]);
 
-  // 写真（URLがあればVisionへ）
   const representative_photo_url = firstNonEmpty(body, ["representative_photo_url", "photo_url", "image_url", "representativeUrl"]);
   const prev_representative_url = firstNonEmpty(body, ["prev_representative_url", "prev_photo_url", "prev_image_url", "prevRepresentativeUrl"]);
   const path_photo_url = firstNonEmpty(body, ["path_photo_url", "pathUrl"]);
@@ -119,8 +118,6 @@ function buildUserInstruction(input: ReturnType<typeof pickInput>) {
     "  危険予知：\\n・...\\n・...\\n\\n対策：\\n・（1）...\\n・（2）...",
   ].join("\n");
 }
-
-// ---- OpenAI (Responses API) ----
 
 type OpenAIJson = {
   ai_risk_items: RiskItem[];
@@ -217,8 +214,6 @@ async function callOpenAIResponsesJson(args: {
       }
 
       const data = JSON.parse(text || "{}");
-
-      // Responses API の JSON は output_text ではなく output[].content[] に入る
       const out = Array.isArray(data?.output) ? data.output : [];
       const msg = out.find((x: any) => x?.type === "message") ?? out[0];
       const contentArr = Array.isArray(msg?.content) ? msg.content : [];
@@ -245,7 +240,6 @@ async function callOpenAIResponsesJson(args: {
   throw err;
 }
 
-// OpenAIが落ちても「表示が空」にならないための最小補完
 function fallbackItems(workContent: string): RiskItem[] {
   const base = [
     { hazard: "作業半径が重なるから、接触・巻き込まれが起こる", countermeasure: "誘導員配置・立入禁止範囲を明確化し、合図を統一する" },
@@ -272,13 +266,11 @@ export async function POST(req: Request) {
     const apiKey = process.env.OPENAI_API_KEY || "";
     if (!apiKey) return NextResponse.json({ error: "Missing env: OPENAI_API_KEY" }, { status: 500 });
 
-    // envに gpt-4o-mini が入っている前提でOK（Responses API対応）
     const model = (process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
 
     const instruction = buildUserInstruction(input);
 
     const images: string[] = [];
-    // 画像URLがHTTP(S)のときだけ入れる（空文字・不正URLは弾く）
     const addIfUrl = (u: string) => {
       const t = u.trim();
       if (!t) return;
@@ -295,7 +287,6 @@ export async function POST(req: Request) {
     try {
       obj = await callOpenAIResponsesJson({ apiKey, model, instruction, images });
     } catch (e: any) {
-      // OpenAIが落ちても「空」にしない
       const items = fallbackItems(input.workContent.trim());
       const ai_hazards = items.map((x) => `・${x.hazard}`).join("\n");
       const ai_countermeasures = items.map((x) => `・（${x.rank}）${x.countermeasure}`).join("\n");
@@ -327,7 +318,6 @@ export async function POST(req: Request) {
       }))
       .filter((it) => it.hazard && it.countermeasure);
 
-    // 8件に不足なら補完（失敗にしない）
     let items = cleaned.slice(0, 8);
     if (items.length < 8) {
       const fb = fallbackItems(input.workContent.trim());
@@ -338,13 +328,15 @@ export async function POST(req: Request) {
     }
     items = items.slice(0, 8).map((it, i) => ({ ...it, rank: i + 1 }));
 
-    const ai_hazards = normalizeNewlines(obj?.ai_hazards || items.map((x) => `・${x.hazard}`).join("\n"));
-    const ai_countermeasures = normalizeNewlines(obj?.ai_countermeasures || items.map((x) => `・（${x.rank}）${x.countermeasure}`).join("\n"));
+    const ai_hazards = normalizeNewlines((obj as any)?.ai_hazards || items.map((x) => `・${x.hazard}`).join("\n"));
+    const ai_countermeasures = normalizeNewlines(
+      (obj as any)?.ai_countermeasures || items.map((x) => `・（${x.rank}）${x.countermeasure}`).join("\n")
+    );
     const ai_text =
-      normalizeNewlines(obj?.ai_text) ||
+      normalizeNewlines((obj as any)?.ai_text) ||
       `危険予知：\n${ai_hazards}\n\n対策：\n${ai_countermeasures}`;
 
-    const ai_third_party = normalizeNewlines(obj?.ai_third_party || "");
+    const ai_third_party = normalizeNewlines((obj as any)?.ai_third_party || "");
 
     return NextResponse.json({
       ai_risk_items: items,
