@@ -81,47 +81,57 @@ function slotSummary(slot: WeatherSlot | null | undefined): string {
   return `${w} / 気温${t} / 風${wd} ${ws} / 降水${p}`;
 }
 
-function bulletsFromItemsHazards(items: RiskItem[]) {
-  return items.map((x) => `・${x.hazard}`).join("\n");
-}
-function bulletsFromItemsMeasures(items: RiskItem[]) {
-  return items.map((x) => `・（${x.rank}）${x.countermeasure}`).join("\n");
-}
+function parseAiTextToItems(aiText: string): { items: RiskItem[]; hazardsText: string; measuresText: string } {
+  const t = s(aiText).replace(/\r\n/g, "\n").trim();
+  if (!t) return { items: [], hazardsText: "", measuresText: "" };
 
-// ✅ "\\n" を実改行へ（¥n対策）
-function normalizeNewlines(text: string) {
-  return s(text).replace(/\r\n/g, "\n").replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").trim();
-}
+  // 期待フォーマット：
+  // 危険予知：\n・...\n\n対策：\n・（1）...
+  const hazardIdx = t.indexOf("危険予知");
+  const measureIdx = t.indexOf("対策");
 
-function parseBulletLines(text: string): string[] {
-  return normalizeNewlines(text)
+  let hazardsPart = t;
+  let measuresPart = "";
+
+  if (hazardIdx >= 0 && measureIdx > hazardIdx) {
+    hazardsPart = t.slice(hazardIdx, measureIdx).trim();
+    measuresPart = t.slice(measureIdx).trim();
+  } else if (measureIdx >= 0) {
+    // 対策だけ検出
+    measuresPart = t.slice(measureIdx).trim();
+    hazardsPart = t.slice(0, measureIdx).trim();
+  }
+
+  const hazardLines = hazardsPart
     .split("\n")
     .map((x) => x.trim())
-    .filter(Boolean)
-    .map((x) => x.replace(/^[-•・\s]+/, "").trim())
-    .filter(Boolean);
-}
+    .filter((x) => x.startsWith("・"));
 
-// ✅ ai_hazards / ai_countermeasures から ai_risk_items を復元
-function buildItemsFromTexts(aiHazardsText: string, aiCounterText: string): RiskItem[] {
-  const hs = parseBulletLines(aiHazardsText);
-  const csRaw = parseBulletLines(aiCounterText);
+  const measureLines = measuresPart
+    .split("\n")
+    .map((x) => x.trim())
+    .filter((x) => x.startsWith("・"));
 
-  // 対策の先頭に（1）等が付いても剥がす
-  const cs = csRaw.map((x) => x.replace(/^\(?\d+\)?\s*[）)]?\s*/, "").trim());
-
-  const n = Math.min(5, Math.max(hs.length, 0));
   const items: RiskItem[] = [];
+  const n = Math.max(hazardLines.length, measureLines.length);
+
   for (let i = 0; i < n; i++) {
-    const hazard = hs[i] || "";
-    if (!hazard) continue;
+    const hz = s(hazardLines[i] || "").replace(/^・\s*/, "").trim();
+    const msRaw = s(measureLines[i] || "").replace(/^・\s*/, "").trim();
+    // 「（1）」などの番号を落として内容だけに
+    const ms = msRaw.replace(/^\（?\(?\d+\)?\）?\s*/, "").trim();
+    if (!hz && !ms) continue;
     items.push({
       rank: i + 1,
-      hazard,
-      countermeasure: cs[i] || "",
+      hazard: hz || "（危険予知が取得できませんでした）",
+      countermeasure: ms || "（対策が取得できませんでした）",
     });
   }
-  return items;
+
+  const hazardsText = hazardLines.length ? hazardLines.join("\n") : "";
+  const measuresText = measureLines.length ? measureLines.join("\n") : "";
+
+  return { items, hazardsText, measuresText };
 }
 
 export default function KyNewClient() {
@@ -160,7 +170,7 @@ export default function KyNewClient() {
   const [selectedSlotHour, setSelectedSlotHour] = useState<9 | 12 | 15 | null>(null);
   const [appliedSlotHour, setAppliedSlotHour] = useState<9 | 12 | 15 | null>(null);
 
-  // 写真（最小構成）
+  // 写真（任意）
   const slopeFileRef = useRef<HTMLInputElement | null>(null);
   const pathFileRef = useRef<HTMLInputElement | null>(null);
   const [slopeMode, setSlopeMode] = useState<"url" | "file" | "none">("none");
@@ -172,11 +182,15 @@ export default function KyNewClient() {
   const [slopeNowUrlCached, setSlopeNowUrlCached] = useState<string>("");
   const [pathNowUrlCached, setPathNowUrlCached] = useState<string>("");
 
-  // AI（正本）
+  // 前回写真（比較用）
+  const [prevRepresentativeUrl, setPrevRepresentativeUrl] = useState<string>("");
+  const [prevPathUrl, setPrevPathUrl] = useState<string>("");
+
+  // AI（表示用）
   const [aiRiskItems, setAiRiskItems] = useState<RiskItem[]>([]);
   const [aiProfile] = useState<"strict" | "normal">("strict");
 
-  // 互換（旧カラム用）
+  // 互換（保存用）
   const [aiHazards, setAiHazards] = useState("");
   const [aiCounter, setAiCounter] = useState("");
   const [aiThird, setAiThird] = useState("");
@@ -184,7 +198,7 @@ export default function KyNewClient() {
 
   const KY_PHOTO_BUCKET = process.env.NEXT_PUBLIC_KY_PHOTO_BUCKET || "ky-photos";
 
-  const slopeUrlFromProject = useMemo(() => s(project?.slope_camera_snapshot_url).trim(), [project?.slope_camera_snapshot_url]);
+  const representativeUrlFromProject = useMemo(() => s(project?.slope_camera_snapshot_url).trim(), [project?.slope_camera_snapshot_url]);
   const pathUrlFromProject = useMemo(() => s(project?.path_camera_snapshot_url).trim(), [project?.path_camera_snapshot_url]);
 
   const fetchInitial = useCallback(async () => {
@@ -220,9 +234,33 @@ export default function KyNewClient() {
         }
       }
 
+      // ✅ 前回写真（代表=kind:slope / 通路=kind:path）を復活
+      const { data: photos, error: photoErr } = await (supabase as any)
+        .from("ky_photos")
+        .select("kind,image_url,created_at")
+        .eq("project_id", projectId)
+        .order("created_at", { ascending: false })
+        .limit(50);
+
+      if (photoErr) {
+        // 失敗しても画面は動かす
+        console.warn("[KyNew] ky_photos load failed", photoErr);
+      }
+
+      let prevRep = "";
+      let prevPath = "";
+      if (Array.isArray(photos)) {
+        const rep = photos.find((p: any) => s(p?.kind) === "slope" && s(p?.image_url).trim());
+        const pth = photos.find((p: any) => s(p?.kind) === "path" && s(p?.image_url).trim());
+        prevRep = s(rep?.image_url).trim();
+        prevPath = s(pth?.image_url).trim();
+      }
+
       if (mountedRef.current) {
         setProject((proj as any) ?? null);
         setPartnerOptions(opts);
+        setPrevRepresentativeUrl(prevRep);
+        setPrevPathUrl(prevPath);
       }
     } catch (e: any) {
       if (mountedRef.current) setStatus({ type: "error", text: e?.message ?? "読み込みに失敗しました" });
@@ -346,7 +384,7 @@ export default function KyNewClient() {
     [KY_PHOTO_BUCKET, projectId]
   );
 
-  // ✅ AI生成：レスポンスが揺れても「消えない」ように復元する
+  // ✅ AI生成：ChatGPT5.2（作業＋気象＋写真比較）
   const onGenerateAi = useCallback(async () => {
     setStatus({ type: null, text: "生成中..." });
     setAiGenerating(true);
@@ -355,53 +393,59 @@ export default function KyNewClient() {
       const w = workDetail.trim();
       if (!w) throw new Error("作業内容（必須）を入力してください");
 
+      // 今回写真URL（fileは未アップロードなので、URLモード/キャッシュのみAIへ渡す）
+      const representativeNowUrl =
+        slopeNowUrlCached ||
+        (slopeMode === "url" ? representativeUrlFromProject : "") ||
+        "";
+      const pathNowUrl =
+        pathNowUrlCached ||
+        (pathMode === "url" ? pathUrlFromProject : "") ||
+        "";
+
       const res = await fetch("/api/ky-ai-suggest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
         body: JSON.stringify({
           workContent: w,
-          hazardsText: hazards || "",
           thirdPartyLevel: thirdPartyLevel || "",
+          // 気象（適用中のスロット）
+          temperature_c: appliedSlotObj?.temperature_c ?? null,
+          wind_speed_ms: appliedSlotObj?.wind_speed_ms ?? null,
+          wind_direction: degToDirJp(appliedSlotObj?.wind_direction_deg) || "",
+          precipitation_mm: appliedSlotObj?.precipitation_mm ?? null,
+          weather_text: appliedSlotObj?.weather_text || "",
           profile: aiProfile,
+
+          // 写真（代表＝slope扱いを運用上の代表写真にする）
+          representative_photo_url: representativeNowUrl || null,
+          prev_representative_url: prevRepresentativeUrl || null,
+          path_photo_url: pathNowUrl || null,
+          prev_path_url: prevPathUrl || null,
+
+          // 手入力（参考）
+          hazardsText: hazards || "",
         }),
       });
 
       const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(j?.error || "AI補足生成に失敗しました");
+      if (!res.ok) throw new Error(j?.detail || j?.error || "AI補足生成に失敗しました");
 
-      // ✅ まず文字列を正規化（¥n/\\n対策）
-      const hazText = normalizeNewlines(j?.ai_hazards ?? j?.hazards ?? j?.hazards_text ?? "");
-      const meaText = normalizeNewlines(j?.ai_countermeasures ?? j?.countermeasures ?? j?.countermeasures_text ?? "");
+      // ✅ 新API：ai_textを受けて表示へ変換
+      const aiText = s(j?.ai_text).trim();
+      if (!aiText) throw new Error("AIの出力が空でした（ai_text empty）");
 
-      // ✅ items は「配列優先」→ 無ければ文字列から復元
-      const apiItemsRaw = Array.isArray(j?.ai_risk_items) ? (j.ai_risk_items as any[]) : [];
-      let items: RiskItem[] = apiItemsRaw
-        .map((x, idx) => ({
-          rank: Number(x?.rank) || idx + 1,
-          hazard: s(x?.hazard).trim(),
-          countermeasure: s(x?.countermeasure).trim(),
-          score: x?.score,
-          tags: Array.isArray(x?.tags) ? x.tags : undefined,
-        }))
-        .filter((x) => x.hazard);
+      const parsed = parseAiTextToItems(aiText);
+      const items = parsed.items.length ? parsed.items : [];
 
-      if (!items.length) {
-        items = buildItemsFromTexts(hazText, meaText);
-      }
+      setAiRiskItems(items);
 
-      // ✅ ここ重要：itemsが空なら「消さない」
-      if (!items.length) {
-        throw new Error("AIの出力が不十分でした（危険予知/対策が空）。もう一度生成してください。");
-      }
+      // 互換保存用（箇条書きを維持）
+      setAiHazards(parsed.hazardsText || aiText);
+      setAiCounter(parsed.measuresText || "");
 
-      setAiRiskItems(items.slice(0, 5));
-
-      // 互換文字列（保存・レビュー用）
-      setAiHazards(hazText || bulletsFromItemsHazards(items));
-      setAiCounter(meaText || bulletsFromItemsMeasures(items));
-
-      // 第三者（ローカル固定）
+      // 第三者（固定補足は維持：今の運用どおり）
       const third = (() => {
         if (thirdPartyLevel === "多い") {
           return [
@@ -422,12 +466,25 @@ export default function KyNewClient() {
 
       setStatus({ type: "success", text: "AI補足を生成しました" });
     } catch (e: any) {
-      // ✅ エラー時に aiRiskItems を空にしない（消さない）
       setStatus({ type: "error", text: e?.message ?? "AI補足生成に失敗しました" });
     } finally {
       setAiGenerating(false);
     }
-  }, [workDetail, hazards, thirdPartyLevel, aiProfile]);
+  }, [
+    workDetail,
+    hazards,
+    thirdPartyLevel,
+    aiProfile,
+    appliedSlotObj,
+    slopeMode,
+    pathMode,
+    slopeNowUrlCached,
+    pathNowUrlCached,
+    representativeUrlFromProject,
+    pathUrlFromProject,
+    prevRepresentativeUrl,
+    prevPathUrl,
+  ]);
 
   const WeatherCard = useCallback(({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) => {
     const isApplied = appliedHour != null && slot.hour === appliedHour;
@@ -450,7 +507,7 @@ export default function KyNewClient() {
     );
   }, []);
 
-  // ✅ 保存：/api/ky-create 経由（kyIdを受け取ってレビューへ）
+  // ✅ 保存（既存運用そのまま：ky-createへ送るwork_contentは後で修正が必要）
   const onSave = useCallback(async () => {
     setStatus({ type: null, text: "" });
 
@@ -475,7 +532,7 @@ export default function KyNewClient() {
       if (slopeNowUrlCached) slopeSavedUrl = slopeNowUrlCached;
       else {
         if (slopeMode === "file" && slopeFile) slopeSavedUrl = await uploadToStorage(slopeFile, "slope");
-        else if (slopeMode === "url") slopeSavedUrl = slopeUrlFromProject || null;
+        else if (slopeMode === "url") slopeSavedUrl = representativeUrlFromProject || null;
       }
 
       if (pathNowUrlCached) pathSavedUrl = pathNowUrlCached;
@@ -488,10 +545,11 @@ export default function KyNewClient() {
         project_id: projectId,
         work_date: workDate,
         partner_company_name: partnerCompanyName.trim(),
-
         worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
 
+        // ⚠️ ky-create / DB側のカラム差分は次ステップで直す（work_content vs work_detail）
         work_content: workDetail.trim(),
+
         hazards: hazards.trim() ? hazards.trim() : null,
         countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
         third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
@@ -503,7 +561,7 @@ export default function KyNewClient() {
         ai_countermeasures: aiCounter.trim() ? aiCounter.trim() : null,
         ai_third_party: aiThird.trim() ? aiThird.trim() : null,
 
-        ai_risk_items: aiRiskItems.length ? aiRiskItems.slice(0, 5) : null,
+        ai_risk_items: aiRiskItems.length ? aiRiskItems : null,
         ai_profile: "strict",
       };
 
@@ -576,7 +634,7 @@ export default function KyNewClient() {
     slopeFile,
     pathFile,
     uploadToStorage,
-    slopeUrlFromProject,
+    representativeUrlFromProject,
     pathUrlFromProject,
     slopeNowUrlCached,
     pathNowUrlCached,
@@ -740,45 +798,82 @@ export default function KyNewClient() {
         <div className="text-xs text-slate-500">※ 墓参者の多少に応じて、誘導・区画分離・声掛け等をAI補足に反映します。</div>
       </div>
 
+      {/* 写真 */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
         <div className="text-sm font-semibold text-slate-800">写真（任意）</div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="space-y-2">
-            <div className="text-xs text-slate-600">法面（今回）</div>
+            <div className="text-xs text-slate-600">代表的な現場写真（今回）</div>
             <div className="flex gap-2 flex-wrap">
-              <button type="button" onClick={() => { setSlopeMode("url"); setSlopeFile(null); setSlopeFileName(""); }} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+              <button
+                type="button"
+                onClick={() => {
+                  setSlopeMode("url");
+                  setSlopeFile(null);
+                  setSlopeFileName("");
+                }}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+              >
                 定点URLを使う
               </button>
               <button type="button" onClick={onPickSlopeFile} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
                 ファイル選択
               </button>
-              <button type="button" onClick={() => { setSlopeMode("none"); setSlopeFile(null); setSlopeFileName(""); setSlopeNowUrlCached(""); }} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+              <button
+                type="button"
+                onClick={() => {
+                  setSlopeMode("none");
+                  setSlopeFile(null);
+                  setSlopeFileName("");
+                  setSlopeNowUrlCached("");
+                }}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+              >
                 なし
               </button>
             </div>
             <div className="text-xs text-slate-500">
-              {slopeMode === "url" ? `URL：${slopeUrlFromProject || "（未設定）"}` : slopeMode === "file" ? `ファイル：${slopeFileName}` : "（なし）"}
+              {slopeMode === "url" ? `URL：${representativeUrlFromProject || "（未設定）"}` : slopeMode === "file" ? `ファイル：${slopeFileName}` : "（なし）"}
             </div>
+            {prevRepresentativeUrl && <div className="text-xs text-slate-500">前回URL：{prevRepresentativeUrl}</div>}
             <input ref={slopeFileRef} type="file" accept="image/*" className="hidden" onChange={onSlopeFileChange} />
           </div>
 
           <div className="space-y-2">
             <div className="text-xs text-slate-600">通路（今回）</div>
             <div className="flex gap-2 flex-wrap">
-              <button type="button" onClick={() => { setPathMode("url"); setPathFile(null); setPathFileName(""); }} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+              <button
+                type="button"
+                onClick={() => {
+                  setPathMode("url");
+                  setPathFile(null);
+                  setPathFileName("");
+                }}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+              >
                 定点URLを使う
               </button>
               <button type="button" onClick={onPickPathFile} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
                 ファイル選択
               </button>
-              <button type="button" onClick={() => { setPathMode("none"); setPathFile(null); setPathFileName(""); setPathNowUrlCached(""); }} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+              <button
+                type="button"
+                onClick={() => {
+                  setPathMode("none");
+                  setPathFile(null);
+                  setPathFileName("");
+                  setPathNowUrlCached("");
+                }}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+              >
                 なし
               </button>
             </div>
             <div className="text-xs text-slate-500">
               {pathMode === "url" ? `URL：${pathUrlFromProject || "（未設定）"}` : pathMode === "file" ? `ファイル：${pathFileName}` : "（なし）"}
             </div>
+            {prevPathUrl && <div className="text-xs text-slate-500">前回URL：{prevPathUrl}</div>}
             <input ref={pathFileRef} type="file" accept="image/*" className="hidden" onChange={onPathFileChange} />
           </div>
         </div>
@@ -791,18 +886,20 @@ export default function KyNewClient() {
             type="button"
             onClick={onGenerateAi}
             disabled={aiGenerating}
-            className={`rounded-lg border px-3 py-2 text-sm ${aiGenerating ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
+            className={`rounded-lg border px-3 py-2 text-sm ${
+              aiGenerating ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
+            }`}
           >
             {aiGenerating ? "生成中..." : "AI補足を生成"}
           </button>
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">危険予知の補足（上位5・リスク順）</div>
+          <div className="text-xs text-slate-600">危険予知の補足（上位・リスク順）</div>
           {aiRiskItems.length ? (
             <div className="rounded-lg border border-slate-300 bg-white p-3">
               <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {aiRiskItems.slice(0, 5).map((x) => (
+                {aiRiskItems.map((x) => (
                   <li key={`h-${x.rank}`}>{x.hazard}</li>
                 ))}
               </ul>
@@ -817,7 +914,7 @@ export default function KyNewClient() {
           {aiRiskItems.length ? (
             <div className="rounded-lg border border-slate-300 bg-white p-3">
               <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {aiRiskItems.slice(0, 5).map((x) => (
+                {aiRiskItems.map((x) => (
                   <li key={`m-${x.rank}`}>
                     <span className="font-semibold">（{x.rank}）</span>
                     {x.countermeasure}
