@@ -366,13 +366,7 @@ type ProcessOptions = {
 };
 
 function processAiLines(aiText: string | null | undefined, opts: ProcessOptions = Array.isArray(aiText) ? {} : {}) {
-  const {
-    humanText = "",
-    similarityThreshold = 0.72,
-    topN = 5,
-    alignKeywords = [],
-    alignBonus = 2,
-  } = opts;
+  const { humanText = "", similarityThreshold = 0.72, topN = 5, alignKeywords = [], alignBonus = 2 } = opts;
 
   const humanLines = uniqExact(splitLines(humanText));
   const aiLines = uniqExact(splitLines(aiText));
@@ -1007,10 +1001,6 @@ export default function KyReviewClient() {
     return processAiLines(ky?.ai_third_party, { humanText: humanAllForAi, topN: 5, similarityThreshold: 0.72 });
   }, [ky?.ai_third_party, humanAllForAi]);
 
-  const workTop = useMemo(() => {
-    return processAiLines(ky?.ai_work_detail, { humanText: humanAllForAi, topN: 5, similarityThreshold: 0.72 });
-  }, [ky?.ai_work_detail, humanAllForAi]);
-
   if (loading) {
     return (
       <div className="p-4">
@@ -1436,10 +1426,7 @@ export default function KyReviewClient() {
           </button>
         </div>
 
-        <div className="space-y-2 print-avoid-break">
-          <div className="text-xs text-slate-600">作業内容の補足（上位5）</div>
-          <div className="rounded-lg border border-slate-300 bg-white p-3">{renderBullets(workTop) ?? <div className="text-sm text-slate-600">（なし）</div>}</div>
-        </div>
+        {/* ✅ 仕様：作業内容のAI補足は表示しない */}
 
         <div className="space-y-2 print-avoid-break">
           <div className="text-xs text-slate-600">危険予知の補足（上位5：番号なし）</div>

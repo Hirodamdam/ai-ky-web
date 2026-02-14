@@ -64,7 +64,7 @@ function analyzeWeather(slots: WeatherSlot[] | null | undefined): WeatherRisk {
   const flags: string[] = [];
   const hints: string[] = [];
 
-  // ✅ しきい値は「厳しめ」寄り（注意喚起を強く出す）
+  // ✅ しきい値は「厳しめ」寄り
   if (maxWind != null && maxWind >= 10) {
     flags.push("強風");
     hints.push("強風の恐れ：飛散・転倒（養生固定、資材整理、立入規制）");
@@ -159,7 +159,7 @@ function ensureCausal(line: string): { ok: boolean; fixed: string } {
   const t = (line || "").trim();
   if (!t) return { ok: false, fixed: "" };
 
-  // ✅ 例：『○○だから → ○○が起こる恐れ』を必須化
+  // ✅ 例：『○○だから → ○○が起こる恐れ/可能性』を必須化
   const ok =
     /だから\s*→\s*.+(恐れ|可能性)/.test(t) ||
     /ため\s*→\s*.+(恐れ|可能性)/.test(t) ||
@@ -167,13 +167,13 @@ function ensureCausal(line: string): { ok: boolean; fixed: string } {
 
   if (ok) return { ok: true, fixed: t };
 
-  // 既存文を「因果」に寄せる（断定は禁止 → 恐れ/可能性に統一）
+  // 既存文を「因果」に寄せる（断定禁止 → 恐れ/可能性）
   const fixed = `${t} だから → 不安全行動/事故につながる恐れ`;
   return { ok: false, fixed };
 }
 
 function normalizeProbabilistic(text: string) {
-  // 断定を避けたい（現場文書）：強すぎる断定語を弱める
+  // ✅ 現場文書：断定を弱める（ただし「→」の形式は壊さない）
   return (text || "")
     .replace(/必ず(?!\s*→)/g, "可能性がある")
     .replace(/絶対/g, "恐れがある")
@@ -192,14 +192,12 @@ function buildFallbackHazards(opts: {
 }): string[] {
   const items: string[] = [];
 
-  // 法面
   if (opts.hasSlope) {
     items.push("法面での作業がある だから → 浮石/崩土で転倒・落石が起こる恐れ");
     items.push("法面で足場が不安定になりやすい だから → 滑落・墜落が起こる恐れ");
     items.push("湧水/泥濘の変化に気づきにくい だから → 小崩落に巻き込まれる恐れ");
   }
 
-  // 重機（汎用）
   if (opts.hasHeavy) {
     items.push("重機の旋回半径内に人が入り得る だから → 接触・挟まれが起こる恐れ");
     items.push("吊荷/積載物が揺れやすい だから → 落下・飛来が起こる恐れ");
@@ -207,7 +205,6 @@ function buildFallbackHazards(opts: {
     items.push("資材運搬や手作業で姿勢が崩れやすい だから → 腰痛悪化・転倒が起こる恐れ");
   }
 
-  // 天候
   if (opts.weatherFlags.includes("雨") || opts.weatherFlags.includes("小雨")) {
     items.push("降雨で路面・法面が滑りやすい だから → 転倒・滑落が起こる恐れ");
     items.push("雨で視界や足元確認が甘くなる だから → つまずき・接触が起こる恐れ");
@@ -222,7 +219,6 @@ function buildFallbackHazards(opts: {
     items.push("高温で疲労・脱水が出やすい だから → 判断低下で事故が起こる恐れ");
   }
 
-  // 墓参者（第三者）
   if (opts.thirdPartyLevel === "多い") {
     items.push("墓参者が作業帯に接近し得る だから → 接触・転倒に巻き込む恐れ");
     items.push("説明不足で立入が発生し得る だから → 立入事故が起こる恐れ");
@@ -230,31 +226,23 @@ function buildFallbackHazards(opts: {
     items.push("第三者が少なくても突発的に接近し得る だから → 接触事故が起こる恐れ");
   }
 
-  // 作業員数
   if (opts.workerCount != null && opts.workerCount >= 6) {
     items.push("作業員数が多く同時作業になりやすい だから → 合図不統一で接触が起こる恐れ");
     items.push("人の動線が交錯しやすい だから → つまずき・転倒が起こる恐れ");
   }
 
-  // 写真差分
   if (opts.hasPhotoNotes) {
     items.push("現況変化の見落としが起こり得る だから → 不意の段差/滑りで転倒が起こる恐れ");
   }
 
-  // 最後の保険
   items.push("慣れで指差呼称が省略されやすい だから → 取り違え・誤操作が起こる恐れ");
 
-  // 重複を軽く排除
   const uniq: string[] = [];
-  for (const x of items) {
-    if (!uniq.some((u) => u === x)) uniq.push(x);
-  }
+  for (const x of items) if (!uniq.includes(x)) uniq.push(x);
   return uniq;
 }
 
 function buildFallbackCounter(hazardLine: string) {
-  // hazardLine は「○○だから → ○○が起こる恐れ」
-  // 対策は短文で「恐れを下げる行動」
   if (/墜落|滑落/.test(hazardLine)) return "足場/歩行帯を確保し、親綱/墜落制止用器具の使用を徹底する";
   if (/崩土|崩落|落石|浮石/.test(hazardLine)) return "法面の変状（浮石/クラック/湧水）を事前巡視し、危険時は立入禁止・作業中止とする";
   if (/挟まれ|接触/.test(hazardLine)) return "重機旋回/作業半径を区画し、合図者を固定して合図統一・立入管理を行う";
@@ -271,9 +259,8 @@ type AiOut = {
   ai_hazards: string; // 8-12 / 因果
   ai_countermeasures: string; // 1:1
   ai_third_party: string; // 4+
-  // 追加（フロント未対応でもOK）
   ai_meta?: string;
-  ai_risk_add?: number; // 不足ほど加点 + 厳しめバイアス
+  ai_risk_add?: number;
   ai_counts?: {
     hazards_count: number;
     causal_ok_count: number;
@@ -297,19 +284,16 @@ export async function POST(req: Request) {
     const weatherRisk = analyzeWeather(weatherSlots);
     const photoNotes = analyzePhotoDiff(body);
 
-    // ✅ 現場条件（想定リスクに必ず織り込む）
-    const hasSlope = true; // 草牟田墓地法面の想定（一般化するなら project種別等で切替）
-    const hasHeavy = true; // 重機想定（一般化するなら入力や現場属性で切替）
+    // ✅ 現場条件（厳しめ）
+    const hasSlope = true;
+    const hasHeavy = true;
     const hasPhotoNotes = photoNotes.length > 0;
 
-    // ✅ 厳しめバイアス（係数）
-    // - 充実していても「安全」とは言わない
-    // - 不足は強く加点
-    const STRICT_BIAS_BASE = 10; // 常に最低これだけ上乗せ（見逃し防止）
-    const DEFICIT_POINT = 3; // 不足1つあたりの加点
+    // ✅ 厳しめバイアス
+    const STRICT_BIAS_BASE = 10;
+    const DEFICIT_POINT = 3;
 
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
     const model = process.env.KY_OPENAI_MODEL || process.env.OPENAI_MODEL || "gpt-4o-mini";
 
     const system = [
@@ -320,7 +304,7 @@ export async function POST(req: Request) {
       "【最重要ルール】",
       "1) ai_hazards：必ず8〜12項目。各項目は必ず『〇〇だから → 〇〇が起こる恐れ/可能性』の因果形式。",
       "2) ai_countermeasures：ai_hazardsと1対1対応。項目数を一致させ、対応関係が分かるように [1] [2]… を付与。",
-      "3) ai_third_party：第三者（墓参者）対策を別枠で最低4項目。『誘導』『区画（立入規制/動線分離）』『声掛け』『作業中断/停止』を優先。",
+      "3) ai_third_party：第三者（墓参者）対策を別枠で最低4項目。『誘導』『区画（立入規制/動線分離）』『声掛け』『作業停止』を優先。",
       "4) 現場条件（法面・重機・墓参者・天候・作業員数）を“想定リスク”として必ず織り込む。",
       "5) 生成内容は“厳しめ”に。見逃し防止の観点で、起こり得る不具合を優先的に抽出する。",
       "",
@@ -366,7 +350,7 @@ export async function POST(req: Request) {
 
     const completion = await client.chat.completions.create({
       model,
-      temperature: 0.15, // ✅ 厳しめ：ブレを抑えて確実に形式を守らせる
+      temperature: 0.15,
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: system },
@@ -385,12 +369,8 @@ export async function POST(req: Request) {
 
     // --- 正規化（断定回避） ---
     let workOut = normalizeProbabilistic(rawWork);
-
-    // hazards
     let hazLines = splitLines(normalizeProbabilistic(rawHaz));
-    // counter
     let ctrLines = splitLines(normalizeProbabilistic(rawCtr));
-    // third party
     let thirdLines = splitLines(normalizeProbabilistic(rawThird));
 
     // --- hazards: 因果形式強制 ---
@@ -413,22 +393,20 @@ export async function POST(req: Request) {
       hasPhotoNotes,
     }).map((x) => normalizeProbabilistic(x));
 
-    // 重複除去しつつ補充
     const hazUniq: string[] = [];
     for (const x of hazLines) {
       const t = x.trim();
       if (!t) continue;
-      if (!hazUniq.some((u) => u === t)) hazUniq.push(t);
+      if (!hazUniq.includes(t)) hazUniq.push(t);
     }
     for (const x of fallbackHaz) {
       if (hazUniq.length >= 12) break;
-      if (!hazUniq.some((u) => u === x)) hazUniq.push(x);
+      if (!hazUniq.includes(x)) hazUniq.push(x);
     }
-    // まだ足りない場合の保険
     while (hazUniq.length < 8) {
       hazUniq.push("指示の伝達が曖昧になり得る だから → 手順逸脱で事故が起こる恐れ");
     }
-    // 上限
+
     const hazardsFinal = hazUniq.slice(0, 12);
 
     // 因果成立数を再計測（補完分含む）
@@ -441,7 +419,6 @@ export async function POST(req: Request) {
     }
 
     // --- counter: 1対1対応を強制 ---
-    // 形式：'- [1] ...' を想定。無ければ順序で合わせる。
     const ctrMap = new Map<number, string>();
     const ctrRest: string[] = [];
     for (const line of ctrLines) {
@@ -468,79 +445,67 @@ export async function POST(req: Request) {
     }
 
     // --- third party: 最低4、必須語を優先挿入 ---
-    const thirdNeed = ["誘導", "区画", "声掛け", "停止"];
     const thirdBase: string[] = [];
-
-    // 既存をユニーク化
     for (const x of thirdLines) {
       const t = x.trim();
       if (!t) continue;
-      if (!thirdBase.some((u) => u === t)) thirdBase.push(t);
+      if (!thirdBase.includes(t)) thirdBase.push(t);
     }
 
-    // 必須要素（不足を補う）
     const thirdFallback: string[] = [
       "誘導：入口〜作業帯の動線を明確化（案内/看板/誘導員）",
       "区画：コーン/バーで立入規制し、作業帯と動線を分離する",
-      "声掛け：接近時は作業を一時停止し、声掛け→安全確認後に再開する",
-      "停止：第三者が区画内に入った場合は重機/吊荷/手作業を停止する",
+      "声掛け：接近時は作業を停止し、声掛け→安全確認後に再開する",
+      "作業停止：第三者が区画内に入った場合は重機/吊荷/手作業を停止する",
       "掲示：注意喚起（工事中・足元注意）を見やすい位置に掲示する",
-      "夜間/薄暗い場合：照明を追加し、つまずきの恐れを下げる",
+      "薄暗い場合：照明を追加し、つまずきの恐れを下げる",
     ].map((x) => normalizeProbabilistic(x));
 
     for (const x of thirdFallback) {
       if (thirdBase.length >= 8) break;
-      if (!thirdBase.some((u) => u === x)) thirdBase.push(x);
+      if (!thirdBase.includes(x)) thirdBase.push(x);
     }
-    while (thirdBase.length < 4) {
-      thirdBase.push("第三者の接近が起こり得るため、区画と誘導を強化する");
-    }
+    while (thirdBase.length < 4) thirdBase.push("第三者の接近が起こり得るため、区画と誘導を強化する");
 
-    // 「多い」ならより強く（先頭寄せ）
     let thirdFinal = thirdBase.slice(0, 8);
     if (thirdPartyLevel === "多い") {
-      // 必須ワードが含まれないなら、先頭に差し込む（強制）
       const must: string[] = [];
       if (!thirdFinal.some((x) => x.includes("誘導"))) must.push("誘導：入口〜作業帯の動線を明確化（案内/看板/誘導員）");
       if (!thirdFinal.some((x) => x.includes("区画"))) must.push("区画：コーン/バーで立入規制し、動線分離を徹底する");
       if (!thirdFinal.some((x) => x.includes("声掛け"))) must.push("声掛け：接近時は作業停止→声掛け→安全確認後再開");
-      if (!thirdFinal.some((x) => x.includes("停止"))) must.push("停止：第三者が近接した場合は重機/吊荷を停止する");
+      if (!thirdFinal.some((x) => x.includes("停止"))) must.push("作業停止：第三者が近接した場合は重機/吊荷を停止する");
       thirdFinal = must.concat(thirdFinal).slice(0, 8);
     }
 
     // --- 想定リスク（work_detail）へ最低限織り込み（短く） ---
-    // ※「断定」禁止
     const assumedRisk: string[] = [];
-    assumedRisk.push(`法面作業があるため、滑落・落石・小崩落が起こる恐れ`);
-    assumedRisk.push(`重機作業があるため、接触・挟まれ・飛来が起こる恐れ`);
+    assumedRisk.push("法面作業があるため、滑落・落石・小崩落が起こる恐れ");
+    assumedRisk.push("重機作業があるため、接触・挟まれ・飛来が起こる恐れ");
     if (thirdPartyLevel) assumedRisk.push(`墓参者（第三者）が${thirdPartyLevel}ため、接近・立入が起こる恐れ`);
     if (weatherRisk.flags.length) assumedRisk.push(`気象（${weatherRisk.flags.join(" / ")}）により、滑り・飛散・崩落が起こる恐れ`);
     if (workerCount != null) assumedRisk.push(`作業員数${workerCount}名のため、同時作業で合図不統一が起こる恐れ`);
     if (photoNotes.length) assumedRisk.push("写真差分があるため、現況変化の見落としが起こる恐れ");
 
-    // 既存workOutが薄い場合でも、最低限は出す
     const workLines = splitLines(workOut);
     const workFinal = toBullet(
       [
         ...(workLines.length ? workLines : []),
         "【想定リスク（見逃し防止）】",
-        ...assumedRisk.map((x) => `・${x}`),
+        ...assumedRisk,
       ].slice(0, 18)
     );
 
-    // --- スコア化 → 不足ほどリスク加点（充実＝安全ではない） ---
+    // --- スコア化（不足ほど加点 + 常時厳しめ） ---
     const hazardsCount = causalFixedFinal.length;
     const thirdCount = thirdFinal.length;
     const counterCount = counterFinal.length;
 
     const deficitHaz = Math.max(0, 8 - hazardsCount);
-    const deficitCausal = Math.max(0, hazardsCount - causalOk); // 因果未成立ぶん
+    const deficitCausal = Math.max(0, hazardsCount - causalOk);
     const deficitPair = Math.max(0, hazardsCount - counterCount);
     const deficitThird = Math.max(0, 4 - thirdCount);
 
     const deficitTotal = deficitHaz + deficitCausal + deficitPair + deficitThird;
-
-    // ✅ 厳しめバイアス：常に基礎加点 + 不足に応じて増える
     const aiRiskAdd = STRICT_BIAS_BASE + deficitTotal * DEFICIT_POINT;
 
     const metaLines: string[] = [];
@@ -554,7 +519,7 @@ export async function POST(req: Request) {
     const out: AiOut = {
       ai_work_detail: workFinal || "",
       ai_hazards: toBullet(causalFixedFinal),
-      ai_countermeasures: toBullet(counterFinal.map((x) => x)), // '- [n] ...' 形式
+      ai_countermeasures: toBullet(counterFinal),
       ai_third_party: toBullet(thirdFinal),
       ai_meta: toBullet(metaLines),
       ai_risk_add: aiRiskAdd,

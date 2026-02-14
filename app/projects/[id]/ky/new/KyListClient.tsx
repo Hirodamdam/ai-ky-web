@@ -1,3 +1,4 @@
+// app/projects/[id]/ky/KyListClient.tsx
 "use client";
 
 import Link from "next/link";
@@ -41,7 +42,10 @@ function loadPartnerHistoryFromLS(): string[] {
 
 function savePartnerHistoryToLS(next: string[]) {
   try {
-    localStorage.setItem(LS_GLOBAL_PARTNER_HISTORY, JSON.stringify(next.slice(0, MAX_HISTORY)));
+    localStorage.setItem(
+      LS_GLOBAL_PARTNER_HISTORY,
+      JSON.stringify(next.slice(0, MAX_HISTORY))
+    );
   } catch {
     // noop
   }
@@ -59,7 +63,7 @@ function upsertHistory(current: string[], value: string): string[] {
 export default function KyListClient() {
   const params = useParams();
   const router = useRouter();
-  const projectId = String(params?.id ?? "");
+  const projectId = String((params as any)?.id ?? "");
 
   const [status, setStatus] = useState<Status>({ type: null, text: "" });
   const [saving, setSaving] = useState(false);
@@ -110,7 +114,11 @@ export default function KyListClient() {
         is_approved: false,
       };
 
-      const { data, error } = await supabase.from("ky_entries").insert(payload).select("id").single();
+      const { data, error } = await supabase
+        .from("ky_entries")
+        .insert(payload)
+        .select("id")
+        .single();
       if (error) throw error;
 
       // ✅ 横断履歴へ追加
@@ -118,14 +126,15 @@ export default function KyListClient() {
       savePartnerHistoryToLS(nextHistory);
       setPartnerHistory(nextHistory);
 
-      setStatus({ type: "success", text: "作成しました（一覧へ移動します）" });
-
-      // 一覧へ
       const newId = (data as any)?.id as string | undefined;
-      setTimeout(() => {
-        router.push(`/projects/${projectId}/ky`);
-        router.refresh();
-      }, 600);
+      if (!newId) throw new Error("作成に失敗しました（id不明）");
+
+      setStatus({ type: "success", text: "作成しました（新規作成へ移動します）" });
+
+      // ✅ 新規作成（詳細入力）へ移動（一覧へ戻さない）
+      router.push(`/projects/${projectId}/ky/${newId}/new`);
+      router.refresh();
+      return;
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "作成に失敗しました" });
     } finally {
@@ -241,7 +250,7 @@ export default function KyListClient() {
               }`}
               title={partnerMissing ? "協力会社が未入力です" : "作成"}
             >
-              作成
+              {saving ? "作成中..." : "作成"}
             </button>
 
             <div className="text-sm text-gray-600">
