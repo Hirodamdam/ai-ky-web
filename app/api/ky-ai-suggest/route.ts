@@ -35,34 +35,6 @@ function firstNonEmpty(body: Body, keys: string[]) {
   return "";
 }
 
-function parseBulletLines(text: string): string[] {
-  return s(text)
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean)
-    .map((x) => x.replace(/^[-•・\s]+/, "").trim())
-    .filter(Boolean);
-}
-
-function rebuildRiskItemsFromTexts(aiHazardsText: string, aiCounterText: string): RiskItem[] {
-  const hs = parseBulletLines(aiHazardsText);
-  const csRaw = parseBulletLines(aiCounterText);
-  const cs = csRaw.map((x) => x.replace(/^\(?\d+\)?\s*[）)]?\s*/, "").trim());
-
-  const n = Math.min(Math.max(hs.length, 0), 10);
-  const items: RiskItem[] = [];
-  for (let i = 0; i < n; i++) {
-    items.push({
-      rank: i + 1,
-      hazard: hs[i] || "",
-      countermeasure: cs[i] || "",
-    });
-  }
-  // hazardsだけある/対策だけあるケースの補正
-  // 対策が少ない場合は空で入れる（UIは表示できる）
-  return items.slice(0, 5).filter((x) => x.hazard);
-}
-
 type Flags = {
   height: boolean;
   lifting: boolean;
@@ -96,21 +68,20 @@ function inferFlags(work_detail: string, note: string): Flags {
 }
 
 function fallbackRiskItems(work_detail: string, third_party_level: string, flags: Flags): RiskItem[] {
-  // 最低5件を必ず返す。因果形式＆具体対策（雑になりすぎない範囲）
   const base: Array<{ h: string; m: string }> = [];
 
-  // 交通・第三者が絡む系（ガードレール設置などに強い）
+  // ガードレール設置工で頻出（交通・資材取回し）
   base.push({
-    h: "車両通行がある環境だから、作業員が車道側へ出て接触事故が起こる",
+    h: "車両の通行がある環境だから、作業員が車道側へ出て接触事故が起こる",
     m: "規制帯（コーン・バー）で作業域を確保し、誘導員を配置して接近車両を減速・停止誘導する",
   });
   base.push({
-    h: "資材（ガードレール・支柱）を手運び/取回すから、落下・挟まれで手指を負傷する",
-    m: "搬入経路を確保し、2人運搬・合図統一・手袋着用、仮置きは転倒しない向きで固定する",
+    h: "ガードレール・支柱を取回すから、落下・挟まれで手指を負傷する",
+    m: "2人運搬・合図統一・手袋着用、仮置きは転倒しない向きで固定し、手指を挟む位置に置かない",
   });
   base.push({
     h: "足元が不整地・段差になりやすいから、つまずき転倒して捻挫・打撲が起こる",
-    m: "作業前に足元整地、通路確保、資材の置き場を決めて散乱させない（5S）",
+    m: "作業前に足元整地、通路確保、資材置き場を決めて散乱させない（5S）",
   });
 
   if (flags.heavyMachine) {
@@ -125,24 +96,11 @@ function fallbackRiskItems(work_detail: string, third_party_level: string, flags
     });
   }
 
-  if (flags.lifting) {
-    base.push({
-      h: "吊荷作業があるから、吊荷下に入って落下・転倒災害が起こる",
-      m: "吊荷下立入禁止を徹底し、玉掛け点検・合図者統一・旋回範囲区画を行う",
-    });
-  } else if (flags.height) {
-    base.push({
-      h: "法面/段差に近い作業だから、足を滑らせて転落が起こる",
-      m: "法肩から離隔し、必要時は親綱・フルハーネス、立入規制で作業域を明確化する",
-    });
-  } else {
-    base.push({
-      h: "工具・資材を扱うから、飛来・落下で頭部を負傷する",
-      m: "ヘルメット着用、上部作業の有無確認、資材は安定した場所へ仮置きして転倒防止する",
-    });
-  }
+  base.push({
+    h: "工具・資材の取扱いがあるから、飛来・落下で頭部を負傷する",
+    m: "ヘルメット着用、工具は落下防止（置き方・手渡し徹底）、上部作業の有無を確認して立入規制する",
+  });
 
-  // 第三者補正（墓参者）
   if (third_party_level === "多い") {
     base.unshift({
       h: "第三者（墓参者）が頻繁に接近するから、誘導不足で接触・転倒事故が起こる",
@@ -155,7 +113,6 @@ function fallbackRiskItems(work_detail: string, third_party_level: string, flags
     });
   }
 
-  // 5件に整形
   const items: RiskItem[] = [];
   for (let i = 0; i < base.length && items.length < 5; i++) {
     items.push({ rank: items.length + 1, hazard: base[i].h, countermeasure: base[i].m });
@@ -211,6 +168,13 @@ function pickBody(body: Body) {
   };
 }
 
+function bulletsHaz(items: RiskItem[]) {
+  return items.map((x) => `・${x.hazard}`).join("\n");
+}
+function bulletsMea(items: RiskItem[]) {
+  return items.map((x) => `・（${x.rank}）${x.countermeasure}`).join("\n");
+}
+
 function buildUserPrompt(input: ReturnType<typeof pickBody>) {
   const {
     work_detail, photo_slope_url, photo_path_url, weather_text,
@@ -218,33 +182,25 @@ function buildUserPrompt(input: ReturnType<typeof pickBody>) {
     wbgt, temperature_c, wind_speed_ms, precipitation_mm,
   } = input;
 
-  const missing: string[] = [];
-  if (!work_detail) missing.push("作業内容");
-  if (!weather_text && wbgt == null && temperature_c == null) missing.push("気象");
-  if (!photo_slope_url && !photo_path_url) missing.push("写真");
-  if (!third_party_level) missing.push("第三者状況");
-  const missingText = missing.length ? missing.join("、") : "なし";
-
-  const heatRule = [
-    "【熱中症の判断（厳守）】",
-    "・WBGT < 21 → 熱中症（危険予知/対策）を一切出力しない（例外なし）",
-    "・WBGT 21〜24 → 熱負荷が高い場合のみ出力（推測なら推測と明記）",
-    "・WBGT >= 25 → 熱中症を出力する",
-    "・WBGT不明時：気温30℃以上なら出力、25℃未満なら出力しない。25〜29℃は作業負荷次第（推測明記）。",
-  ].join("\n");
+  const flags = inferFlags(work_detail, note);
+  const flagText = Object.entries(flags)
+    .filter(([, v]) => v)
+    .map(([k]) => k)
+    .join(", ") || "none";
 
   return [
-    "あなたは建設現場の安全管理（KY）の専門家です。出力は必ず日本語、現場でそのまま使える実務文。",
-    "甘い評価は禁止（厳しめ）。根拠のない断定は禁止。推測は『推測』と明記。",
+    "あなたは建設現場の安全管理（KY）の専門家です。出力は必ず日本語。",
+    "甘い内容は禁止。根拠のない断定は禁止。推測は『推測』と明記。",
     "",
-    heatRule,
+    "【熱中症ルール（厳守）】",
+    "WBGT < 21 の場合、熱中症に関する危険予知・対策を一切出力しない。",
     "",
     "【入力】",
-    project_name ? `工事名/現場名: ${project_name}` : undefined,
+    project_name ? `現場: ${project_name}` : undefined,
     `作業内容: ${work_detail || "（未入力）"}`,
     `作業員数: ${worker_count || 0}`,
     `第三者状況: ${third_party_level || "（未選択）"}`,
-    `気象要約: ${weather_text || "（なし）"}`,
+    `気象: ${weather_text || "（なし）"}`,
     `WBGT: ${wbgt == null ? "（不明）" : wbgt}`,
     `気温: ${temperature_c == null ? "（不明）" : temperature_c}`,
     `風速: ${wind_speed_ms == null ? "（不明）" : wind_speed_ms}`,
@@ -252,13 +208,17 @@ function buildUserPrompt(input: ReturnType<typeof pickBody>) {
     `写真URL（法面）: ${photo_slope_url || "（なし）"}`,
     `写真URL（通路）: ${photo_path_url || "（なし）"}`,
     note ? `備考: ${note}` : undefined,
-    `情報不足: ${missingText}`,
     "",
-    "【出力仕様（厳守）】",
-    "JSONのみ。キーは4つ固定：ai_work_detail, ai_hazards, ai_countermeasures, ai_third_party",
-    "ai_hazards：『・』箇条書き。各行は必ず『〇〇だから、〇〇が起こる』形式（5〜10項目）",
-    "ai_countermeasures：hazardsに対応（同数）、具体策のみ",
-    "ai_third_party：空欄禁止",
+    "【推定フラグ（内部）】",
+    `flags: ${flagText}`,
+    "",
+    "【出力仕様（最重要）】",
+    "必ず JSON のみで返す。",
+    "ai_risk_items は配列で必ず5件。",
+    "各 hazard は必ず『〇〇だから、〇〇が起こる』形式（1行）。",
+    "countermeasure は具体策のみ（抽象語だけ禁止）。",
+    "ガードレール設置工なら「交通規制・車両接触・資材取回し・工具・足元」を必ず含める。",
+    "ai_third_party は空欄禁止（第三者が少ない/多いに応じて誘導・停止・区画を具体化）。",
   ].filter(Boolean).join("\n");
 }
 
@@ -278,8 +238,8 @@ export async function POST(req: Request) {
 
     const system = [
       "あなたは建設現場の安全管理（KY）支援AIです。",
-      "JSON以外の出力は禁止。余計な文章・注釈・コードブロック禁止。",
-      "危険予知は因果（『〇〇だから、〇〇が起こる』）を厳守。対策は具体策のみ。",
+      "JSON以外の出力は禁止。コードブロック禁止。",
+      "危険予知は因果（『〇〇だから、〇〇が起こる』）を厳守。",
       "WBGT<21 は熱中症を一切出力しない。",
     ].join("\n");
 
@@ -293,21 +253,36 @@ export async function POST(req: Request) {
       ? [{ type: "text", text: userPrompt }, ...imageParts]
       : userPrompt;
 
-    // JSON崩れ防止（strict schema）
+    // ✅ ここがポイント：ChatGPTに ai_risk_items を直接作らせる（復元しない）
     const response_format = {
       type: "json_schema",
       json_schema: {
-        name: "ky_ai_suggest",
+        name: "ky_ai_suggest_v2",
         strict: true,
         schema: {
           type: "object",
           additionalProperties: false,
-          required: ["ai_work_detail", "ai_hazards", "ai_countermeasures", "ai_third_party"],
+          required: ["ai_work_detail", "ai_risk_items", "ai_third_party"],
           properties: {
             ai_work_detail: { type: "string" },
-            ai_hazards: { type: "string" },
-            ai_countermeasures: { type: "string" },
             ai_third_party: { type: "string" },
+            ai_risk_items: {
+              type: "array",
+              minItems: 5,
+              maxItems: 5,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["rank", "hazard", "countermeasure"],
+                properties: {
+                  rank: { type: "integer", minimum: 1, maximum: 5 },
+                  hazard: { type: "string" },
+                  countermeasure: { type: "string" },
+                  score: { type: "number" },
+                  tags: { type: "array", items: { type: "string" } },
+                },
+              },
+            },
           },
         },
       },
@@ -346,29 +321,42 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Non-JSON response", raw: content.slice(0, 2000) }, { status: 502 });
     }
 
-    const out = {
-      ai_work_detail: s(obj?.ai_work_detail),
-      ai_hazards: s(obj?.ai_hazards),
-      ai_countermeasures: s(obj?.ai_countermeasures),
-      ai_third_party: s(obj?.ai_third_party),
-    };
+    let items: RiskItem[] = Array.isArray(obj?.ai_risk_items) ? (obj.ai_risk_items as RiskItem[]) : [];
+    items = items
+      .map((x, i) => ({
+        rank: Number(x?.rank) || (i + 1),
+        hazard: s(x?.hazard).trim(),
+        countermeasure: s(x?.countermeasure).trim(),
+        score: x?.score,
+        tags: Array.isArray(x?.tags) ? x.tags : undefined,
+      }))
+      .filter((x) => x.hazard);
 
-    // ✅ ここが本修正：必ず ai_risk_items を作る
-    let items = rebuildRiskItemsFromTexts(out.ai_hazards, out.ai_countermeasures);
-
-    // モデルが空を返した/薄い場合のフォールバック（抜け防止）
-    if (!items.length) {
+    // 万一崩れたらフォールバック（ただし通常は通らない）
+    if (items.length < 5) {
       const flags = inferFlags(input.work_detail, input.note);
       items = fallbackRiskItems(input.work_detail || "（作業内容未入力）", input.third_party_level || "", flags);
-      // 文字列も合わせて作る（保存互換も維持）
-      out.ai_hazards = items.map((x) => `・${x.hazard}`).join("\n");
-      out.ai_countermeasures = items.map((x) => `・（${x.rank}）${x.countermeasure}`).join("\n");
+    } else {
+      items = items.slice(0, 5).map((x, i) => ({ ...x, rank: i + 1 }));
     }
 
-    // ✅ 互換キーも返す（KyNew/Reviewがどれを参照してもOK）
+    const ai_work_detail = s(obj?.ai_work_detail).trim() || "";
+    const ai_third_party = s(obj?.ai_third_party).trim() || s(obj?.ai_third_party).trim() || "";
+
+    const out = {
+      ai_work_detail,
+      ai_risk_items: items,
+      ai_hazards: bulletsHaz(items),
+      ai_countermeasures: bulletsMea(items),
+      ai_third_party: ai_third_party || "・区画（コーン・バー）を維持し、接近時は作業を一時停止して安全通行を確保すること",
+      // 確認用（画面には出なくてもOK）：生成元
+      meta_source: "openai_or_fallback",
+      meta_model: model,
+    };
+
     return NextResponse.json({
       ...out,
-      ai_risk_items: items.slice(0, 5),
+      // 互換キー
       hazards: out.ai_hazards,
       countermeasures: out.ai_countermeasures,
       third_party: out.ai_third_party,
