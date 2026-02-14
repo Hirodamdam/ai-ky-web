@@ -58,6 +58,51 @@ function degToDirJp(deg: number | null | undefined): string {
   return dirs[idx];
 }
 
+function normalizeText(text: string): string {
+  return (text || "").replace(/\r\n/g, "\n").replace(/\u3000/g, " ").trim();
+}
+
+function splitAiCombined(text: string): { work: string; hazards: string; countermeasures: string; third: string } {
+  const src = (text || "").trim();
+  if (!src) return { work: "", hazards: "", countermeasures: "", third: "" };
+
+  const makeBracketRe = (label: string) =>
+    new RegExp(String.raw`(?:^|\n)\s*(?:[•・\-*]\s*)?[【\[]\s*AI補足\s*[｜|]\s*${label}\s*[】\]]`, "g");
+
+  const headings: Array<{ key: "work" | "hazards" | "countermeasures" | "third"; re: RegExp }> = [
+    { key: "work", re: makeBracketRe("作業内容") },
+    { key: "hazards", re: makeBracketRe("危険予知") },
+    { key: "countermeasures", re: makeBracketRe("対策") },
+    { key: "third", re: makeBracketRe("第三者(?:\\s*（\\s*墓参者\\s*）)?") },
+    { key: "work", re: /(?:^|\n)\s*(作業内容)\s*[:：]/g },
+    { key: "hazards", re: /(?:^|\n)\s*(危険予知)\s*[:：]/g },
+    { key: "countermeasures", re: /(?:^|\n)\s*(対策)\s*[:：]/g },
+    { key: "third", re: /(?:^|\n)\s*(第三者|墓参者)\s*[:：]/g },
+  ];
+
+  const marks: Array<{ idx: number; key: "work" | "hazards" | "countermeasures" | "third"; len: number }> = [];
+  for (const h of headings) {
+    let m: RegExpExecArray | null;
+    h.re.lastIndex = 0;
+    while ((m = h.re.exec(src))) marks.push({ idx: m.index, key: h.key, len: m[0].length });
+  }
+  marks.sort((a, b) => a.idx - b.idx);
+
+  if (!marks.length) return { work: src, hazards: "", countermeasures: "", third: "" };
+
+  const out = { work: "", hazards: "", countermeasures: "", third: "" };
+  for (let i = 0; i < marks.length; i++) {
+    const cur = marks[i];
+    const next = marks[i + 1];
+    const start = cur.idx + cur.len;
+    const end = next ? next.idx : src.length;
+    const chunk = src.slice(start, end).trim();
+    if (!chunk) continue;
+    (out as any)[cur.key] = (out as any)[cur.key] ? `${(out as any)[cur.key]}\n${chunk}` : chunk;
+  }
+  return out;
+}
+
 function extFromName(name: string): string {
   const m = name.toLowerCase().match(/\.([a-z0-9]+)$/);
   return m ? m[1] : "jpg";
@@ -86,6 +131,342 @@ function slotSummary(slot: WeatherSlot | null | undefined): string {
   const ws = slot.wind_speed_ms == null ? "—" : `${slot.wind_speed_ms}m/s`;
   const p = slot.precipitation_mm == null ? "—" : `${slot.precipitation_mm}mm`;
   return `${w} / 気温${t} / 風${wd} ${ws} / 降水${p}`;
+}
+
+/** =========================
+ *  表示用整形（壊さず改良）
+ *  - 重複除去
+ *  - 重要度スコアリング
+ *  - 上位5件抽出
+ *  - 番号削除（全項目統一）
+ *  - 人入力との最小一致文削除
+ *  - 危険予知と対策の整合統一（右側採用/番号除去/分割）
+ * ========================= */
+
+function normalizeLineBase(raw: string): string {
+  return raw
+    .replace(/\u3000/g, " ")
+    .replace(/^[•・\-*]\s*/, "")
+    .replace(/^\s*\[\s*\d+\s*\]\s*/g, "")
+    .replace(/^\s*\d+\s*[)\.．、]\s*/g, "")
+    .replace(/^\s*（\s*\d+\s*）\s*/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripGenericAccidentNote(x: string): string {
+  return x
+    .replace(/（\s*事故につながる恐れ\s*）/g, "")
+    .replace(/（\s*事故に繋がる恐れ\s*）/g, "")
+    .replace(/（\s*事故につながる可能性\s*）/g, "")
+    .replace(/（\s*事故に繋がる可能性\s*）/g, "")
+    .trim();
+}
+
+function takeRightOfArrow(line: string): string {
+  const t = line;
+  const seps = ["→", "⇒", "->", "＞", "〉", "→→"];
+  for (const sep of seps) {
+    const idx = t.indexOf(sep);
+    if (idx >= 0) {
+      const right = t.slice(idx + sep.length).trim();
+      if (right) return right;
+    }
+  }
+  return t.trim();
+}
+
+function dedupeKeepOrder(arr: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const x of arr) {
+    const k = x.trim();
+    if (!k) continue;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+  }
+  return out;
+}
+
+function normalizeForSim(x: string): string {
+  return (x || "")
+    .toLowerCase()
+    .replace(/\u3000/g, " ")
+    .replace(/[（）()\[\]【】「」『』]/g, "")
+    .replace(/[、，,。．.・:：;；/／|｜]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function charBigrams(x: string): Set<string> {
+  const t = normalizeForSim(x).replace(/\s+/g, "");
+  const s2 = t;
+  const out = new Set<string>();
+  if (s2.length <= 1) return out;
+  for (let i = 0; i < s2.length - 1; i++) out.add(s2.slice(i, i + 2));
+  return out;
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (!a.size || !b.size) return 0;
+  let inter = 0;
+  for (const x of a) if (b.has(x)) inter++;
+  const uni = a.size + b.size - inter;
+  return uni ? inter / uni : 0;
+}
+
+function isTooSimilarToHuman(line: string, humanText: string, threshold = 0.42): boolean {
+  const h = normalizeForSim(humanText);
+  if (!h) return false;
+
+  const a = charBigrams(line);
+  if (!a.size) return false;
+
+  const candidates = h
+    .split(/\n+/g)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  for (const c of candidates) {
+    const b = charBigrams(c);
+    const sim = jaccard(a, b);
+    if (sim >= threshold) return true;
+  }
+  return false;
+}
+
+function scoreImportance(line: string, kind: "hazard" | "measure" | "third"): number {
+  const t = normalizeForSim(line);
+
+  const strong = [
+    "墜落",
+    "転落",
+    "崩壊",
+    "土砂",
+    "法面",
+    "落下",
+    "飛来",
+    "挟まれ",
+    "巻き込まれ",
+    "接触",
+    "重機",
+    "バックホウ",
+    "ユンボ",
+    "クレーン",
+    "玉掛",
+    "感電",
+    "ガス",
+    "酸欠",
+    "火災",
+    "倒壊",
+    "逸走",
+    "第三者",
+    "墓参者",
+    "一般",
+    "通行人",
+    "車両",
+    "交通",
+    "交差",
+    "誘導",
+  ];
+
+  const medium = [
+    "滑り",
+    "足元",
+    "段差",
+    "転倒",
+    "つまず",
+    "視界",
+    "死角",
+    "手元",
+    "工具",
+    "刃物",
+    "切創",
+    "打撃",
+    "激突",
+    "騒音",
+    "粉じん",
+    "粉塵",
+    "飛散",
+    "風",
+    "強風",
+    "雨",
+    "降雨",
+    "ぬかるみ",
+    "路面",
+    "養生",
+    "区画",
+    "立入",
+    "立入禁止",
+    "カラーコーン",
+    "バリケード",
+    "ロープ",
+    "看板",
+    "声掛け",
+    "監視",
+  ];
+
+  let score = 10;
+
+  for (const w of strong) if (t.includes(w)) score += 18;
+  for (const w of medium) if (t.includes(w)) score += 10;
+
+  if (kind === "measure") {
+    const good = ["立入禁止", "区画", "誘導", "合図", "指差呼称", "退避", "停止", "監視", "点検", "KY", "周知", "周囲確認"];
+    for (const w of good) if (t.includes(w)) score += 6;
+  }
+  if (kind === "third") {
+    const good = ["誘導", "区画", "導線", "声掛け", "案内", "掲示", "停止", "同伴", "見守り"];
+    for (const w of good) if (t.includes(w)) score += 6;
+  }
+
+  const len = normalizeForSim(line).length;
+  if (len >= 60) score -= 8;
+  if (len >= 90) score -= 12;
+
+  if (t === "注意する" || t === "気をつける" || t === "安全に作業する") score -= 20;
+
+  return Math.max(0, score);
+}
+
+function splitMeasuresLine(line: string): string[] {
+  const t = line.trim();
+
+  const noLead = t
+    .replace(/^\s*\[\s*\d+\s*\]\s*/g, "")
+    .replace(/^\s*\d+[)\.．、]\s*/g, "")
+    .trim();
+
+  const hasMulti = /\[\s*\d+\s*\]/.test(noLead);
+  if (!hasMulti) return [noLead];
+
+  const parts = noLead
+    .split(/\[\s*\d+\s*\]/g)
+    .map((x) => x.replace(/^[、,\s]+/, "").trim())
+    .filter(Boolean);
+
+  return parts.length ? parts : [noLead];
+}
+
+function pickTop5ByScore(lines: string[], kind: "hazard" | "measure" | "third"): string[] {
+  const scored = lines
+    .map((x) => ({ x: x.trim(), score: scoreImportance(x, kind) }))
+    .filter((it) => it.x && it.score > 0);
+
+  scored.sort((a, b) => b.score - a.score);
+
+  const out: string[] = [];
+  for (const it of scored) {
+    if (out.length >= 5) break;
+    out.push(it.x);
+  }
+  return out;
+}
+
+// 危険予知：右側だけ採用、注記削除、重複除去、スコア上位5、人入力と類似は除外、番号なし
+function formatHazardsForView5(text: string, humanHazards: string): string[] {
+  const lines = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const picked: string[] = [];
+  for (const l0 of lines) {
+    const base = normalizeLineBase(l0);
+    if (!base) continue;
+
+    let v = takeRightOfArrow(base);
+    v = normalizeLineBase(v);
+    v = stripGenericAccidentNote(v);
+    v = v.replace(/（\s*[^）]*事故[^）]*恐れ\s*）\s*$/g, "").trim();
+
+    if (/^危険予知/i.test(v) || /^対策/i.test(v) || /^AI補足/i.test(v)) continue;
+    if (!v) continue;
+
+    if (isTooSimilarToHuman(v, humanHazards, 0.42)) continue;
+
+    picked.push(v);
+  }
+
+  const deduped = dedupeKeepOrder(picked);
+
+  const top5 = pickTop5ByScore(deduped, "hazard");
+
+  if (top5.length < 5) {
+    for (const x of deduped) {
+      if (top5.length >= 5) break;
+      if (top5.includes(x)) continue;
+      top5.push(x);
+    }
+  }
+
+  return top5.slice(0, 5);
+}
+
+// 対策：番号削除、複合行分割、右側だけ採用、重複除去、スコア上位5、人入力と類似は除外、番号なし
+function formatMeasuresForView5(text: string, humanMeasures: string): string[] {
+  const lines = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const items: string[] = [];
+  for (const l0 of lines) {
+    const base0 = normalizeLineBase(l0);
+    if (!base0) continue;
+
+    const parts = splitMeasuresLine(base0);
+    for (let p of parts) {
+      p = normalizeLineBase(p);
+      if (!p) continue;
+
+      p = takeRightOfArrow(p);
+      p = normalizeLineBase(p);
+
+      if (/^対策/i.test(p) || /^AI補足/i.test(p)) continue;
+      if (!p) continue;
+
+      if (isTooSimilarToHuman(p, humanMeasures, 0.40)) continue;
+
+      items.push(p);
+    }
+  }
+
+  const deduped = dedupeKeepOrder(items);
+  const top5 = pickTop5ByScore(deduped, "measure");
+
+  if (top5.length < 5) {
+    for (const x of deduped) {
+      if (top5.length >= 5) break;
+      if (top5.includes(x)) continue;
+      top5.push(x);
+    }
+  }
+
+  return top5.slice(0, 5);
+}
+
+// 第三者：番号削除、重複除去、人入力（第三者レベル）と一致しそうな薄い文は落とす（上限なし）
+function formatThirdForView(text: string, thirdLevelHuman: string): string[] {
+  const raw = String(text ?? "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((x) => normalizeLineBase(x))
+    .map((x) => x.replace(/^[•・\-*]\s*/, "").trim())
+    .filter(Boolean);
+
+  const filtered = raw.filter((x) => {
+    const t = normalizeForSim(x);
+    if (!t) return false;
+    if (t === "多い" || t === "少ない") return false;
+    if (thirdLevelHuman && isTooSimilarToHuman(x, thirdLevelHuman, 0.55)) return false;
+    return true;
+  });
+
+  return dedupeKeepOrder(filtered);
 }
 
 export default function KyNewClient() {
@@ -140,11 +521,12 @@ export default function KyNewClient() {
   const [slopePrevUrl, setSlopePrevUrl] = useState<string>("");
   const [pathPrevUrl, setPathPrevUrl] = useState<string>("");
 
-  // ✅ 保存用（UIは今回削除）
   const [aiWork, setAiWork] = useState("");
   const [aiHazards, setAiHazards] = useState("");
   const [aiCounter, setAiCounter] = useState("");
   const [aiThird, setAiThird] = useState("");
+
+  const [aiGenerating, setAiGenerating] = useState(false);
 
   const KY_PHOTO_BUCKET = process.env.NEXT_PUBLIC_KY_PHOTO_BUCKET || "ky-photos";
 
@@ -337,6 +719,113 @@ export default function KyNewClient() {
     [KY_PHOTO_BUCKET, projectId]
   );
 
+  const buildAiPayload = useCallback(async () => {
+    const w = workDetail.trim();
+    if (!w) throw new Error("作業内容（必須）を入力してください");
+
+    let slopeNowUrl: string | null = null;
+    let pathNowUrl: string | null = null;
+
+    if (slopeMode === "url") slopeNowUrl = slopeUrlFromProject || null;
+    if (slopeMode === "file" && slopeFile) slopeNowUrl = await uploadToStorage(slopeFile, "slope");
+
+    if (pathMode === "url") pathNowUrl = pathUrlFromProject || null;
+    if (pathMode === "file" && pathFile) pathNowUrl = await uploadToStorage(pathFile, "path");
+
+    const slotsForAi = (appliedSlots || []).map((x) => ({
+      hour: x.hour,
+      weather_text: x.weather_text,
+      temperature_c: x.temperature_c ?? null,
+      wind_direction_deg: x.wind_direction_deg ?? null,
+      wind_speed_ms: x.wind_speed_ms ?? null,
+      precipitation_mm: x.precipitation_mm ?? null,
+    }));
+
+    const lat = project?.lat ?? null;
+    const lon = project?.lon ?? null;
+
+    return {
+      work_detail: w,
+      hazards: hazards.trim() ? hazards.trim() : null,
+      countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
+      third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
+
+      worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
+
+      lat,
+      lon,
+
+      weather_slots: slotsForAi.length ? slotsForAi : null,
+      slope_photo_url: slopeNowUrl,
+      slope_prev_photo_url: slopePrevUrl || null,
+      path_photo_url: pathNowUrl,
+      path_prev_photo_url: pathPrevUrl || null,
+    };
+  }, [
+    workDetail,
+    hazards,
+    countermeasures,
+    thirdPartyLevel,
+    workerCount,
+    appliedSlots,
+    slopeMode,
+    pathMode,
+    slopeUrlFromProject,
+    pathUrlFromProject,
+    slopeFile,
+    pathFile,
+    uploadToStorage,
+    slopePrevUrl,
+    pathPrevUrl,
+    project?.lat,
+    project?.lon,
+  ]);
+
+  const onGenerateAi = useCallback(async () => {
+    setStatus({ type: null, text: "生成中..." });
+    setAiGenerating(true);
+
+    try {
+      const payload = await buildAiPayload();
+
+      const res = await fetch("/api/ky-ai-supplement", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify(payload),
+      });
+
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j?.error || "AI補足生成に失敗しました");
+
+      const w = normalizeText(s(j?.ai_work_detail));
+      const h = normalizeText(s(j?.ai_hazards));
+      const c = normalizeText(s(j?.ai_countermeasures));
+      const t = normalizeText(s(j?.ai_third_party));
+
+      if (w || h || c || t) {
+        setAiWork(w);
+        setAiHazards(h);
+        setAiCounter(c);
+        setAiThird(t);
+      } else {
+        const combined = normalizeText(s(j?.ai_supplement));
+        const split = splitAiCombined(combined);
+
+        setAiWork(normalizeText(split.work));
+        setAiHazards(normalizeText(split.hazards));
+        setAiCounter(normalizeText(split.countermeasures));
+        setAiThird(normalizeText(split.third));
+      }
+
+      setStatus({ type: "success", text: "AI補足を生成しました" });
+    } catch (e: any) {
+      setStatus({ type: "error", text: e?.message ?? "AI補足生成に失敗しました" });
+    } finally {
+      setAiGenerating(false);
+    }
+  }, [buildAiPayload]);
+
   const onSave = useCallback(async () => {
     setStatus({ type: null, text: "" });
 
@@ -480,6 +969,11 @@ export default function KyNewClient() {
       </div>
     );
   }, []);
+
+  // （※整形ロジックは残したまま。UIではテキスト欄を1つに統一）
+  // const aiHazardsTop5 = useMemo(() => formatHazardsForView5(aiHazards, hazards), [aiHazards, hazards]);
+  // const aiMeasuresTop5 = useMemo(() => formatMeasuresForView5(aiCounter, countermeasures), [aiCounter, countermeasures]);
+  // const aiThirdView = useMemo(() => formatThirdForView(aiThird, thirdPartyLevel), [aiThird, thirdPartyLevel]);
 
   if (loading) {
     return (
@@ -709,6 +1203,60 @@ export default function KyNewClient() {
             前回写真：<span className="break-all">{pathPrevUrl}</span>
           </div>
         )}
+      </div>
+
+      {/* ✅ AI補足（項目別）：書式のみ修正（欄を1つに統一／作業内容欄削除／第三者表記変更） */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-sm font-semibold text-slate-800">AI補足（項目別）</div>
+          <button
+            type="button"
+            onClick={onGenerateAi}
+            disabled={aiGenerating}
+            className={`rounded-lg border px-3 py-2 text-sm ${aiGenerating ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
+          >
+            {aiGenerating ? "生成中..." : "AI補足を生成"}
+          </button>
+        </div>
+
+        {/* ① 作業内容の補足欄は削除（表示しない） */}
+
+        {/* ② 危険予知の補足：欄を1つに */}
+        <div className="space-y-2">
+          <div className="text-xs text-slate-600">危険予知の補足</div>
+          <textarea
+            value={aiHazards}
+            onChange={(e) => setAiHazards(e.target.value)}
+            rows={6}
+            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+            placeholder="例：〇〇だから〇〇が起こる（箇条書き推奨）"
+          />
+        </div>
+
+        {/* ③ 対策の補足：欄を1つに */}
+        <div className="space-y-2">
+          <div className="text-xs text-slate-600">対策の補足</div>
+          <textarea
+            value={aiCounter}
+            onChange={(e) => setAiCounter(e.target.value)}
+            rows={6}
+            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+            placeholder="例：各項目ごとに具体的対策（箇条書き推奨）"
+          />
+        </div>
+
+        {/* ③（ご指定） 第三者（墓参者）→ 第三者 に変更 */}
+        {/* ④ 第三者の補足：欄を1つに */}
+        <div className="space-y-2">
+          <div className="text-xs text-slate-600">第三者の補足</div>
+          <textarea
+            value={aiThird}
+            onChange={(e) => setAiThird(e.target.value)}
+            rows={6}
+            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+            placeholder="例：立入区画、誘導導線、声掛け、見守り配置 など（箇条書き推奨）"
+          />
+        </div>
       </div>
 
       {!!status.text && (
