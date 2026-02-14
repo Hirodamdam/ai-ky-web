@@ -85,8 +85,6 @@ function parseAiTextToItems(aiText: string): { items: RiskItem[]; hazardsText: s
   const t = s(aiText).replace(/\r\n/g, "\n").trim();
   if (!t) return { items: [], hazardsText: "", measuresText: "" };
 
-  // 期待フォーマット：
-  // 危険予知：\n・...\n\n対策：\n・（1）...
   const hazardIdx = t.indexOf("危険予知");
   const measureIdx = t.indexOf("対策");
 
@@ -97,7 +95,6 @@ function parseAiTextToItems(aiText: string): { items: RiskItem[]; hazardsText: s
     hazardsPart = t.slice(hazardIdx, measureIdx).trim();
     measuresPart = t.slice(measureIdx).trim();
   } else if (measureIdx >= 0) {
-    // 対策だけ検出
     measuresPart = t.slice(measureIdx).trim();
     hazardsPart = t.slice(0, measureIdx).trim();
   }
@@ -118,7 +115,6 @@ function parseAiTextToItems(aiText: string): { items: RiskItem[]; hazardsText: s
   for (let i = 0; i < n; i++) {
     const hz = s(hazardLines[i] || "").replace(/^・\s*/, "").trim();
     const msRaw = s(measureLines[i] || "").replace(/^・\s*/, "").trim();
-    // 「（1）」などの番号を落として内容だけに
     const ms = msRaw.replace(/^\（?\(?\d+\)?\）?\s*/, "").trim();
     if (!hz && !ms) continue;
     items.push({
@@ -132,6 +128,23 @@ function parseAiTextToItems(aiText: string): { items: RiskItem[]; hazardsText: s
   const measuresText = measureLines.length ? measureLines.join("\n") : "";
 
   return { items, hazardsText, measuresText };
+}
+
+function WeatherCard({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) {
+  const isApplied = appliedHour != null && slot.hour === appliedHour;
+  return (
+    <div className={`rounded-xl border p-3 ${isApplied ? "border-black bg-slate-50" : "border-slate-200 bg-white"}`}>
+      <div className="flex items-center justify-between">
+        <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>
+        {isApplied && <div className="text-xs font-semibold text-black">適用中</div>}
+      </div>
+      <div className="mt-2 text-sm text-slate-800">{slot.weather_text || "（不明）"}</div>
+      <div className="mt-1 text-xs text-slate-600">
+        気温 {slot.temperature_c ?? "—"}℃ / 風 {degToDirJp(slot.wind_direction_deg) || "—"} {slot.wind_speed_ms ?? "—"}m/s / 降水{" "}
+        {slot.precipitation_mm ?? "—"}mm
+      </div>
+    </div>
+  );
 }
 
 export default function KyNewClient() {
@@ -234,7 +247,7 @@ export default function KyNewClient() {
         }
       }
 
-      // ✅ 前回写真（代表=kind:slope / 通路=kind:path）を復活
+      // ✅ 前回写真（代表=kind:slope / 通路=kind:path）
       const { data: photos, error: photoErr } = await (supabase as any)
         .from("ky_photos")
         .select("kind,image_url,created_at")
@@ -243,7 +256,6 @@ export default function KyNewClient() {
         .limit(50);
 
       if (photoErr) {
-        // 失敗しても画面は動かす
         console.warn("[KyNew] ky_photos load failed", photoErr);
       }
 
@@ -301,9 +313,7 @@ export default function KyNewClient() {
       if (!res.ok) throw new Error(j?.error || "気象取得に失敗しました");
 
       const slots = Array.isArray(j?.slots) ? (j.slots as WeatherSlot[]) : [];
-      const normalized: WeatherSlot[] = slots
-        .filter((x) => x && (x.hour === 9 || x.hour === 12 || x.hour === 15))
-        .sort((a, b) => a.hour - b.hour);
+      const normalized: WeatherSlot[] = slots.filter((x) => x && (x.hour === 9 || x.hour === 12 || x.hour === 15)).sort((a, b) => a.hour - b.hour);
 
       setWeatherSlots(normalized);
       setSelectedSlotHour(normalized.length ? normalized[0].hour : null);
@@ -340,7 +350,7 @@ export default function KyNewClient() {
     return weatherSlots.find((x) => x.hour === appliedSlotHour) ?? null;
   }, [weatherSlots, appliedSlotHour]);
 
-  // 写真入力
+  // photo input
   const onPickSlopeFile = useCallback(() => slopeFileRef.current?.click(), []);
   const onPickPathFile = useCallback(() => pathFileRef.current?.click(), []);
 
@@ -384,7 +394,7 @@ export default function KyNewClient() {
     [KY_PHOTO_BUCKET, projectId]
   );
 
-  // ✅ AI生成：ChatGPT5.2（作業＋気象＋写真比較）
+  // AI生成：作業＋気象＋写真比較
   const onGenerateAi = useCallback(async () => {
     setStatus({ type: null, text: "生成中..." });
     setAiGenerating(true);
@@ -394,14 +404,8 @@ export default function KyNewClient() {
       if (!w) throw new Error("作業内容（必須）を入力してください");
 
       // 今回写真URL（fileは未アップロードなので、URLモード/キャッシュのみAIへ渡す）
-      const representativeNowUrl =
-        slopeNowUrlCached ||
-        (slopeMode === "url" ? representativeUrlFromProject : "") ||
-        "";
-      const pathNowUrl =
-        pathNowUrlCached ||
-        (pathMode === "url" ? pathUrlFromProject : "") ||
-        "";
+      const representativeNowUrl = slopeNowUrlCached || (slopeMode === "url" ? representativeUrlFromProject : "") || "";
+      const pathNowUrl = pathNowUrlCached || (pathMode === "url" ? pathUrlFromProject : "") || "";
 
       const res = await fetch("/api/ky-ai-suggest", {
         method: "POST",
@@ -410,21 +414,16 @@ export default function KyNewClient() {
         body: JSON.stringify({
           workContent: w,
           thirdPartyLevel: thirdPartyLevel || "",
-          // 気象（適用中のスロット）
           temperature_c: appliedSlotObj?.temperature_c ?? null,
           wind_speed_ms: appliedSlotObj?.wind_speed_ms ?? null,
           wind_direction: degToDirJp(appliedSlotObj?.wind_direction_deg) || "",
           precipitation_mm: appliedSlotObj?.precipitation_mm ?? null,
           weather_text: appliedSlotObj?.weather_text || "",
           profile: aiProfile,
-
-          // 写真（代表＝slope扱いを運用上の代表写真にする）
           representative_photo_url: representativeNowUrl || null,
           prev_representative_url: prevRepresentativeUrl || null,
           path_photo_url: pathNowUrl || null,
           prev_path_url: prevPathUrl || null,
-
-          // 手入力（参考）
           hazardsText: hazards || "",
         }),
       });
@@ -432,39 +431,18 @@ export default function KyNewClient() {
       const j = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(j?.detail || j?.error || "AI補足生成に失敗しました");
 
-      // ✅ 新API：ai_textを受けて表示へ変換
       const aiText = s(j?.ai_text).trim();
       if (!aiText) throw new Error("AIの出力が空でした（ai_text empty）");
 
       const parsed = parseAiTextToItems(aiText);
-      const items = parsed.items.length ? parsed.items : [];
+      const items = parsed.items.length ? parsed.items : (Array.isArray(j?.ai_risk_items) ? (j.ai_risk_items as RiskItem[]) : []);
 
-      setAiRiskItems(items);
+      setAiRiskItems(items || []);
+      setAiHazards(parsed.hazardsText || s(j?.ai_hazards));
+      setAiCounter(parsed.measuresText || s(j?.ai_countermeasures));
+      setAiThird(s(j?.ai_third_party));
 
-      // 互換保存用（箇条書きを維持）
-      setAiHazards(parsed.hazardsText || aiText);
-      setAiCounter(parsed.measuresText || "");
-
-      // 第三者（固定補足は維持：今の運用どおり）
-      const third = (() => {
-        if (thirdPartyLevel === "多い") {
-          return [
-            "・誘導員を配置し、墓参者の動線を常時監視すること",
-            "・作業区画をコーン・バーで明確化し、立入規制を行うこと",
-            "・接近があれば作業を一時中断し、安全確保後に再開すること",
-          ].join("\n");
-        }
-        if (thirdPartyLevel === "少ない") {
-          return [
-            "・出入口付近に注意喚起表示を行い、声掛けを徹底すること",
-            "・接近時は作業を一時停止し、誘導して安全を確保すること",
-          ].join("\n");
-        }
-        return "";
-      })();
-      setAiThird(third);
-
-      setStatus({ type: "success", text: "AI補足を生成しました" });
+      setStatus({ type: "success", text: `AI補足を更新しました（model: ${s(j?.meta_model || "")}）` });
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "AI補足生成に失敗しました" });
     } finally {
@@ -472,239 +450,132 @@ export default function KyNewClient() {
     }
   }, [
     workDetail,
-    hazards,
     thirdPartyLevel,
+    appliedSlotObj?.temperature_c,
+    appliedSlotObj?.wind_speed_ms,
+    appliedSlotObj?.wind_direction_deg,
+    appliedSlotObj?.precipitation_mm,
+    appliedSlotObj?.weather_text,
     aiProfile,
-    appliedSlotObj,
-    slopeMode,
-    pathMode,
     slopeNowUrlCached,
     pathNowUrlCached,
+    slopeMode,
+    pathMode,
     representativeUrlFromProject,
     pathUrlFromProject,
     prevRepresentativeUrl,
     prevPathUrl,
+    hazards,
   ]);
 
-  const WeatherCard = useCallback(({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) => {
-    const isApplied = appliedHour != null && slot.hour === appliedHour;
-    return (
-      <div className={`rounded-lg border p-3 ${isApplied ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`}>
-        <div className="flex items-center justify-between">
-          <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>
-          {isApplied && <div className="text-xs font-semibold text-emerald-700">適用中</div>}
-        </div>
-        <div className="mt-1 text-sm text-slate-700">{slot.weather_text || "（不明）"}</div>
-        <div className="mt-2 text-xs text-slate-600 space-y-1">
-          <div>気温：{slot.temperature_c ?? "—"} ℃</div>
-          <div>
-            風：{degToDirJp(slot.wind_direction_deg) || "—"}{" "}
-            {slot.wind_speed_ms !== null && slot.wind_speed_ms !== undefined ? `${slot.wind_speed_ms} m/s` : "—"}
-          </div>
-          <div>降水：{slot.precipitation_mm ?? "—"} mm</div>
-        </div>
-      </div>
-    );
-  }, []);
-
-  // ✅ 保存（既存運用そのまま：ky-createへ送るwork_contentは後で修正が必要）
   const onSave = useCallback(async () => {
     setStatus({ type: null, text: "" });
-
-    if (!partnerCompanyName.trim()) {
-      setStatus({ type: "error", text: "協力会社（必須）を選択してください" });
-      return;
-    }
-    if (!workDetail.trim()) {
-      setStatus({ type: "error", text: "作業内容（必須）を入力してください" });
-      return;
-    }
-
     setSaving(true);
+
     try {
-      const { data: sess } = await supabase.auth.getSession();
-      const accessToken = s(sess?.session?.access_token).trim();
-      if (!accessToken) throw new Error("ログインが必要です（access tokenなし）");
+      const w = workDetail.trim();
+      const partner = partnerCompanyName.trim();
+      if (!partner) throw new Error("協力会社（必須）を選択/入力してください");
+      if (!w) throw new Error("作業内容（必須）を入力してください");
 
-      let slopeSavedUrl: string | null = null;
-      let pathSavedUrl: string | null = null;
+      // 写真アップロード（file選択時のみ）
+      let slopeUrl = "";
+      let pathUrl = "";
 
-      if (slopeNowUrlCached) slopeSavedUrl = slopeNowUrlCached;
-      else {
-        if (slopeMode === "file" && slopeFile) slopeSavedUrl = await uploadToStorage(slopeFile, "slope");
-        else if (slopeMode === "url") slopeSavedUrl = representativeUrlFromProject || null;
+      if (slopeMode === "file" && slopeFile) {
+        slopeUrl = await uploadToStorage(slopeFile, "slope");
+      } else if (slopeMode === "url") {
+        slopeUrl = representativeUrlFromProject;
       }
 
-      if (pathNowUrlCached) pathSavedUrl = pathNowUrlCached;
-      else {
-        if (pathMode === "file" && pathFile) pathSavedUrl = await uploadToStorage(pathFile, "path");
-        else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;
+      if (pathMode === "file" && pathFile) {
+        pathUrl = await uploadToStorage(pathFile, "path");
+      } else if (pathMode === "url") {
+        pathUrl = pathUrlFromProject;
       }
 
-      const createPayload: any = {
-        project_id: projectId,
-        work_date: workDate,
-        partner_company_name: partnerCompanyName.trim(),
-        worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
-
-        // ⚠️ ky-create / DB側のカラム差分は次ステップで直す（work_content vs work_detail）
-        work_content: workDetail.trim(),
-
-        hazards: hazards.trim() ? hazards.trim() : null,
-        countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
-        third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
-
-        weather_slots: appliedSlots && appliedSlots.length ? appliedSlots : null,
-
-        ai_work_detail: null,
-        ai_hazards: aiHazards.trim() ? aiHazards.trim() : null,
-        ai_countermeasures: aiCounter.trim() ? aiCounter.trim() : null,
-        ai_third_party: aiThird.trim() ? aiThird.trim() : null,
-
-        ai_risk_items: aiRiskItems.length ? aiRiskItems : null,
-        ai_profile: "strict",
-      };
-
-      const resp = await fetch("/api/ky-create", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`,
-        },
-        body: JSON.stringify(createPayload),
-      });
-
-      const jr = await resp.json().catch(() => ({}));
-      if (!resp.ok) throw new Error(jr?.error || "保存に失敗しました");
-
-      const kyId = s(jr?.kyId).trim();
-      if (!kyId) throw new Error("保存に失敗しました（kyId不明）");
-
-      const photoRows: any[] = [];
-      if (slopeSavedUrl) {
-        photoRows.push({
+      // ky_entries 保存
+      const workerNum = workerCount.trim() ? Number(workerCount.trim()) : null;
+      const { data, error } = await (supabase as any)
+        .from("ky_entries")
+        .insert({
           project_id: projectId,
-          ky_id: kyId,
-          ky_entry_id: kyId,
-          kind: "slope",
-          image_url: slopeSavedUrl,
-          photo_url: slopeSavedUrl,
-        });
-      }
-      if (pathSavedUrl) {
-        photoRows.push({
-          project_id: projectId,
-          ky_id: kyId,
-          ky_entry_id: kyId,
-          kind: "path",
-          image_url: pathSavedUrl,
-          photo_url: pathSavedUrl,
-        });
-      }
-      if (photoRows.length) {
-        const { error: photoErr } = await (supabase as any).from("ky_photos").insert(photoRows);
-        if (photoErr) throw photoErr;
-      }
+          work_date: workDate,
+          partner_company_name: partner,
+          worker_count: Number.isFinite(workerNum as any) ? workerNum : null,
+          work_detail: w,
+          hazards: hazards || null,
+          countermeasures: countermeasures || null,
+          third_party_level: thirdPartyLevel || null,
+          weather_slots: weatherSlots || [],
+          applied_hour: appliedSlotHour,
+          slope_photo_url: slopeUrl || null,
+          path_photo_url: pathUrl || null,
+          // AI（互換保存）
+          ai_hazards: aiHazards || null,
+          ai_countermeasures: aiCounter || null,
+          ai_third_party: aiThird || null,
+        })
+        .select("id")
+        .maybeSingle();
 
-      setStatus({ type: "success", text: "保存しました（レビューへ移動）" });
+      if (error) throw error;
+
+      const kyId = s(data?.id).trim();
+      if (!kyId) throw new Error("保存IDが取得できませんでした");
+
+      setStatus({ type: "success", text: "保存しました。レビューへ移動します。" });
       router.push(`/projects/${projectId}/ky/${kyId}/review`);
-      router.refresh();
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "保存に失敗しました" });
     } finally {
       setSaving(false);
     }
   }, [
+    projectId,
+    router,
+    workDate,
     partnerCompanyName,
+    workerCount,
     workDetail,
     hazards,
     countermeasures,
     thirdPartyLevel,
-    projectId,
-    workDate,
-    appliedSlots,
-    aiHazards,
-    aiCounter,
-    aiThird,
-    aiRiskItems,
-    workerCount,
-    router,
+    weatherSlots,
+    appliedSlotHour,
     slopeMode,
-    pathMode,
     slopeFile,
+    pathMode,
     pathFile,
     uploadToStorage,
     representativeUrlFromProject,
     pathUrlFromProject,
-    slopeNowUrlCached,
-    pathNowUrlCached,
+    aiHazards,
+    aiCounter,
+    aiThird,
   ]);
 
   if (loading) {
     return (
-      <div className="p-4">
-        <div className="text-slate-600">読み込み中...</div>
+      <div className="mx-auto max-w-3xl p-4">
+        <div className="rounded-xl border border-slate-200 bg-white p-4 text-sm text-slate-600">読み込み中...</div>
       </div>
     );
   }
 
   return (
-    <div className="p-4 space-y-4">
-      <div className="flex items-start justify-between gap-3">
+    <div className="mx-auto max-w-3xl p-4 space-y-4">
+      <div className="flex items-center justify-between gap-3">
         <div>
           <div className="text-lg font-bold text-slate-900">KY 新規作成</div>
-          <div className="mt-1 text-sm text-slate-600">工事件名：{project?.name ?? "（不明）"}</div>
-        </div>
-        <div className="flex flex-col gap-2 shrink-0">
-          <Link className="text-sm text-blue-600 underline text-right" href="/login">
-            ログイン
-          </Link>
-          <Link className="text-sm text-blue-600 underline text-right" href={`/projects/${projectId}/ky`}>
-            KY一覧へ
-          </Link>
-        </div>
-      </div>
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
-        <div className="text-sm font-semibold text-slate-800">施工会社（固定）</div>
-        <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
-          {project?.contractor_name ?? "（未入力）"}
-        </div>
-      </div>
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
-        <div className="text-sm font-semibold text-slate-800">
-          協力会社 <span className="text-rose-600">（必須）</span>
+          <div className="text-sm text-slate-600">
+            {project?.name || "（現場）"} / {project?.contractor_name || ""}
+          </div>
         </div>
 
-        <select
-          value={partnerCompanyName}
-          onChange={(e) => setPartnerCompanyName(e.target.value)}
-          className="relative z-10 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-        >
-          <option value="">選択してください</option>
-          {partnerOptions.map((o) => (
-            <option key={o.value} value={o.value}>
-              {o.name}
-            </option>
-          ))}
-        </select>
-
-        <div className="text-xs text-slate-500">※ 工事詳細で「入場登録」した会社がここに出ます</div>
-        <div className="text-xs text-slate-500">候補数：{partnerOptions.length}</div>
-      </div>
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
-        <div className="text-sm font-semibold text-slate-800">本日の作業員数</div>
-        <input
-          type="number"
-          inputMode="numeric"
-          value={workerCount}
-          onChange={(e) => setWorkerCount(String(e.target.value ?? "").replace(/[^\d]/g, ""))}
-          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-          placeholder="例：12"
-        />
-        <div className="text-xs text-slate-500">※ 半角数字で入力してください</div>
+        <Link href={`/projects/${projectId}/ky`} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+          一覧へ
+        </Link>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
@@ -784,27 +655,30 @@ export default function KyNewClient() {
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">対策（1行でもOK）</div>
-          <textarea value={countermeasures} onChange={(e) => setCountermeasures(e.target.value)} rows={3} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
+          <textarea
+            value={countermeasures}
+            onChange={(e) => setCountermeasures(e.target.value)}
+            rows={3}
+            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+          />
         </div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-800">第三者（墓参者）の状況</div>
-        <select value={thirdPartyLevel} onChange={(e) => setThirdPartyLevel(e.target.value)} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm">
-          <option value="">選択してください</option>
-          <option value="多い">多い</option>
+        <select value={thirdPartyLevel} onChange={(e) => setThirdPartyLevel(e.target.value)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm">
+          <option value="">選択</option>
           <option value="少ない">少ない</option>
+          <option value="多い">多い</option>
         </select>
-        <div className="text-xs text-slate-500">※ 墓参者の多少に応じて、誘導・区画分離・声掛け等をAI補足に反映します。</div>
       </div>
 
-      {/* 写真 */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
-        <div className="text-sm font-semibold text-slate-800">写真（任意）</div>
+        <div className="text-sm font-semibold text-slate-800">写真（今回/前回）</div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="space-y-4">
           <div className="space-y-2">
-            <div className="text-xs text-slate-600">代表的な現場写真（今回）</div>
+            <div className="text-xs text-slate-600">代表（今回）</div>
             <div className="flex gap-2 flex-wrap">
               <button
                 type="button"
@@ -833,6 +707,7 @@ export default function KyNewClient() {
                 なし
               </button>
             </div>
+
             <div className="text-xs text-slate-500">
               {slopeMode === "url" ? `URL：${representativeUrlFromProject || "（未設定）"}` : slopeMode === "file" ? `ファイル：${slopeFileName}` : "（なし）"}
             </div>
@@ -870,6 +745,7 @@ export default function KyNewClient() {
                 なし
               </button>
             </div>
+
             <div className="text-xs text-slate-500">
               {pathMode === "url" ? `URL：${pathUrlFromProject || "（未設定）"}` : pathMode === "file" ? `ファイル：${pathFileName}` : "（なし）"}
             </div>
@@ -894,48 +770,47 @@ export default function KyNewClient() {
           </button>
         </div>
 
-        <div className="space-y-2">
-          <div className="text-xs text-slate-600">危険予知の補足（上位・リスク順）</div>
-          {aiRiskItems.length ? (
-            <div className="rounded-lg border border-slate-300 bg-white p-3">
-              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {aiRiskItems.map((x) => (
-                  <li key={`h-${x.rank}`}>{x.hazard}</li>
-                ))}
-              </ul>
-            </div>
-          ) : (
-            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
-          )}
-        </div>
+        <div className="grid grid-cols-1 gap-3">
+          <div className="space-y-2">
+            <div className="text-xs text-slate-600">危険予知の補足</div>
+            {aiRiskItems.length ? (
+              <div className="rounded-lg border border-slate-300 bg-white p-3">
+                <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                  {aiRiskItems.map((x) => (
+                    <li key={`h-${x.rank}`}>{x.hazard}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
+            )}
+          </div>
 
-        <div className="space-y-2">
-          <div className="text-xs text-slate-600">対策の補足（危険予知に対応：1対1）</div>
-          {aiRiskItems.length ? (
-            <div className="rounded-lg border border-slate-300 bg-white p-3">
-              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {aiRiskItems.map((x) => (
-                  <li key={`m-${x.rank}`}>
-                    <span className="font-semibold">（{x.rank}）</span>
-                    {x.countermeasure}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ) : (
-            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
-          )}
-        </div>
+          <div className="space-y-2">
+            <div className="text-xs text-slate-600">対策の補足</div>
+            {aiRiskItems.length ? (
+              <div className="rounded-lg border border-slate-300 bg-white p-3">
+                <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                  {aiRiskItems.map((x) => (
+                    <li key={`m-${x.rank}`}>{x.countermeasure}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
+            )}
+          </div>
 
-        <div className="space-y-2">
-          <div className="text-xs text-slate-600">第三者（墓参者）の補足</div>
-          {aiThird.trim() ? (
-            <div className="rounded-lg border border-slate-300 bg-white p-3">
-              <pre className="whitespace-pre-wrap text-sm text-slate-800">{aiThird}</pre>
-            </div>
-          ) : (
-            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
-          )}
+          <div className="space-y-2">
+            <div className="text-xs text-slate-600">第三者（墓参者）の補足</div>
+            {aiThird.trim() ? (
+              <div className="rounded-lg border border-slate-300 bg-white p-3">
+                <pre className="whitespace-pre-wrap text-sm text-slate-800">{aiThird}</pre>
+              </div>
+            ) : (
+              <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
+            )}
+          </div>
         </div>
       </div>
 
