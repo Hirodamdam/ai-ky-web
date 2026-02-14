@@ -228,7 +228,6 @@ function isTooSimilarToHuman(line: string, humanText: string, threshold = 0.42):
     .map((x) => x.trim())
     .filter(Boolean);
 
-  // 人入力は1～数行が多いので、行単位で比較（雑な一致を落とす）
   for (const c of candidates) {
     const b = charBigrams(c);
     const sim = jaccard(a, b);
@@ -240,7 +239,6 @@ function isTooSimilarToHuman(line: string, humanText: string, threshold = 0.42):
 function scoreImportance(line: string, kind: "hazard" | "measure" | "third"): number {
   const t = normalizeForSim(line);
 
-  // 強い危険ワード（法面/墓地/重機を想定して厳しめ）
   const strong = [
     "墜落",
     "転落",
@@ -314,7 +312,6 @@ function scoreImportance(line: string, kind: "hazard" | "measure" | "third"): nu
   for (const w of strong) if (t.includes(w)) score += 18;
   for (const w of medium) if (t.includes(w)) score += 10;
 
-  // kindごと微調整
   if (kind === "measure") {
     const good = ["立入禁止", "区画", "誘導", "合図", "指差呼称", "退避", "停止", "監視", "点検", "KY", "周知", "周囲確認"];
     for (const w of good) if (t.includes(w)) score += 6;
@@ -324,12 +321,10 @@ function scoreImportance(line: string, kind: "hazard" | "measure" | "third"): nu
     for (const w of good) if (t.includes(w)) score += 6;
   }
 
-  // 長すぎる1行は読みにくいので軽く減点
   const len = normalizeForSim(line).length;
   if (len >= 60) score -= 8;
   if (len >= 90) score -= 12;
 
-  // ありがちな薄い文を減点
   if (t === "注意する" || t === "気をつける" || t === "安全に作業する") score -= 20;
 
   return Math.max(0, score);
@@ -369,7 +364,6 @@ function pickTop5ByScore(lines: string[], kind: "hazard" | "measure" | "third"):
   return out;
 }
 
-// 危険予知：右側だけ採用、注記削除、重複除去、スコア上位5、人入力と類似は除外、番号なし
 function formatHazardsForView5(text: string, humanHazards: string): string[] {
   const lines = String(text ?? "")
     .replace(/\r\n/g, "\n")
@@ -396,11 +390,8 @@ function formatHazardsForView5(text: string, humanHazards: string): string[] {
   }
 
   const deduped = dedupeKeepOrder(picked);
-
-  // スコア上位5（重要度）
   const top5 = pickTop5ByScore(deduped, "hazard");
 
-  // スコアリングで落ち切ることがあるので、保険で先頭から補完（最大5）
   if (top5.length < 5) {
     for (const x of deduped) {
       if (top5.length >= 5) break;
@@ -412,7 +403,6 @@ function formatHazardsForView5(text: string, humanHazards: string): string[] {
   return top5.slice(0, 5);
 }
 
-// 対策：番号削除、複合行分割、右側だけ採用、重複除去、スコア上位5、人入力と類似は除外、番号なし
 function formatMeasuresForView5(text: string, humanMeasures: string): string[] {
   const lines = String(text ?? "")
     .replace(/\r\n/g, "\n")
@@ -456,7 +446,6 @@ function formatMeasuresForView5(text: string, humanMeasures: string): string[] {
   return top5.slice(0, 5);
 }
 
-// 第三者：番号削除、重複除去、人入力（第三者レベル）と一致しそうな薄い文は落とす（上限なし）
 function formatThirdForView(text: string, thirdLevelHuman: string): string[] {
   const raw = String(text ?? "")
     .replace(/\r\n/g, "\n")
@@ -465,7 +454,6 @@ function formatThirdForView(text: string, thirdLevelHuman: string): string[] {
     .map((x) => x.replace(/^[•・\-*]\s*/, "").trim())
     .filter(Boolean);
 
-  // 「多い/少ない」だけの行などを落とす
   const filtered = raw.filter((x) => {
     const t = normalizeForSim(x);
     if (!t) return false;
@@ -978,10 +966,15 @@ export default function KyNewClient() {
     );
   }, []);
 
-  // ✅ AI表示（壊さず改良版）
+  // （AI補足（項目別）UIは削除。ただし型/未使用対策として参照だけ残す）
   const aiHazardsTop5 = useMemo(() => formatHazardsForView5(aiHazards, hazards), [aiHazards, hazards]);
   const aiMeasuresTop5 = useMemo(() => formatMeasuresForView5(aiCounter, countermeasures), [aiCounter, countermeasures]);
   const aiThirdView = useMemo(() => formatThirdForView(aiThird, thirdPartyLevel), [aiThird, thirdPartyLevel]);
+  void aiHazardsTop5;
+  void aiMeasuresTop5;
+  void aiThirdView;
+  void aiGenerating;
+  void onGenerateAi;
 
   if (loading) {
     return (
@@ -1130,23 +1123,37 @@ export default function KyNewClient() {
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">危険予知（1行でもOK）</div>
-          <textarea value={hazards} onChange={(e) => setHazards(e.target.value)} rows={3} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
+          <textarea
+            value={hazards}
+            onChange={(e) => setHazards(e.target.value)}
+            rows={3}
+            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+          />
         </div>
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">対策（1行でもOK）</div>
-          <textarea value={countermeasures} onChange={(e) => setCountermeasures(e.target.value)} rows={3} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
+          <textarea
+            value={countermeasures}
+            onChange={(e) => setCountermeasures(e.target.value)}
+            rows={3}
+            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+          />
         </div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
-        <div className="text-sm font-semibold text-slate-800">第三者（墓参者）の状況</div>
-        <select value={thirdPartyLevel} onChange={(e) => setThirdPartyLevel(e.target.value)} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm">
+        <div className="text-sm font-semibold text-slate-800">第三者の状況</div>
+        <select
+          value={thirdPartyLevel}
+          onChange={(e) => setThirdPartyLevel(e.target.value)}
+          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+        >
           <option value="">選択してください</option>
           <option value="多い">多い</option>
           <option value="少ない">少ない</option>
         </select>
-        <div className="text-xs text-slate-500">※ 墓参者の多少に応じて、誘導・区画分離・声掛け等をAI補足に反映します。</div>
+        <div className="text-xs text-slate-500">※ 第三者の多少に応じて、誘導・区画分離・声掛け等を反映します。</div>
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
@@ -1211,74 +1218,6 @@ export default function KyNewClient() {
             前回写真：<span className="break-all">{pathPrevUrl}</span>
           </div>
         )}
-      </div>
-
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
-        <div className="flex items-center justify-between gap-3">
-          <div className="text-sm font-semibold text-slate-800">AI補足（項目別）</div>
-          <button
-            type="button"
-            onClick={onGenerateAi}
-            disabled={aiGenerating}
-            className={`rounded-lg border px-3 py-2 text-sm ${aiGenerating ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
-          >
-            {aiGenerating ? "生成中..." : "AI補足を生成"}
-          </button>
-        </div>
-
-        <div className="space-y-2">
-          <div className="text-xs text-slate-600">作業内容の補足</div>
-          <textarea value={aiWork} onChange={(e) => setAiWork(e.target.value)} rows={4} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
-        </div>
-
-        <div className="space-y-2">
-          <div className="text-xs text-slate-600">危険予知の補足（上位5項目・番号なし・人入力重複除外）</div>
-          {aiHazardsTop5.length ? (
-            <div className="rounded-lg border border-slate-300 bg-white p-3">
-              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {aiHazardsTop5.map((x, i) => (
-                  <li key={`${x}-${i}`}>{x}</li>
-                ))}
-              </ul>
-            </div>
-          ) : (
-            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
-          )}
-          {/* ※保存値は壊さないため、元テキストはそのまま編集可 */}
-          <textarea value={aiHazards} onChange={(e) => setAiHazards(e.target.value)} rows={4} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
-        </div>
-
-        <div className="space-y-2">
-          <div className="text-xs text-slate-600">対策の補足（上位5項目・番号なし・人入力重複除外）</div>
-          {aiMeasuresTop5.length ? (
-            <div className="rounded-lg border border-slate-300 bg-white p-3">
-              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {aiMeasuresTop5.map((x, i) => (
-                  <li key={`${x}-${i}`}>{x}</li>
-                ))}
-              </ul>
-            </div>
-          ) : (
-            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
-          )}
-          <textarea value={aiCounter} onChange={(e) => setAiCounter(e.target.value)} rows={4} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
-        </div>
-
-        <div className="space-y-2">
-          <div className="text-xs text-slate-600">第三者（墓参者）の補足（番号なし・重複除去）</div>
-          {aiThirdView.length ? (
-            <div className="rounded-lg border border-slate-300 bg-white p-3">
-              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {aiThirdView.map((x, i) => (
-                  <li key={`${x}-${i}`}>{x}</li>
-                ))}
-              </ul>
-            </div>
-          ) : (
-            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
-          )}
-          <textarea value={aiThird} onChange={(e) => setAiThird(e.target.value)} rows={4} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
-        </div>
       </div>
 
       {!!status.text && (
