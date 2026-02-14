@@ -216,17 +216,30 @@ export async function POST(req: Request) {
     }
 
     const outText = extractOutputText(j);
-    let parsed: any = null;
 
-    try {
-      parsed = JSON.parse(outText);
-    } catch {
-      // Structured outputsのはずだが、万一崩れた場合の保険
-      return NextResponse.json(
-        { error: "AI output was not valid JSON", raw: outText },
-        { status: 500 }
-      );
-    }
+// 余計な文字除去（```json や 前後テキストを除去）
+const jsonStart = outText.indexOf("{");
+const jsonEnd = outText.lastIndexOf("}");
+const cleaned =
+  jsonStart >= 0 && jsonEnd >= 0
+    ? outText.slice(jsonStart, jsonEnd + 1)
+    : outText;
+
+let parsed: any = null;
+
+try {
+  parsed = JSON.parse(cleaned);
+} catch {
+  return NextResponse.json(
+    {
+      error: "AI output was not valid JSON",
+      raw: outText,
+      cleaned,
+    },
+    { status: 500 }
+  );
+}
+
 
     // 配列で受けて、UI互換のために改行文字列も返す
     const hazardsArr = Array.isArray(parsed?.hazards) ? parsed.hazards : [];
