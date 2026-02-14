@@ -2,6 +2,25 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
+export const runtime = "nodejs";
+
+function s(v: any) {
+  return v == null ? "" : String(v);
+}
+
+function pick(src: Record<string, any>, keys: string[]) {
+  const out: Record<string, any> = {};
+  for (const k of keys) if (k in src) out[k] = src[k];
+  return out;
+}
+
+function isValidUuid(v: unknown): v is string {
+  if (typeof v !== "string") return false;
+  const x = v.trim();
+  if (!x || x === "undefined") return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(x);
+}
+
 export async function POST(req: Request) {
   try {
     const auth = req.headers.get("authorization") || "";
@@ -22,7 +41,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ ユーザーセッションの検証（なりすまし防止）
+    // ✅ ユーザーセッション検証（なりすまし防止）
     const authed = createClient(url, anonKey, {
       global: { headers: { Authorization: `Bearer ${accessToken}` } },
     });
@@ -31,17 +50,77 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invalid session" }, { status: 401 });
     }
 
-    const body = await req.json();
+    const body = (await req.json().catch(() => ({}))) as Record<string, any>;
 
-    // ✅ Service Role で保存（RLS/401を回避）
-    const admin = createClient(url, serviceKey);
-    const { error } = await admin.from("ky_entries").insert(body);
-
-    if (error) {
-      return NextResponse.json({ error: error.message, details: error.details, hint: error.hint, code: error.code }, { status: 500 });
+    const project_id = s(body.project_id || body.projectId).trim();
+    if (!isValidUuid(project_id)) {
+      return NextResponse.json({ error: "project_id required (uuid)" }, { status: 400 });
     }
 
-    return NextResponse.json({ ok: true });
+    // ✅ 許可キーのみDBに入れる（ゴミ混入防止）
+    const allowed = [
+      "project_id",
+      "work_date",
+      "partner_company_id",
+      "partner_company_name",
+      "worker_count",
+
+      // 人の入力
+      "work_content",
+      "hazards",
+      "countermeasures",
+      "third_party_level",
+
+      // 気象
+      "weather_slots",
+      "weather_applied_slots",
+      "weather_applied_at",
+
+      // 写真スコアなど（将来用）
+      "photo_urls",
+      "photo_score",
+      "photo_score_detail",
+
+      // リスク評価
+      "risk_score_total",
+      "risk_score_breakdown",
+
+      // AI（互換）
+      "ai_work_detail",
+      "ai_hazards",
+      "ai_countermeasures",
+      "ai_third_party",
+      "ai_supplement",
+
+      // ✅ AI正本
+      "ai_risk_items",
+      "ai_profile",
+      "ai_generated_at",
+    ];
+
+    const payload = pick(body, allowed);
+    payload.project_id = project_id;
+
+    const nowIso = new Date().toISOString();
+    if (!payload.ai_profile) payload.ai_profile = "strict";
+    if (payload.ai_risk_items && !payload.ai_generated_at) payload.ai_generated_at = nowIso;
+
+    const admin = createClient(url, serviceKey);
+
+    const { data, error } = await admin
+      .from("ky_entries")
+      .insert(payload)
+      .select("id, project_id")
+      .single();
+
+    if (error) {
+      return NextResponse.json(
+        { error: error.message, details: error.details, hint: error.hint, code: error.code },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({ ok: true, kyId: data?.id, projectId: data?.project_id });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "ky create failed" }, { status: 500 });
   }

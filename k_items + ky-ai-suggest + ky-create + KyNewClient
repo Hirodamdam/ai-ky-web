@@ -1,0 +1,973 @@
+[1mdiff --git a/app/api/ky-create/route.ts b/app/api/ky-create/route.ts[m
+[1mindex 2ad501c..8a90c15 100644[m
+[1m--- a/app/api/ky-create/route.ts[m
+[1m+++ b/app/api/ky-create/route.ts[m
+[36m@@ -2,6 +2,25 @@[m
+ import { NextResponse } from "next/server";[m
+ import { createClient } from "@supabase/supabase-js";[m
+ [m
+[32m+[m[32mexport const runtime = "nodejs";[m
+[32m+[m
+[32m+[m[32mfunction s(v: any) {[m
+[32m+[m[32m  return v == null ? "" : String(v);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction pick(src: Record<string, any>, keys: string[]) {[m
+[32m+[m[32m  const out: Record<string, any> = {};[m
+[32m+[m[32m  for (const k of keys) if (k in src) out[k] = src[k];[m
+[32m+[m[32m  return out;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction isValidUuid(v: unknown): v is string {[m
+[32m+[m[32m  if (typeof v !== "string") return false;[m
+[32m+[m[32m  const x = v.trim();[m
+[32m+[m[32m  if (!x || x === "undefined") return false;[m
+[32m+[m[32m  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(x);[m
+[32m+[m[32m}[m
+[32m+[m
+ export async function POST(req: Request) {[m
+   try {[m
+     const auth = req.headers.get("authorization") || "";[m
+[36m@@ -22,7 +41,7 @@[m [mexport async function POST(req: Request) {[m
+       );[m
+     }[m
+ [m
+[31m-    // ✅ ユーザーセッションの検証（なりすまし防止）[m
+[32m+[m[32m    // ✅ ユーザーセッション検証（なりすまし防止）[m
+     const authed = createClient(url, anonKey, {[m
+       global: { headers: { Authorization: `Bearer ${accessToken}` } },[m
+     });[m
+[36m@@ -31,17 +50,77 @@[m [mexport async function POST(req: Request) {[m
+       return NextResponse.json({ error: "Invalid session" }, { status: 401 });[m
+     }[m
+ [m
+[31m-    const body = await req.json();[m
+[32m+[m[32m    const body = (await req.json().catch(() => ({}))) as Record<string, any>;[m
+[32m+[m
+[32m+[m[32m    const project_id = s(body.project_id || body.projectId).trim();[m
+[32m+[m[32m    if (!isValidUuid(project_id)) {[m
+[32m+[m[32m      return NextResponse.json({ error: "project_id required (uuid)" }, { status: 400 });[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    // ✅ 許可キーのみDBに入れる（ゴミ混入防止）[m
+[32m+[m[32m    const allowed = [[m
+[32m+[m[32m      "project_id",[m
+[32m+[m[32m      "work_date",[m
+[32m+[m[32m      "partner_company_id",[m
+[32m+[m[32m      "partner_company_name",[m
+[32m+[m[32m      "worker_count",[m
+[32m+[m
+[32m+[m[32m      // 人の入力[m
+[32m+[m[32m      "work_content",[m
+[32m+[m[32m      "hazards",[m
+[32m+[m[32m      "countermeasures",[m
+[32m+[m[32m      "third_party_level",[m
+[32m+[m
+[32m+[m[32m      // 気象[m
+[32m+[m[32m      "weather_slots",[m
+[32m+[m[32m      "weather_applied_slots",[m
+[32m+[m[32m      "weather_applied_at",[m
+[32m+[m
+[32m+[m[32m      // 写真スコアなど（将来用）[m
+[32m+[m[32m      "photo_urls",[m
+[32m+[m[32m      "photo_score",[m
+[32m+[m[32m      "photo_score_detail",[m
+[32m+[m
+[32m+[m[32m      // リスク評価[m
+[32m+[m[32m      "risk_score_total",[m
+[32m+[m[32m      "risk_score_breakdown",[m
+[32m+[m
+[32m+[m[32m      // AI（互換）[m
+[32m+[m[32m      "ai_work_detail",[m
+[32m+[m[32m      "ai_hazards",[m
+[32m+[m[32m      "ai_countermeasures",[m
+[32m+[m[32m      "ai_third_party",[m
+[32m+[m[32m      "ai_supplement",[m
+[32m+[m
+[32m+[m[32m      // ✅ AI正本[m
+[32m+[m[32m      "ai_risk_items",[m
+[32m+[m[32m      "ai_profile",[m
+[32m+[m[32m      "ai_generated_at",[m
+[32m+[m[32m    ];[m
+[32m+[m
+[32m+[m[32m    const payload = pick(body, allowed);[m
+[32m+[m[32m    payload.project_id = project_id;[m
+[32m+[m
+[32m+[m[32m    const nowIso = new Date().toISOString();[m
+[32m+[m[32m    if (!payload.ai_profile) payload.ai_profile = "strict";[m
+[32m+[m[32m    if (payload.ai_risk_items && !payload.ai_generated_at) payload.ai_generated_at = nowIso;[m
+ [m
+[31m-    // ✅ Service Role で保存（RLS/401を回避）[m
+     const admin = createClient(url, serviceKey);[m
+[31m-    const { error } = await admin.from("ky_entries").insert(body);[m
+[32m+[m
+[32m+[m[32m    const { data, error } = await admin[m
+[32m+[m[32m      .from("ky_entries")[m
+[32m+[m[32m      .insert(payload)[m
+[32m+[m[32m      .select("id, project_id")[m
+[32m+[m[32m      .single();[m
+ [m
+     if (error) {[m
+[31m-      return NextResponse.json({ error: error.message, details: error.details, hint: error.hint, code: error.code }, { status: 500 });[m
+[32m+[m[32m      return NextResponse.json([m
+[32m+[m[32m        { error: error.message, details: error.details, hint: error.hint, code: error.code },[m
+[32m+[m[32m        { status: 500 }[m
+[32m+[m[32m      );[m
+     }[m
+ [m
+[31m-    return NextResponse.json({ ok: true });[m
+[32m+[m[32m    return NextResponse.json({ ok: true, kyId: data?.id, projectId: data?.project_id });[m
+   } catch (e: any) {[m
+     return NextResponse.json({ error: e?.message ?? "ky create failed" }, { status: 500 });[m
+   }[m
+[1mdiff --git a/app/projects/[id]/ky/new/KyNewClient.tsx b/app/projects/[id]/ky/new/KyNewClient.tsx[m
+[1mindex ad19e4c..1b47b05 100644[m
+[1m--- a/app/projects/[id]/ky/new/KyNewClient.tsx[m
+[1m+++ b/app/projects/[id]/ky/new/KyNewClient.tsx[m
+[36m@@ -31,6 +31,14 @@[m [mtype Project = {[m
+ [m
+ type PartnerOption = { value: string; name: string };[m
+ [m
+[32m+[m[32mtype RiskItem = {[m
+[32m+[m[32m  rank: number;[m
+[32m+[m[32m  hazard: string;[m
+[32m+[m[32m  countermeasure: string;[m
+[32m+[m[32m  score?: number;[m
+[32m+[m[32m  tags?: string[];[m
+[32m+[m[32m};[m
+[32m+[m
+ function s(v: any) {[m
+   if (v == null) return "";[m
+   return String(v);[m
+[36m@@ -58,71 +66,11 @@[m [mfunction degToDirJp(deg: number | null | undefined): string {[m
+   return dirs[idx];[m
+ }[m
+ [m
+[31m-function normalizeText(text: string): string {[m
+[31m-  return (text || "").replace(/\r\n/g, "\n").replace(/\u3000/g, " ").trim();[m
+[31m-}[m
+[31m-[m
+[31m-function splitAiCombined(text: string): { work: string; hazards: string; countermeasures: string; third: string } {[m
+[31m-  const src = (text || "").trim();[m
+[31m-  if (!src) return { work: "", hazards: "", countermeasures: "", third: "" };[m
+[31m-[m
+[31m-  const makeBracketRe = (label: string) =>[m
+[31m-    new RegExp(String.raw`(?:^|\n)\s*(?:[•・\-*]\s*)?[【\[]\s*AI補足\s*[｜|]\s*${label}\s*[】\]]`, "g");[m
+[31m-[m
+[31m-  const headings: Array<{ key: "work" | "hazards" | "countermeasures" | "third"; re: RegExp }> = [[m
+[31m-    { key: "work", re: makeBracketRe("作業内容") },[m
+[31m-    { key: "hazards", re: makeBracketRe("危険予知") },[m
+[31m-    { key: "countermeasures", re: makeBracketRe("対策") },[m
+[31m-    { key: "third", re: makeBracketRe("第三者(?:\\s*（\\s*墓参者\\s*）)?") },[m
+[31m-    { key: "work", re: /(?:^|\n)\s*(作業内容)\s*[:：]/g },[m
+[31m-    { key: "hazards", re: /(?:^|\n)\s*(危険予知)\s*[:：]/g },[m
+[31m-    { key: "countermeasures", re: /(?:^|\n)\s*(対策)\s*[:：]/g },[m
+[31m-    { key: "third", re: /(?:^|\n)\s*(第三者|墓参者)\s*[:：]/g },[m
+[31m-  ];[m
+[31m-[m
+[31m-  const marks: Array<{ idx: number; key: "work" | "hazards" | "countermeasures" | "third"; len: number }> = [];[m
+[31m-  for (const h of headings) {[m
+[31m-    let m: RegExpExecArray | null;[m
+[31m-    h.re.lastIndex = 0;[m
+[31m-    while ((m = h.re.exec(src))) marks.push({ idx: m.index, key: h.key, len: m[0].length });[m
+[31m-  }[m
+[31m-  marks.sort((a, b) => a.idx - b.idx);[m
+[31m-[m
+[31m-  if (!marks.length) return { work: src, hazards: "", countermeasures: "", third: "" };[m
+[31m-[m
+[31m-  const out = { work: "", hazards: "", countermeasures: "", third: "" };[m
+[31m-  for (let i = 0; i < marks.length; i++) {[m
+[31m-    const cur = marks[i];[m
+[31m-    const next = marks[i + 1];[m
+[31m-    const start = cur.idx + cur.len;[m
+[31m-    const end = next ? next.idx : src.length;[m
+[31m-    const chunk = src.slice(start, end).trim();[m
+[31m-    if (!chunk) continue;[m
+[31m-    (out as any)[cur.key] = (out as any)[cur.key] ? `${(out as any)[cur.key]}\n${chunk}` : chunk;[m
+[31m-  }[m
+[31m-  return out;[m
+[31m-}[m
+[31m-[m
+ function extFromName(name: string): string {[m
+   const m = name.toLowerCase().match(/\.([a-z0-9]+)$/);[m
+   return m ? m[1] : "jpg";[m
+ }[m
+ [m
+[31m-// ky_photos の列名差を吸収[m
+[31m-function pickKind(row: any): string {[m
+[31m-  return s(row?.photo_kind).trim() || s(row?.kind).trim() || s(row?.type).trim() || s(row?.category).trim() || "";[m
+[31m-}[m
+[31m-function pickUrl(row: any): string {[m
+[31m-  return ([m
+[31m-    s(row?.image_url).trim() ||[m
+[31m-    s(row?.photo_url).trim() ||[m
+[31m-    s(row?.url).trim() ||[m
+[31m-    s(row?.photo_path).trim() ||[m
+[31m-    s(row?.path).trim() ||[m
+[31m-    ""[m
+[31m-  );[m
+[31m-}[m
+[31m-[m
+ function slotSummary(slot: WeatherSlot | null | undefined): string {[m
+   if (!slot) return "";[m
+   const w = slot.weather_text || "（不明）";[m
+[36m@@ -133,121 +81,11 @@[m [mfunction slotSummary(slot: WeatherSlot | null | undefined): string {[m
+   return `${w} / 気温${t} / 風${wd} ${ws} / 降水${p}`;[m
+ }[m
+ [m
+[31m-/** ===== 表示用整形（レビューと同じ） ===== */[m
+[31m-[m
+[31m-function normalizeLineBase(raw: string): string {[m
+[31m-  return raw.replace(/^[•・\-*]\s*/, "").replace(/\s+/g, " ").trim();[m
+[31m-}[m
+[31m-[m
+[31m-function stripGenericAccidentNote(x: string): string {[m
+[31m-  return x[m
+[31m-    .replace(/（\s*事故につながる恐れ\s*）/g, "")[m
+[31m-    .replace(/（\s*事故に繋がる恐れ\s*）/g, "")[m
+[31m-    .replace(/（\s*事故につながる可能性\s*）/g, "")[m
+[31m-    .replace(/（\s*事故に繋がる可能性\s*）/g, "")[m
+[31m-    .trim();[m
+[31m-}[m
+[31m-[m
+[31m-function takeRightOfArrow(line: string): string {[m
+[31m-  const t = line;[m
+[31m-  const seps = ["→", "⇒", "->", "＞", "〉"];[m
+[31m-  for (const sep of seps) {[m
+[31m-    const idx = t.indexOf(sep);[m
+[31m-    if (idx >= 0) {[m
+[31m-      const right = t.slice(idx + sep.length).trim();[m
+[31m-      if (right) return right;[m
+[31m-    }[m
+[31m-  }[m
+[31m-  return t.trim();[m
+[31m-}[m
+[31m-[m
+[31m-function dedupeKeepOrder(arr: string[]): string[] {[m
+[31m-  const seen = new Set<string>();[m
+[31m-  const out: string[] = [];[m
+[31m-  for (const x of arr) {[m
+[31m-    const k = x.trim();[m
+[31m-    if (!k) continue;[m
+[31m-    if (seen.has(k)) continue;[m
+[31m-    seen.add(k);[m
+[31m-    out.push(k);[m
+[31m-  }[m
+[31m-  return out;[m
+[31m-}[m
+[31m-[m
+[31m-// 危険予知：右側だけ採用、(事故につながる恐れ)削除、最大5件、番号なし[m
+[31m-function formatHazardsForView5(text: string): string[] {[m
+[31m-  const lines = String(text ?? "")[m
+[31m-    .replace(/\r\n/g, "\n")[m
+[31m-    .split("\n")[m
+[31m-    .map((x) => x.trim())[m
+[31m-    .filter(Boolean);[m
+[31m-[m
+[31m-  const picked: string[] = [];[m
+[31m-  for (const l0 of lines) {[m
+[31m-    const base = normalizeLineBase(l0);[m
+[31m-    if (!base) continue;[m
+[31m-[m
+[31m-    let v = takeRightOfArrow(base);[m
+[31m-    v = stripGenericAccidentNote(v);[m
+[31m-    v = v.replace(/（\s*[^）]*事故[^）]*恐れ\s*）\s*$/g, "").trim();[m
+[31m-[m
+[31m-    if (/^危険予知/i.test(v) || /^対策/i.test(v) || /^AI補足/i.test(v)) continue;[m
+[31m-    if (v) picked.push(v);[m
+[31m-  }[m
+[31m-  return dedupeKeepOrder(picked).slice(0, 5);[m
+[31m-}[m
+[31m-[m
+[31m-function splitMeasuresLine(line: string): string[] {[m
+[31m-  const t = line.trim();[m
+[31m-  const noLead = t.replace(/^\s*\[\s*\d+\s*\]\s*/g, "").replace(/^\s*\d+[)\.]\s*/g, "").trim();[m
+[31m-[m
+[31m-  const hasMulti = /\[\s*\d+\s*\]/.test(noLead);[m
+[31m-  if (!hasMulti) return [noLead];[m
+[31m-[m
+[31m-  const parts = noLead[m
+[31m-    .split(/\[\s*\d+\s*\]/g)[m
+[31m-    .map((x) => x.replace(/^[、,\s]+/, "").trim())[m
+[31m-    .filter(Boolean);[m
+[31m-[m
+[31m-  return parts.length ? parts : [noLead];[m
+[31m-}[m
+[31m-[m
+[31m-// 対策：番号削除、右側だけ採用、最大5件、番号なし[m
+[31m-function formatMeasuresForView5(text: string): string[] {[m
+[31m-  const lines = String(text ?? "")[m
+[31m-    .replace(/\r\n/g, "\n")[m
+[31m-    .split("\n")[m
+[31m-    .map((x) => x.trim())[m
+[31m-    .filter(Boolean);[m
+[31m-[m
+[31m-  const items: string[] = [];[m
+[31m-  for (const l0 of lines) {[m
+[31m-    const base0 = normalizeLineBase(l0);[m
+[31m-    if (!base0) continue;[m
+[31m-[m
+[31m-    const parts = splitMeasuresLine(base0);[m
+[31m-    for (let p of parts) {[m
+[31m-      p = normalizeLineBase(p);[m
+[31m-      if (!p) continue;[m
+[31m-[m
+[31m-      p = takeRightOfArrow(p);[m
+[31m-[m
+[31m-      if (/^対策/i.test(p) || /^AI補足/i.test(p)) continue;[m
+[31m-      if (p) items.push(p);[m
+[31m-    }[m
+[31m-  }[m
+[31m-  return dedupeKeepOrder(items).slice(0, 5);[m
+[32m+[m[32mfunction bulletsFromItemsHazards(items: RiskItem[]) {[m
+[32m+[m[32m  return items.map((x) => `・${x.hazard}`).join("\n");[m
+ }[m
+[31m-[m
+[31m-// 第三者：番号なし（今は上限なし）[m
+[31m-function formatThirdForView(text: string): string[] {[m
+[31m-  return String(text ?? "")[m
+[31m-    .replace(/\r\n/g, "\n")[m
+[31m-    .split("\n")[m
+[31m-    .map((x) => x.trim())[m
+[31m-    .filter(Boolean)[m
+[31m-    .map((x) => x.replace(/^[•・\-*]\s*/, "").trim())[m
+[31m-    .filter(Boolean);[m
+[32m+[m[32mfunction bulletsFromItemsMeasures(items: RiskItem[]) {[m
+[32m+[m[32m  return items.map((x) => `・（${x.rank}）${x.countermeasure}`).join("\n");[m
+ }[m
+ [m
+ export default function KyNewClient() {[m
+[36m@@ -274,7 +112,6 @@[m [mexport default function KyNewClient() {[m
+   const [partnerCompanyName, setPartnerCompanyName] = useState<string>("");[m
+   const [partnerOptions, setPartnerOptions] = useState<PartnerOption[]>([]);[m
+ [m
+[31m-  // ✅ 本日の作業員数[m
+   const [workerCount, setWorkerCount] = useState<string>("");[m
+ [m
+   const [workDetail, setWorkDetail] = useState("");[m
+[36m@@ -287,32 +124,28 @@[m [mexport default function KyNewClient() {[m
+   const [selectedSlotHour, setSelectedSlotHour] = useState<9 | 12 | 15 | null>(null);[m
+   const [appliedSlotHour, setAppliedSlotHour] = useState<9 | 12 | 15 | null>(null);[m
+ [m
+[32m+[m[32m  // 写真（最小構成）[m
+   const slopeFileRef = useRef<HTMLInputElement | null>(null);[m
+   const pathFileRef = useRef<HTMLInputElement | null>(null);[m
+[31m-[m
+   const [slopeMode, setSlopeMode] = useState<"url" | "file" | "none">("none");[m
+   const [pathMode, setPathMode] = useState<"url" | "file" | "none">("none");[m
+[31m-[m
+   const [slopeFile, setSlopeFile] = useState<File | null>(null);[m
+   const [pathFile, setPathFile] = useState<File | null>(null);[m
+[31m-[m
+   const [slopeFileName, setSlopeFileName] = useState("");[m
+   const [pathFileName, setPathFileName] = useState("");[m
+[32m+[m[32m  const [slopeNowUrlCached, setSlopeNowUrlCached] = useState<string>("");[m
+[32m+[m[32m  const [pathNowUrlCached, setPathNowUrlCached] = useState<string>("");[m
+ [m
+[31m-  const [slopePrevUrl, setSlopePrevUrl] = useState<string>("");[m
+[31m-  const [pathPrevUrl, setPathPrevUrl] = useState<string>("");[m
+[32m+[m[32m  // AI（正本）[m
+[32m+[m[32m  const [aiRiskItems, setAiRiskItems] = useState<RiskItem[]>([]);[m
+[32m+[m[32m  const [aiProfile] = useState<"strict" | "normal">("strict");[m
+ [m
+[31m-  const [aiWork, setAiWork] = useState("");[m
+[32m+[m[32m  // 互換（旧カラム用）[m
+   const [aiHazards, setAiHazards] = useState("");[m
+   const [aiCounter, setAiCounter] = useState("");[m
+   const [aiThird, setAiThird] = useState("");[m
+[31m-[m
+   const [aiGenerating, setAiGenerating] = useState(false);[m
+ [m
+[31m-  // ✅ AI生成時にアップロード済みのURLをキャッシュ（保存時の二重アップ防止）[m
+[31m-  const [slopeNowUrlCached, setSlopeNowUrlCached] = useState<string>("");[m
+[31m-  const [pathNowUrlCached, setPathNowUrlCached] = useState<string>("");[m
+[31m-[m
+   const KY_PHOTO_BUCKET = process.env.NEXT_PUBLIC_KY_PHOTO_BUCKET || "ky-photos";[m
+ [m
+   const slopeUrlFromProject = useMemo(() => s(project?.slope_camera_snapshot_url).trim(), [project?.slope_camera_snapshot_url]);[m
+[36m@@ -351,34 +184,9 @@[m [mexport default function KyNewClient() {[m
+         }[m
+       }[m
+ [m
+[31m-      const { data: prevPhotos, error: prevErr } = await (supabase as any)[m
+[31m-        .from("ky_photos")[m
+[31m-        .select("*")[m
+[31m-        .eq("project_id", projectId)[m
+[31m-        .order("created_at", { ascending: false })[m
+[31m-        .limit(50);[m
+[31m-[m
+[31m-      let prevSlope = "";[m
+[31m-      let prevPath = "";[m
+[31m-      if (!prevErr && Array.isArray(prevPhotos)) {[m
+[31m-        for (const p of prevPhotos) {[m
+[31m-          const kind = pickKind(p);[m
+[31m-          const url = pickUrl(p);[m
+[31m-          if (!url) continue;[m
+[31m-[m
+[31m-          // ✅ kind=="" を両方に入れる事故を避ける（空は採用しない）[m
+[31m-          if (!prevSlope && (kind === "slope" || kind === "法面" || kind === "slope_photo")) prevSlope = url;[m
+[31m-          if (!prevPath && (kind === "path" || kind === "通路" || kind === "path_photo")) prevPath = url;[m
+[31m-[m
+[31m-          if (prevSlope && prevPath) break;[m
+[31m-        }[m
+[31m-      }[m
+[31m-[m
+       if (mountedRef.current) {[m
+         setProject((proj as any) ?? null);[m
+         setPartnerOptions(opts);[m
+[31m-        setSlopePrevUrl(prevSlope);[m
+[31m-        setPathPrevUrl(prevPath);[m
+       }[m
+     } catch (e: any) {[m
+       if (mountedRef.current) setStatus({ type: "error", text: e?.message ?? "読み込みに失敗しました" });[m
+[36m@@ -391,7 +199,7 @@[m [mexport default function KyNewClient() {[m
+     fetchInitial();[m
+   }, [fetchInitial]);[m
+ [m
+[31m-  // ✅ weather：POSTが405ならGETへフォールバック[m
+[32m+[m[32m  // weather[m
+   const fetchWeather = useCallback(async () => {[m
+     const lat = project?.lat ?? null;[m
+     const lon = project?.lon ?? null;[m
+[36m@@ -424,13 +232,8 @@[m [mexport default function KyNewClient() {[m
+         .sort((a, b) => a.hour - b.hour);[m
+ [m
+       setWeatherSlots(normalized);[m
+[31m-[m
+[31m-      if (normalized.length) {[m
+[31m-        setSelectedSlotHour(normalized[0].hour);[m
+[31m-      } else {[m
+[31m-        setSelectedSlotHour(null);[m
+[31m-        setAppliedSlotHour(null);[m
+[31m-      }[m
+[32m+[m[32m      setSelectedSlotHour(normalized.length ? normalized[0].hour : null);[m
+[32m+[m[32m      if (!normalized.length) setAppliedSlotHour(null);[m
+     } catch {[m
+       setWeatherSlots([]);[m
+       setSelectedSlotHour(null);[m
+[36m@@ -447,7 +250,6 @@[m [mexport default function KyNewClient() {[m
+     setAppliedSlotHour(selectedSlotHour);[m
+   }, [selectedSlotHour]);[m
+ [m
+[31m-  // ✅ 適用枠を先頭へ（保存にも使う）[m
+   const appliedSlots = useMemo(() => {[m
+     if (!appliedSlotHour) return weatherSlots;[m
+     const arr = [...weatherSlots];[m
+[36m@@ -464,6 +266,7 @@[m [mexport default function KyNewClient() {[m
+     return weatherSlots.find((x) => x.hour === appliedSlotHour) ?? null;[m
+   }, [weatherSlots, appliedSlotHour]);[m
+ [m
+[32m+[m[32m  // 写真入力[m
+   const onPickSlopeFile = useCallback(() => slopeFileRef.current?.click(), []);[m
+   const onPickPathFile = useCallback(() => pathFileRef.current?.click(), []);[m
+ [m
+[36m@@ -474,7 +277,7 @@[m [mexport default function KyNewClient() {[m
+     setSlopeMode("file");[m
+     setSlopeFile(f);[m
+     setSlopeFileName(f.name);[m
+[31m-    setSlopeNowUrlCached(""); // ✅ 切り替えたらキャッシュを破棄[m
+[32m+[m[32m    setSlopeNowUrlCached("");[m
+   }, []);[m
+ [m
+   const onPathFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {[m
+[36m@@ -484,7 +287,7 @@[m [mexport default function KyNewClient() {[m
+     setPathMode("file");[m
+     setPathFile(f);[m
+     setPathFileName(f.name);[m
+[31m-    setPathNowUrlCached(""); // ✅ 切り替えたらキャッシュを破棄[m
+[32m+[m[32m    setPathNowUrlCached("");[m
+   }, []);[m
+ [m
+   const uploadToStorage = useCallback([m
+[36m@@ -507,117 +310,55 @@[m [mexport default function KyNewClient() {[m
+     [KY_PHOTO_BUCKET, projectId][m
+   );[m
+ [m
+[31m-  const buildAiPayload = useCallback(async () => {[m
+[31m-    const w = workDetail.trim();[m
+[31m-    if (!w) throw new Error("作業内容（必須）を入力してください");[m
+[31m-[m
+[31m-    let slopeNowUrl: string | null = null;[m
+[31m-    let pathNowUrl: string | null = null;[m
+[31m-[m
+[31m-    // ✅ まずキャッシュがあればそれを使う[m
+[31m-    if (slopeNowUrlCached) slopeNowUrl = slopeNowUrlCached;[m
+[31m-    else {[m
+[31m-      if (slopeMode === "url") slopeNowUrl = slopeUrlFromProject || null;[m
+[31m-      if (slopeMode === "file" && slopeFile) slopeNowUrl = await uploadToStorage(slopeFile, "slope");[m
+[31m-    }[m
+[31m-[m
+[31m-    if (pathNowUrlCached) pathNowUrl = pathNowUrlCached;[m
+[31m-    else {[m
+[31m-      if (pathMode === "url") pathNowUrl = pathUrlFromProject || null;[m
+[31m-      if (pathMode === "file" && pathFile) pathNowUrl = await uploadToStorage(pathFile, "path");[m
+[31m-    }[m
+[31m-[m
+[31m-    // ✅ AI生成で一度アップしたURLは保存時にも使えるようにキャッシュ[m
+[31m-    if (slopeNowUrl) setSlopeNowUrlCached(slopeNowUrl);[m
+[31m-    if (pathNowUrl) setPathNowUrlCached(pathNowUrl);[m
+[31m-[m
+[31m-    const slotsForAi = (appliedSlots || []).map((x) => ({[m
+[31m-      hour: x.hour,[m
+[31m-      weather_text: x.weather_text,[m
+[31m-      temperature_c: x.temperature_c ?? null,[m
+[31m-      wind_direction_deg: x.wind_direction_deg ?? null,[m
+[31m-      wind_speed_ms: x.wind_speed_ms ?? null,[m
+[31m-      precipitation_mm: x.precipitation_mm ?? null,[m
+[31m-    }));[m
+[31m-[m
+[31m-    const lat = project?.lat ?? null;[m
+[31m-    const lon = project?.lon ?? null;[m
+[31m-[m
+[31m-    return {[m
+[31m-      work_detail: w,[m
+[31m-      hazards: hazards.trim() ? hazards.trim() : null,[m
+[31m-      countermeasures: countermeasures.trim() ? countermeasures.trim() : null,[m
+[31m-      third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,[m
+[31m-[m
+[31m-      worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,[m
+[31m-[m
+[31m-      lat,[m
+[31m-      lon,[m
+[31m-[m
+[31m-      weather_slots: slotsForAi.length ? slotsForAi : null,[m
+[31m-      slope_photo_url: slopeNowUrl,[m
+[31m-      slope_prev_photo_url: slopePrevUrl || null,[m
+[31m-      path_photo_url: pathNowUrl,[m
+[31m-      path_prev_photo_url: pathPrevUrl || null,[m
+[31m-    };[m
+[31m-  }, [[m
+[31m-    workDetail,[m
+[31m-    hazards,[m
+[31m-    countermeasures,[m
+[31m-    thirdPartyLevel,[m
+[31m-    workerCount,[m
+[31m-    appliedSlots,[m
+[31m-    slopeMode,[m
+[31m-    pathMode,[m
+[31m-    slopeUrlFromProject,[m
+[31m-    pathUrlFromProject,[m
+[31m-    slopeFile,[m
+[31m-    pathFile,[m
+[31m-    uploadToStorage,[m
+[31m-    slopePrevUrl,[m
+[31m-    pathPrevUrl,[m
+[31m-    project?.lat,[m
+[31m-    project?.lon,[m
+[31m-    slopeNowUrlCached,[m
+[31m-    pathNowUrlCached,[m
+[31m-  ]);[m
+[31m-[m
+[32m+[m[32m  // ✅ AI生成：作業内容から（ChatGPT推論＋ガード）→ ai_risk_items[m
+   const onGenerateAi = useCallback(async () => {[m
+     setStatus({ type: null, text: "生成中..." });[m
+     setAiGenerating(true);[m
+ [m
+     try {[m
+[31m-      const payload = await buildAiPayload();[m
+[32m+[m[32m      const w = workDetail.trim();[m
+[32m+[m[32m      if (!w) throw new Error("作業内容（必須）を入力してください");[m
+ [m
+[31m-      const res = await fetch("/api/ky-ai-supplement", {[m
+[32m+[m[32m      const res = await fetch("/api/ky-ai-suggest", {[m
+         method: "POST",[m
+         headers: { "Content-Type": "application/json" },[m
+         cache: "no-store",[m
+[31m-        body: JSON.stringify(payload),[m
+[32m+[m[32m        body: JSON.stringify({[m
+[32m+[m[32m          workContent: w,[m
+[32m+[m[32m          hazardsText: hazards || "",[m
+[32m+[m[32m          thirdPartyLevel: thirdPartyLevel || "",[m
+[32m+[m[32m          profile: aiProfile,[m
+[32m+[m[32m        }),[m
+       });[m
+ [m
+       const j = await res.json().catch(() => ({}));[m
+       if (!res.ok) throw new Error(j?.error || "AI補足生成に失敗しました");[m
+ [m
+[31m-      const w = normalizeText(s(j?.ai_work_detail));[m
+[31m-      const h = normalizeText(s(j?.ai_hazards));[m
+[31m-      const c = normalizeText(s(j?.ai_countermeasures));[m
+[31m-      const t = normalizeText(s(j?.ai_third_party));[m
+[31m-[m
+[31m-      if (w || h || c || t) {[m
+[31m-        setAiWork(w);[m
+[31m-        setAiHazards(h);[m
+[31m-        setAiCounter(c);[m
+[31m-        setAiThird(t);[m
+[31m-      } else {[m
+[31m-        const combined = normalizeText(s(j?.ai_supplement));[m
+[31m-        const split = splitAiCombined(combined);[m
+[31m-[m
+[31m-        setAiWork(normalizeText(split.work));[m
+[31m-        setAiHazards(normalizeText(split.hazards));[m
+[31m-        setAiCounter(normalizeText(split.countermeasures));[m
+[31m-        setAiThird(normalizeText(split.third));[m
+[31m-      }[m
+[32m+[m[32m      const items = Array.isArray(j?.ai_risk_items) ? (j.ai_risk_items as RiskItem[]) : [];[m
+[32m+[m[32m      setAiRiskItems(items);[m
+[32m+[m
+[32m+[m[32m      // 互換もセット（保存・レビュー互換用）[m
+[32m+[m[32m      setAiHazards(s(j?.ai_hazards || bulletsFromItemsHazards(items)));[m
+[32m+[m[32m      setAiCounter(s(j?.ai_countermeasures || bulletsFromItemsMeasures(items)));[m
+[32m+[m
+[32m+[m[32m      // 第三者（現状OKとのことなので簡易で十分）[m
+[32m+[m[32m      const third = (() => {[m
+[32m+[m[32m        if (thirdPartyLevel === "多い") {[m
+[32m+[m[32m          return [[m
+[32m+[m[32m            "・誘導員を配置し、墓参者の動線を常時監視すること",[m
+[32m+[m[32m            "・作業区画をコーン・バーで明確化し、立入規制を行うこと",[m
+[32m+[m[32m            "・接近があれば作業を一時中断し、安全確保後に再開すること",[m
+[32m+[m[32m          ].join("\n");[m
+[32m+[m[32m        }[m
+[32m+[m[32m        if (thirdPartyLevel === "少ない") {[m
+[32m+[m[32m          return [[m
+[32m+[m[32m            "・出入口付近に注意喚起表示を行い、声掛けを徹底すること",[m
+[32m+[m[32m            "・接近時は作業を一時停止し、誘導して安全を確保すること",[m
+[32m+[m[32m          ].join("\n");[m
+[32m+[m[32m        }[m
+[32m+[m[32m        return "";[m
+[32m+[m[32m      })();[m
+[32m+[m[32m      setAiThird(third);[m
+ [m
+       setStatus({ type: "success", text: "AI補足を生成しました" });[m
+     } catch (e: any) {[m
+[36m@@ -625,8 +366,30 @@[m [mexport default function KyNewClient() {[m
+     } finally {[m
+       setAiGenerating(false);[m
+     }[m
+[31m-  }, [buildAiPayload]);[m
+[32m+[m[32m  }, [workDetail, hazards, thirdPartyLevel, aiProfile]);[m
+[32m+[m
+[32m+[m[32m  const WeatherCard = useCallback(({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) => {[m
+[32m+[m[32m    const isApplied = appliedHour != null && slot.hour === appliedHour;[m
+[32m+[m[32m    return ([m
+[32m+[m[32m      <div className={`rounded-lg border p-3 ${isApplied ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`}>[m
+[32m+[m[32m        <div className="flex items-center justify-between">[m
+[32m+[m[32m          <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>[m
+[32m+[m[32m          {isApplied && <div className="text-xs font-semibold text-emerald-700">適用中</div>}[m
+[32m+[m[32m        </div>[m
+[32m+[m[32m        <div className="mt-1 text-sm text-slate-700">{slot.weather_text || "（不明）"}</div>[m
+[32m+[m[32m        <div className="mt-2 text-xs text-slate-600 space-y-1">[m
+[32m+[m[32m          <div>気温：{slot.temperature_c ?? "—"} ℃</div>[m
+[32m+[m[32m          <div>[m
+[32m+[m[32m            風：{degToDirJp(slot.wind_direction_deg) || "—"}{" "}[m
+[32m+[m[32m            {slot.wind_speed_ms !== null && slot.wind_speed_ms !== undefined ? `${slot.wind_speed_ms} m/s` : "—"}[m
+[32m+[m[32m          </div>[m
+[32m+[m[32m          <div>降水：{slot.precipitation_mm ?? "—"} mm</div>[m
+[32m+[m[32m        </div>[m
+[32m+[m[32m      </div>[m
+[32m+[m[32m    );[m
+[32m+[m[32m  }, []);[m
+ [m
+[32m+[m[32m  // ✅ 保存：/api/ky-create 経由（kyIdを受け取ってレビューへ）[m
+   const onSave = useCallback(async () => {[m
+     setStatus({ type: null, text: "" });[m
+ [m
+[36m@@ -641,10 +404,15 @@[m [mexport default function KyNewClient() {[m
+ [m
+     setSaving(true);[m
+     try {[m
+[32m+[m[32m      // ✅ session token[m
+[32m+[m[32m      const { data: sess } = await supabase.auth.getSession();[m
+[32m+[m[32m      const accessToken = s(sess?.session?.access_token).trim();[m
+[32m+[m[32m      if (!accessToken) throw new Error("ログインが必要です（access tokenなし）");[m
+[32m+[m
+[32m+[m[32m      // ✅ 写真URL確定（キャッシュ優先）[m
+       let slopeSavedUrl: string | null = null;[m
+       let pathSavedUrl: string | null = null;[m
+ [m
+[31m-      // ✅ AI生成でアップ済みならそれを使う（重複アップ防止）[m
+       if (slopeNowUrlCached) slopeSavedUrl = slopeNowUrlCached;[m
+       else {[m
+         if (slopeMode === "file" && slopeFile) slopeSavedUrl = await uploadToStorage(slopeFile, "slope");[m
+[36m@@ -657,45 +425,48 @@[m [mexport default function KyNewClient() {[m
+         else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;[m
+       }[m
+ [m
+[31m-      const insertPayload: any = {[m
+[32m+[m[32m      // ✅ ky-create payload（キー名：work_content）[m
+[32m+[m[32m      const createPayload: any = {[m
+         project_id: projectId,[m
+         work_date: workDate,[m
+[31m-        work_detail: workDetail.trim(),[m
+[32m+[m[32m        partner_company_name: partnerCompanyName.trim(),[m
+[32m+[m
+[32m+[m[32m        worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,[m
+[32m+[m
+[32m+[m[32m        work_content: workDetail.trim(),[m
+         hazards: hazards.trim() ? hazards.trim() : null,[m
+         countermeasures: countermeasures.trim() ? countermeasures.trim() : null,[m
+         third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,[m
+[31m-        partner_company_name: partnerCompanyName.trim(),[m
+ [m
+[31m-        // ✅ 適用枠を先頭にした並びで保存（レビューで先頭＝適用枠として使う）[m
+         weather_slots: appliedSlots && appliedSlots.length ? appliedSlots : null,[m
+ [m
+[31m-        worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,[m
+[31m-[m
+[31m-        // ✅ 保存は壊さない（表示だけ出さない）[m
+[31m-        ai_work_detail: aiWork.trim() ? aiWork.trim() : null,[m
+[32m+[m[32m        // AI互換[m
+[32m+[m[32m        ai_work_detail: null,[m
+         ai_hazards: aiHazards.trim() ? aiHazards.trim() : null,[m
+         ai_countermeasures: aiCounter.trim() ? aiCounter.trim() : null,[m
+         ai_third_party: aiThird.trim() ? aiThird.trim() : null,[m
+[31m-        ai_supplement: [[m
+[31m-          "【AI補足｜作業内容】",[m
+[31m-          aiWork.trim(),[m
+[31m-          "【AI補足｜危険予知】",[m
+[31m-          aiHazards.trim(),[m
+[31m-          "【AI補足｜対策】",[m
+[31m-          aiCounter.trim(),[m
+[31m-          "【AI補足｜第三者】",[m
+[31m-          aiThird.trim(),[m
+[31m-        ][m
+[31m-          .filter(Boolean)[m
+[31m-          .join("\n"),[m
+[32m+[m
+[32m+[m[32m        // ✅ AI正本[m
+[32m+[m[32m        ai_risk_items: aiRiskItems.length ? aiRiskItems.slice(0, 5) : null,[m
+[32m+[m[32m        ai_profile: "strict",[m
+       };[m
+ [m
+[31m-      const { data: inserted, error: insErr } = await (supabase as any).from("ky_entries").insert(insertPayload).select("id").maybeSingle();[m
+[31m-      if (insErr) throw insErr;[m
+[32m+[m[32m      const resp = await fetch("/api/ky-create", {[m
+[32m+[m[32m        method: "POST",[m
+[32m+[m[32m        headers: {[m
+[32m+[m[32m          "Content-Type": "application/json",[m
+[32m+[m[32m          Authorization: `Bearer ${accessToken}`,[m
+[32m+[m[32m        },[m
+[32m+[m[32m        body: JSON.stringify(createPayload),[m
+[32m+[m[32m      });[m
+[32m+[m
+[32m+[m[32m      const jr = await resp.json().catch(() => ({}));[m
+[32m+[m[32m      if (!resp.ok) throw new Error(jr?.error || "保存に失敗しました");[m
+ [m
+[31m-      const kyId = s(inserted?.id).trim();[m
+[32m+[m[32m      const kyId = s(jr?.kyId).trim();[m
+       if (!kyId) throw new Error("保存に失敗しました（kyId不明）");[m
+ [m
+[32m+[m[32m      // ✅ ky_photos へ保存（既存運用）[m
+       const photoRows: any[] = [];[m
+       if (slopeSavedUrl) {[m
+         photoRows.push({[m
+[36m@@ -717,17 +488,14 @@[m [mexport default function KyNewClient() {[m
+           photo_url: pathSavedUrl,[m
+         });[m
+       }[m
+[31m-[m
+       if (photoRows.length) {[m
+         const { error: photoErr } = await (supabase as any).from("ky_photos").insert(photoRows);[m
+         if (photoErr) throw photoErr;[m
+       }[m
+ [m
+       setStatus({ type: "success", text: "保存しました（レビューへ移動）" });[m
+[31m-[m
+       router.push(`/projects/${projectId}/ky/${kyId}/review`);[m
+       router.refresh();[m
+[31m-      return;[m
+     } catch (e: any) {[m
+       setStatus({ type: "error", text: e?.message ?? "保存に失敗しました" });[m
+     } finally {[m
+[36m@@ -742,10 +510,11 @@[m [mexport default function KyNewClient() {[m
+     projectId,[m
+     workDate,[m
+     appliedSlots,[m
+[31m-    aiWork,[m
+     aiHazards,[m
+     aiCounter,[m
+     aiThird,[m
+[32m+[m[32m    aiRiskItems,[m
+[32m+[m[32m    workerCount,[m
+     router,[m
+     slopeMode,[m
+     pathMode,[m
+[36m@@ -754,37 +523,10 @@[m [mexport default function KyNewClient() {[m
+     uploadToStorage,[m
+     slopeUrlFromProject,[m
+     pathUrlFromProject,[m
+[31m-    workerCount,[m
+     slopeNowUrlCached,[m
+     pathNowUrlCached,[m
+   ]);[m
+ [m
+[31m-  const WeatherCard = useCallback(({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) => {[m
+[31m-    const isApplied = appliedHour != null && slot.hour === appliedHour;[m
+[31m-    return ([m
+[31m-      <div className={`rounded-lg border p-3 ${isApplied ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`}>[m
+[31m-        <div className="flex items-center justify-between">[m
+[31m-          <div className="text-sm font-semibold text-slate-800">{slot.hour}時</div>[m
+[31m-          {isApplied && <div className="text-xs font-semibold text-emerald-700">適用中</div>}[m
+[31m-        </div>[m
+[31m-        <div className="mt-1 text-sm text-slate-700">{slot.weather_text || "（不明）"}</div>[m
+[31m-        <div className="mt-2 text-xs text-slate-600 space-y-1">[m
+[31m-          <div>気温：{slot.temperature_c ?? "—"} ℃</div>[m
+[31m-          <div>[m
+[31m-            風：{degToDirJp(slot.wind_direction_deg) || "—"}{" "}[m
+[31m-            {slot.wind_speed_ms !== null && slot.wind_speed_ms !== undefined ? `${slot.wind_speed_ms} m/s` : "—"}[m
+[31m-          </div>[m
+[31m-          <div>降水：{slot.precipitation_mm ?? "—"} mm</div>[m
+[31m-        </div>[m
+[31m-      </div>[m
+[31m-    );[m
+[31m-  }, []);[m
+[31m-[m
+[31m-  // ✅ AI表示（レビューと同じ：危険予知/対策は5件・番号なし・重複/注記除去）[m
+[31m-  const aiHazardsTop5 = useMemo(() => formatHazardsForView5(aiHazards), [aiHazards]);[m
+[31m-  const aiMeasuresTop5 = useMemo(() => formatMeasuresForView5(aiCounter), [aiCounter]);[m
+[31m-  const aiThirdView = useMemo(() => formatThirdForView(aiThird), [aiThird]);[m
+[31m-[m
+   if (loading) {[m
+     return ([m
+       <div className="p-4">[m
+[36m@@ -810,10 +552,6 @@[m [mexport default function KyNewClient() {[m
+         </div>[m
+       </div>[m
+ [m
+[31m-      <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800">[m
+[31m-        工事情報編集で「通路（定点）停止画URL」を入力してください（未設置なら空欄OK）[m
+[31m-      </div>[m
+[31m-[m
+       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">[m
+         <div className="text-sm font-semibold text-slate-800">施工会社（固定）</div>[m
+         <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">[m
+[36m@@ -922,7 +660,7 @@[m [mexport default function KyNewClient() {[m
+             onChange={(e) => setWorkDetail(e.target.value)}[m
+             rows={3}[m
+             className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"[m
+[31m-            placeholder="例：法面整形、転圧、土砂運搬 など"[m
+[32m+[m[32m            placeholder="例：舗装工（表層工 アスファルト舗設）など"[m
+           />[m
+         </div>[m
+ [m
+[36m@@ -947,7 +685,50 @@[m [mexport default function KyNewClient() {[m
+         <div className="text-xs text-slate-500">※ 墓参者の多少に応じて、誘導・区画分離・声掛け等をAI補足に反映します。</div>[m
+       </div>[m
+ [m
+[31m-      {/* ---（中略：写真ブロックは元のまま）--- */}[m
+[32m+[m[32m      {/* 写真（最小：URL or ファイル） */}[m
+[32m+[m[32m      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">[m
+[32m+[m[32m        <div className="text-sm font-semibold text-slate-800">写真（任意）</div>[m
+[32m+[m
+[32m+[m[32m        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">[m
+[32m+[m[32m          <div className="space-y-2">[m
+[32m+[m[32m            <div className="text-xs text-slate-600">法面（今回）</div>[m
+[32m+[m[32m            <div className="flex gap-2 flex-wrap">[m
+[32m+[m[32m              <button type="button" onClick={() => { setSlopeMode("url"); setSlopeFile(null); setSlopeFileName(""); }} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">[m
+[32m+[m[32m                定点URLを使う[m
+[32m+[m[32m              </button>[m
+[32m+[m[32m              <button type="button" onClick={onPickSlopeFile} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">[m
+[32m+[m[32m                ファイル選択[m
+[32m+[m[32m              </button>[m
+[32m+[m[32m              <button type="button" onClick={() => { setSlopeMode("none"); setSlopeFile(null); setSlopeFileName(""); setSlopeNowUrlCached(""); }} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">[m
+[32m+[m[32m                なし[m
+[32m+[m[32m              </button>[m
+[32m+[m[32m            </div>[m
+[32m+[m[32m            <div className="text-xs text-slate-500">[m
+[32m+[m[32m              {slopeMode === "url" ? `URL：${slopeUrlFromProject || "（未設定）"}` : slopeMode === "file" ? `ファイル：${slopeFileName}` : "（なし）"}[m
+[32m+[m[32m            </div>[m
+[32m+[m[32m            <input ref={slopeFileRef} type="file" accept="image/*" className="hidden" onChange={onSlopeFileChange} />[m
+[32m+[m[32m          </div>[m
+[32m+[m
+[32m+[m[32m          <div className="space-y-2">[m
+[32m+[m[32m            <div className="text-xs text-slate-600">通路（今回）</div>[m
+[32m+[m[32m            <div className="flex gap-2 flex-wrap">[m
+[32m+[m[32m              <button type="button" onClick={() => { setPathMode("url"); setPathFile(null); setPathFileName(""); }} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">[m
+[32m+[m[32m                定点URLを使う[m
+[32m+[m[32m              </button>[m
+[32m+[m[32m              <button type="button" onClick={onPickPathFile} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">[m
+[32m+[m[32m                ファイル選択[m
+[32m+[m[32m              </button>[m
+[32m+[m[32m              <button type="button" onClick={() => { setPathMode("none"); setPathFile(null); setPathFileName(""); setPathNowUrlCached(""); }} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">[m
+[32m+[m[32m                なし[m
+[32m+[m[32m              </button>[m
+[32m+[m[32m            </div>[m
+[32m+[m[32m            <div className="text-xs text-slate-500">[m
+[32m+[m[32m              {pathMode === "url" ? `URL：${pathUrlFromProject || "（未設定）"}` : pathMode === "file" ? `ファイル：${pathFileName}` : "（なし）"}[m
+[32m+[m[32m            </div>[m
+[32m+[m[32m            <input ref={pathFileRef} type="file" accept="image/*" className="hidden" onChange={onPathFileChange} />[m
+[32m+[m[32m          </div>[m
+[32m+[m[32m        </div>[m
+[32m+[m[32m      </div>[m
+ [m
+       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">[m
+         <div className="flex items-center justify-between gap-3">[m
+[36m@@ -962,61 +743,50 @@[m [mexport default function KyNewClient() {[m
+           </button>[m
+         </div>[m
+ [m
+[31m-        {/* ✅ 作業内容の補足は表示しない（人の入力が正） */}[m
+[31m-        {/* <div className="space-y-2">[m
+[31m-          <div className="text-xs text-slate-600">作業内容の補足</div>[m
+[31m-          <textarea value={aiWork} onChange={(e) => setAiWork(e.target.value)} rows={4} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />[m
+[31m-        </div> */}[m
+[32m+[m[32m        {/* ✅ 作業内容の補足は不要（人入力が正） */}[m
+ [m
+         <div className="space-y-2">[m
+[31m-          <div className="text-xs text-slate-600">危険予知の補足（上位5項目・番号なし）</div>[m
+[31m-          {aiHazardsTop5.length ? ([m
+[32m+[m[32m          <div className="text-xs text-slate-600">危険予知の補足（上位5・リスク順）</div>[m
+[32m+[m[32m          {aiRiskItems.length ? ([m
+             <div className="rounded-lg border border-slate-300 bg-white p-3">[m
+               <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">[m
+[31m-                {aiHazardsTop5.map((x, i) => ([m
+[31m-                  <li key={`${x}-${i}`}>{x}</li>[m
+[32m+[m[32m                {aiRiskItems.slice(0, 5).map((x) => ([m
+[32m+[m[32m                  <li key={`h-${x.rank}`}>{x.hazard}</li>[m
+                 ))}[m
+               </ul>[m
+             </div>[m
+           ) : ([m
+             <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>[m
+           )}[m
+[31m-[m
+[31m-          {/* ✅ 二重表示の原因：下のtextarea（元テキスト）は削除 */}[m
+         </div>[m
+ [m
+         <div className="space-y-2">[m
+[31m-          <div className="text-xs text-slate-600">対策の補足（上位5項目・番号なし）</div>[m
+[31m-          {aiMeasuresTop5.length ? ([m
+[32m+[m[32m          <div className="text-xs text-slate-600">対策の補足（危険予知に対応：1対1）</div>[m
+[32m+[m[32m          {aiRiskItems.length ? ([m
+             <div className="rounded-lg border border-slate-300 bg-white p-3">[m
+               <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">[m
+[31m-                {aiMeasuresTop5.map((x, i) => ([m
+[31m-                  <li key={`${x}-${i}`}>{x}</li>[m
+[32m+[m[32m                {aiRiskItems.slice(0, 5).map((x) => ([m
+[32m+[m[32m                  <li key={`m-${x.rank}`}>[m
+[32m+[m[32m                    <span className="font-semibold">（{x.rank}）</span>[m
+[32m+[m[32m                    {x.countermeasure}[m
+[32m+[m[32m                  </li>[m
+                 ))}[m
+               </ul>[m
+             </div>[m
+           ) : ([m
+             <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>[m
+           )}[m
+[31m-[m
+[31m-          {/* ✅ 二重表示の原因：下のtextarea（元テキスト）は削除 */}[m
+         </div>[m
+ [m
+         <div className="space-y-2">[m
+[31m-          <div className="text-xs text-slate-600">第三者（墓参者）の補足（番号なし）</div>[m
+[31m-          {aiThirdView.length ? ([m
+[32m+[m[32m          <div className="text-xs text-slate-600">第三者（墓参者）の補足</div>[m
+[32m+[m[32m          {aiThird.trim() ? ([m
+             <div className="rounded-lg border border-slate-300 bg-white p-3">[m
+[31m-              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">[m
+[31m-                {aiThirdView.map((x, i) => ([m
+[31m-                  <li key={`${x}-${i}`}>{x}</li>[m
+[31m-                ))}[m
+[31m-              </ul>[m
+[32m+[m[32m              <pre className="whitespace-pre-wrap text-sm text-slate-800">{aiThird}</pre>[m
+             </div>[m
+           ) : ([m
+             <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>[m
+           )}[m
+[31m-[m
+[31m-          {/* ✅ 二重表示の原因：下のtextarea（元テキスト）は削除 */}[m
+         </div>[m
+       </div>[m
+ [m

@@ -31,6 +31,14 @@ type Project = {
 
 type PartnerOption = { value: string; name: string };
 
+type RiskItem = {
+  rank: number;
+  hazard: string;
+  countermeasure: string;
+  score?: number;
+  tags?: string[];
+};
+
 function s(v: any) {
   if (v == null) return "";
   return String(v);
@@ -58,69 +66,9 @@ function degToDirJp(deg: number | null | undefined): string {
   return dirs[idx];
 }
 
-function normalizeText(text: string): string {
-  return (text || "").replace(/\r\n/g, "\n").replace(/\u3000/g, " ").trim();
-}
-
-function splitAiCombined(text: string): { work: string; hazards: string; countermeasures: string; third: string } {
-  const src = (text || "").trim();
-  if (!src) return { work: "", hazards: "", countermeasures: "", third: "" };
-
-  const makeBracketRe = (label: string) =>
-    new RegExp(String.raw`(?:^|\n)\s*(?:[•・\-*]\s*)?[【\[]\s*AI補足\s*[｜|]\s*${label}\s*[】\]]`, "g");
-
-  const headings: Array<{ key: "work" | "hazards" | "countermeasures" | "third"; re: RegExp }> = [
-    { key: "work", re: makeBracketRe("作業内容") },
-    { key: "hazards", re: makeBracketRe("危険予知") },
-    { key: "countermeasures", re: makeBracketRe("対策") },
-    { key: "third", re: makeBracketRe("第三者(?:\\s*（\\s*墓参者\\s*）)?") },
-    { key: "work", re: /(?:^|\n)\s*(作業内容)\s*[:：]/g },
-    { key: "hazards", re: /(?:^|\n)\s*(危険予知)\s*[:：]/g },
-    { key: "countermeasures", re: /(?:^|\n)\s*(対策)\s*[:：]/g },
-    { key: "third", re: /(?:^|\n)\s*(第三者|墓参者)\s*[:：]/g },
-  ];
-
-  const marks: Array<{ idx: number; key: "work" | "hazards" | "countermeasures" | "third"; len: number }> = [];
-  for (const h of headings) {
-    let m: RegExpExecArray | null;
-    h.re.lastIndex = 0;
-    while ((m = h.re.exec(src))) marks.push({ idx: m.index, key: h.key, len: m[0].length });
-  }
-  marks.sort((a, b) => a.idx - b.idx);
-
-  if (!marks.length) return { work: src, hazards: "", countermeasures: "", third: "" };
-
-  const out = { work: "", hazards: "", countermeasures: "", third: "" };
-  for (let i = 0; i < marks.length; i++) {
-    const cur = marks[i];
-    const next = marks[i + 1];
-    const start = cur.idx + cur.len;
-    const end = next ? next.idx : src.length;
-    const chunk = src.slice(start, end).trim();
-    if (!chunk) continue;
-    (out as any)[cur.key] = (out as any)[cur.key] ? `${(out as any)[cur.key]}\n${chunk}` : chunk;
-  }
-  return out;
-}
-
 function extFromName(name: string): string {
   const m = name.toLowerCase().match(/\.([a-z0-9]+)$/);
   return m ? m[1] : "jpg";
-}
-
-// ky_photos の列名差を吸収
-function pickKind(row: any): string {
-  return s(row?.photo_kind).trim() || s(row?.kind).trim() || s(row?.type).trim() || s(row?.category).trim() || "";
-}
-function pickUrl(row: any): string {
-  return (
-    s(row?.image_url).trim() ||
-    s(row?.photo_url).trim() ||
-    s(row?.url).trim() ||
-    s(row?.photo_path).trim() ||
-    s(row?.path).trim() ||
-    ""
-  );
 }
 
 function slotSummary(slot: WeatherSlot | null | undefined): string {
@@ -133,121 +81,11 @@ function slotSummary(slot: WeatherSlot | null | undefined): string {
   return `${w} / 気温${t} / 風${wd} ${ws} / 降水${p}`;
 }
 
-/** ===== 表示用整形（レビューと同じ） ===== */
-
-function normalizeLineBase(raw: string): string {
-  return raw.replace(/^[•・\-*]\s*/, "").replace(/\s+/g, " ").trim();
+function bulletsFromItemsHazards(items: RiskItem[]) {
+  return items.map((x) => `・${x.hazard}`).join("\n");
 }
-
-function stripGenericAccidentNote(x: string): string {
-  return x
-    .replace(/（\s*事故につながる恐れ\s*）/g, "")
-    .replace(/（\s*事故に繋がる恐れ\s*）/g, "")
-    .replace(/（\s*事故につながる可能性\s*）/g, "")
-    .replace(/（\s*事故に繋がる可能性\s*）/g, "")
-    .trim();
-}
-
-function takeRightOfArrow(line: string): string {
-  const t = line;
-  const seps = ["→", "⇒", "->", "＞", "〉"];
-  for (const sep of seps) {
-    const idx = t.indexOf(sep);
-    if (idx >= 0) {
-      const right = t.slice(idx + sep.length).trim();
-      if (right) return right;
-    }
-  }
-  return t.trim();
-}
-
-function dedupeKeepOrder(arr: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const x of arr) {
-    const k = x.trim();
-    if (!k) continue;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(k);
-  }
-  return out;
-}
-
-// 危険予知：右側だけ採用、(事故につながる恐れ)削除、最大5件、番号なし
-function formatHazardsForView5(text: string): string[] {
-  const lines = String(text ?? "")
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-  const picked: string[] = [];
-  for (const l0 of lines) {
-    const base = normalizeLineBase(l0);
-    if (!base) continue;
-
-    let v = takeRightOfArrow(base);
-    v = stripGenericAccidentNote(v);
-    v = v.replace(/（\s*[^）]*事故[^）]*恐れ\s*）\s*$/g, "").trim();
-
-    if (/^危険予知/i.test(v) || /^対策/i.test(v) || /^AI補足/i.test(v)) continue;
-    if (v) picked.push(v);
-  }
-  return dedupeKeepOrder(picked).slice(0, 5);
-}
-
-function splitMeasuresLine(line: string): string[] {
-  const t = line.trim();
-  const noLead = t.replace(/^\s*\[\s*\d+\s*\]\s*/g, "").replace(/^\s*\d+[)\.]\s*/g, "").trim();
-
-  const hasMulti = /\[\s*\d+\s*\]/.test(noLead);
-  if (!hasMulti) return [noLead];
-
-  const parts = noLead
-    .split(/\[\s*\d+\s*\]/g)
-    .map((x) => x.replace(/^[、,\s]+/, "").trim())
-    .filter(Boolean);
-
-  return parts.length ? parts : [noLead];
-}
-
-// 対策：番号削除、右側だけ採用、最大5件、番号なし
-function formatMeasuresForView5(text: string): string[] {
-  const lines = String(text ?? "")
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-  const items: string[] = [];
-  for (const l0 of lines) {
-    const base0 = normalizeLineBase(l0);
-    if (!base0) continue;
-
-    const parts = splitMeasuresLine(base0);
-    for (let p of parts) {
-      p = normalizeLineBase(p);
-      if (!p) continue;
-
-      p = takeRightOfArrow(p);
-
-      if (/^対策/i.test(p) || /^AI補足/i.test(p)) continue;
-      if (p) items.push(p);
-    }
-  }
-  return dedupeKeepOrder(items).slice(0, 5);
-}
-
-// 第三者：番号なし（今は上限なし）
-function formatThirdForView(text: string): string[] {
-  return String(text ?? "")
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean)
-    .map((x) => x.replace(/^[•・\-*]\s*/, "").trim())
-    .filter(Boolean);
+function bulletsFromItemsMeasures(items: RiskItem[]) {
+  return items.map((x) => `・（${x.rank}）${x.countermeasure}`).join("\n");
 }
 
 export default function KyNewClient() {
@@ -274,7 +112,6 @@ export default function KyNewClient() {
   const [partnerCompanyName, setPartnerCompanyName] = useState<string>("");
   const [partnerOptions, setPartnerOptions] = useState<PartnerOption[]>([]);
 
-  // ✅ 本日の作業員数
   const [workerCount, setWorkerCount] = useState<string>("");
 
   const [workDetail, setWorkDetail] = useState("");
@@ -287,31 +124,27 @@ export default function KyNewClient() {
   const [selectedSlotHour, setSelectedSlotHour] = useState<9 | 12 | 15 | null>(null);
   const [appliedSlotHour, setAppliedSlotHour] = useState<9 | 12 | 15 | null>(null);
 
+  // 写真（最小構成）
   const slopeFileRef = useRef<HTMLInputElement | null>(null);
   const pathFileRef = useRef<HTMLInputElement | null>(null);
-
   const [slopeMode, setSlopeMode] = useState<"url" | "file" | "none">("none");
   const [pathMode, setPathMode] = useState<"url" | "file" | "none">("none");
-
   const [slopeFile, setSlopeFile] = useState<File | null>(null);
   const [pathFile, setPathFile] = useState<File | null>(null);
-
   const [slopeFileName, setSlopeFileName] = useState("");
   const [pathFileName, setPathFileName] = useState("");
+  const [slopeNowUrlCached, setSlopeNowUrlCached] = useState<string>("");
+  const [pathNowUrlCached, setPathNowUrlCached] = useState<string>("");
 
-  const [slopePrevUrl, setSlopePrevUrl] = useState<string>("");
-  const [pathPrevUrl, setPathPrevUrl] = useState<string>("");
+  // AI（正本）
+  const [aiRiskItems, setAiRiskItems] = useState<RiskItem[]>([]);
+  const [aiProfile] = useState<"strict" | "normal">("strict");
 
-  const [aiWork, setAiWork] = useState("");
+  // 互換（旧カラム用）
   const [aiHazards, setAiHazards] = useState("");
   const [aiCounter, setAiCounter] = useState("");
   const [aiThird, setAiThird] = useState("");
-
   const [aiGenerating, setAiGenerating] = useState(false);
-
-  // ✅ AI生成時にアップロード済みのURLをキャッシュ（保存時の二重アップ防止）
-  const [slopeNowUrlCached, setSlopeNowUrlCached] = useState<string>("");
-  const [pathNowUrlCached, setPathNowUrlCached] = useState<string>("");
 
   const KY_PHOTO_BUCKET = process.env.NEXT_PUBLIC_KY_PHOTO_BUCKET || "ky-photos";
 
@@ -351,34 +184,9 @@ export default function KyNewClient() {
         }
       }
 
-      const { data: prevPhotos, error: prevErr } = await (supabase as any)
-        .from("ky_photos")
-        .select("*")
-        .eq("project_id", projectId)
-        .order("created_at", { ascending: false })
-        .limit(50);
-
-      let prevSlope = "";
-      let prevPath = "";
-      if (!prevErr && Array.isArray(prevPhotos)) {
-        for (const p of prevPhotos) {
-          const kind = pickKind(p);
-          const url = pickUrl(p);
-          if (!url) continue;
-
-          // ✅ kind=="" を両方に入れる事故を避ける（空は採用しない）
-          if (!prevSlope && (kind === "slope" || kind === "法面" || kind === "slope_photo")) prevSlope = url;
-          if (!prevPath && (kind === "path" || kind === "通路" || kind === "path_photo")) prevPath = url;
-
-          if (prevSlope && prevPath) break;
-        }
-      }
-
       if (mountedRef.current) {
         setProject((proj as any) ?? null);
         setPartnerOptions(opts);
-        setSlopePrevUrl(prevSlope);
-        setPathPrevUrl(prevPath);
       }
     } catch (e: any) {
       if (mountedRef.current) setStatus({ type: "error", text: e?.message ?? "読み込みに失敗しました" });
@@ -391,7 +199,7 @@ export default function KyNewClient() {
     fetchInitial();
   }, [fetchInitial]);
 
-  // ✅ weather：POSTが405ならGETへフォールバック
+  // weather
   const fetchWeather = useCallback(async () => {
     const lat = project?.lat ?? null;
     const lon = project?.lon ?? null;
@@ -424,13 +232,8 @@ export default function KyNewClient() {
         .sort((a, b) => a.hour - b.hour);
 
       setWeatherSlots(normalized);
-
-      if (normalized.length) {
-        setSelectedSlotHour(normalized[0].hour);
-      } else {
-        setSelectedSlotHour(null);
-        setAppliedSlotHour(null);
-      }
+      setSelectedSlotHour(normalized.length ? normalized[0].hour : null);
+      if (!normalized.length) setAppliedSlotHour(null);
     } catch {
       setWeatherSlots([]);
       setSelectedSlotHour(null);
@@ -447,7 +250,6 @@ export default function KyNewClient() {
     setAppliedSlotHour(selectedSlotHour);
   }, [selectedSlotHour]);
 
-  // ✅ 適用枠を先頭へ（保存にも使う）
   const appliedSlots = useMemo(() => {
     if (!appliedSlotHour) return weatherSlots;
     const arr = [...weatherSlots];
@@ -464,6 +266,7 @@ export default function KyNewClient() {
     return weatherSlots.find((x) => x.hour === appliedSlotHour) ?? null;
   }, [weatherSlots, appliedSlotHour]);
 
+  // 写真入力
   const onPickSlopeFile = useCallback(() => slopeFileRef.current?.click(), []);
   const onPickPathFile = useCallback(() => pathFileRef.current?.click(), []);
 
@@ -474,7 +277,7 @@ export default function KyNewClient() {
     setSlopeMode("file");
     setSlopeFile(f);
     setSlopeFileName(f.name);
-    setSlopeNowUrlCached(""); // ✅ 切り替えたらキャッシュを破棄
+    setSlopeNowUrlCached("");
   }, []);
 
   const onPathFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -484,7 +287,7 @@ export default function KyNewClient() {
     setPathMode("file");
     setPathFile(f);
     setPathFileName(f.name);
-    setPathNowUrlCached(""); // ✅ 切り替えたらキャッシュを破棄
+    setPathNowUrlCached("");
   }, []);
 
   const uploadToStorage = useCallback(
@@ -507,117 +310,55 @@ export default function KyNewClient() {
     [KY_PHOTO_BUCKET, projectId]
   );
 
-  const buildAiPayload = useCallback(async () => {
-    const w = workDetail.trim();
-    if (!w) throw new Error("作業内容（必須）を入力してください");
-
-    let slopeNowUrl: string | null = null;
-    let pathNowUrl: string | null = null;
-
-    // ✅ まずキャッシュがあればそれを使う
-    if (slopeNowUrlCached) slopeNowUrl = slopeNowUrlCached;
-    else {
-      if (slopeMode === "url") slopeNowUrl = slopeUrlFromProject || null;
-      if (slopeMode === "file" && slopeFile) slopeNowUrl = await uploadToStorage(slopeFile, "slope");
-    }
-
-    if (pathNowUrlCached) pathNowUrl = pathNowUrlCached;
-    else {
-      if (pathMode === "url") pathNowUrl = pathUrlFromProject || null;
-      if (pathMode === "file" && pathFile) pathNowUrl = await uploadToStorage(pathFile, "path");
-    }
-
-    // ✅ AI生成で一度アップしたURLは保存時にも使えるようにキャッシュ
-    if (slopeNowUrl) setSlopeNowUrlCached(slopeNowUrl);
-    if (pathNowUrl) setPathNowUrlCached(pathNowUrl);
-
-    const slotsForAi = (appliedSlots || []).map((x) => ({
-      hour: x.hour,
-      weather_text: x.weather_text,
-      temperature_c: x.temperature_c ?? null,
-      wind_direction_deg: x.wind_direction_deg ?? null,
-      wind_speed_ms: x.wind_speed_ms ?? null,
-      precipitation_mm: x.precipitation_mm ?? null,
-    }));
-
-    const lat = project?.lat ?? null;
-    const lon = project?.lon ?? null;
-
-    return {
-      work_detail: w,
-      hazards: hazards.trim() ? hazards.trim() : null,
-      countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
-      third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
-
-      worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
-
-      lat,
-      lon,
-
-      weather_slots: slotsForAi.length ? slotsForAi : null,
-      slope_photo_url: slopeNowUrl,
-      slope_prev_photo_url: slopePrevUrl || null,
-      path_photo_url: pathNowUrl,
-      path_prev_photo_url: pathPrevUrl || null,
-    };
-  }, [
-    workDetail,
-    hazards,
-    countermeasures,
-    thirdPartyLevel,
-    workerCount,
-    appliedSlots,
-    slopeMode,
-    pathMode,
-    slopeUrlFromProject,
-    pathUrlFromProject,
-    slopeFile,
-    pathFile,
-    uploadToStorage,
-    slopePrevUrl,
-    pathPrevUrl,
-    project?.lat,
-    project?.lon,
-    slopeNowUrlCached,
-    pathNowUrlCached,
-  ]);
-
+  // ✅ AI生成：作業内容から（ChatGPT推論＋ガード）→ ai_risk_items
   const onGenerateAi = useCallback(async () => {
     setStatus({ type: null, text: "生成中..." });
     setAiGenerating(true);
 
     try {
-      const payload = await buildAiPayload();
+      const w = workDetail.trim();
+      if (!w) throw new Error("作業内容（必須）を入力してください");
 
-      const res = await fetch("/api/ky-ai-supplement", {
+      const res = await fetch("/api/ky-ai-suggest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          workContent: w,
+          hazardsText: hazards || "",
+          thirdPartyLevel: thirdPartyLevel || "",
+          profile: aiProfile,
+        }),
       });
 
       const j = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(j?.error || "AI補足生成に失敗しました");
 
-      const w = normalizeText(s(j?.ai_work_detail));
-      const h = normalizeText(s(j?.ai_hazards));
-      const c = normalizeText(s(j?.ai_countermeasures));
-      const t = normalizeText(s(j?.ai_third_party));
+      const items = Array.isArray(j?.ai_risk_items) ? (j.ai_risk_items as RiskItem[]) : [];
+      setAiRiskItems(items);
 
-      if (w || h || c || t) {
-        setAiWork(w);
-        setAiHazards(h);
-        setAiCounter(c);
-        setAiThird(t);
-      } else {
-        const combined = normalizeText(s(j?.ai_supplement));
-        const split = splitAiCombined(combined);
+      // 互換もセット（保存・レビュー互換用）
+      setAiHazards(s(j?.ai_hazards || bulletsFromItemsHazards(items)));
+      setAiCounter(s(j?.ai_countermeasures || bulletsFromItemsMeasures(items)));
 
-        setAiWork(normalizeText(split.work));
-        setAiHazards(normalizeText(split.hazards));
-        setAiCounter(normalizeText(split.countermeasures));
-        setAiThird(normalizeText(split.third));
-      }
+      // 第三者（現状OKとのことなので簡易で十分）
+      const third = (() => {
+        if (thirdPartyLevel === "多い") {
+          return [
+            "・誘導員を配置し、墓参者の動線を常時監視すること",
+            "・作業区画をコーン・バーで明確化し、立入規制を行うこと",
+            "・接近があれば作業を一時中断し、安全確保後に再開すること",
+          ].join("\n");
+        }
+        if (thirdPartyLevel === "少ない") {
+          return [
+            "・出入口付近に注意喚起表示を行い、声掛けを徹底すること",
+            "・接近時は作業を一時停止し、誘導して安全を確保すること",
+          ].join("\n");
+        }
+        return "";
+      })();
+      setAiThird(third);
 
       setStatus({ type: "success", text: "AI補足を生成しました" });
     } catch (e: any) {
@@ -625,139 +366,7 @@ export default function KyNewClient() {
     } finally {
       setAiGenerating(false);
     }
-  }, [buildAiPayload]);
-
-  const onSave = useCallback(async () => {
-    setStatus({ type: null, text: "" });
-
-    if (!partnerCompanyName.trim()) {
-      setStatus({ type: "error", text: "協力会社（必須）を選択してください" });
-      return;
-    }
-    if (!workDetail.trim()) {
-      setStatus({ type: "error", text: "作業内容（必須）を入力してください" });
-      return;
-    }
-
-    setSaving(true);
-    try {
-      let slopeSavedUrl: string | null = null;
-      let pathSavedUrl: string | null = null;
-
-      // ✅ AI生成でアップ済みならそれを使う（重複アップ防止）
-      if (slopeNowUrlCached) slopeSavedUrl = slopeNowUrlCached;
-      else {
-        if (slopeMode === "file" && slopeFile) slopeSavedUrl = await uploadToStorage(slopeFile, "slope");
-        else if (slopeMode === "url") slopeSavedUrl = slopeUrlFromProject || null;
-      }
-
-      if (pathNowUrlCached) pathSavedUrl = pathNowUrlCached;
-      else {
-        if (pathMode === "file" && pathFile) pathSavedUrl = await uploadToStorage(pathFile, "path");
-        else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;
-      }
-
-      const insertPayload: any = {
-        project_id: projectId,
-        work_date: workDate,
-        work_detail: workDetail.trim(),
-        hazards: hazards.trim() ? hazards.trim() : null,
-        countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
-        third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
-        partner_company_name: partnerCompanyName.trim(),
-
-        // ✅ 適用枠を先頭にした並びで保存（レビューで先頭＝適用枠として使う）
-        weather_slots: appliedSlots && appliedSlots.length ? appliedSlots : null,
-
-        worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
-
-        // ✅ 保存は壊さない（表示だけ出さない）
-        ai_work_detail: aiWork.trim() ? aiWork.trim() : null,
-        ai_hazards: aiHazards.trim() ? aiHazards.trim() : null,
-        ai_countermeasures: aiCounter.trim() ? aiCounter.trim() : null,
-        ai_third_party: aiThird.trim() ? aiThird.trim() : null,
-        ai_supplement: [
-          "【AI補足｜作業内容】",
-          aiWork.trim(),
-          "【AI補足｜危険予知】",
-          aiHazards.trim(),
-          "【AI補足｜対策】",
-          aiCounter.trim(),
-          "【AI補足｜第三者】",
-          aiThird.trim(),
-        ]
-          .filter(Boolean)
-          .join("\n"),
-      };
-
-      const { data: inserted, error: insErr } = await (supabase as any).from("ky_entries").insert(insertPayload).select("id").maybeSingle();
-      if (insErr) throw insErr;
-
-      const kyId = s(inserted?.id).trim();
-      if (!kyId) throw new Error("保存に失敗しました（kyId不明）");
-
-      const photoRows: any[] = [];
-      if (slopeSavedUrl) {
-        photoRows.push({
-          project_id: projectId,
-          ky_id: kyId,
-          ky_entry_id: kyId,
-          kind: "slope",
-          image_url: slopeSavedUrl,
-          photo_url: slopeSavedUrl,
-        });
-      }
-      if (pathSavedUrl) {
-        photoRows.push({
-          project_id: projectId,
-          ky_id: kyId,
-          ky_entry_id: kyId,
-          kind: "path",
-          image_url: pathSavedUrl,
-          photo_url: pathSavedUrl,
-        });
-      }
-
-      if (photoRows.length) {
-        const { error: photoErr } = await (supabase as any).from("ky_photos").insert(photoRows);
-        if (photoErr) throw photoErr;
-      }
-
-      setStatus({ type: "success", text: "保存しました（レビューへ移動）" });
-
-      router.push(`/projects/${projectId}/ky/${kyId}/review`);
-      router.refresh();
-      return;
-    } catch (e: any) {
-      setStatus({ type: "error", text: e?.message ?? "保存に失敗しました" });
-    } finally {
-      setSaving(false);
-    }
-  }, [
-    partnerCompanyName,
-    workDetail,
-    hazards,
-    countermeasures,
-    thirdPartyLevel,
-    projectId,
-    workDate,
-    appliedSlots,
-    aiWork,
-    aiHazards,
-    aiCounter,
-    aiThird,
-    router,
-    slopeMode,
-    pathMode,
-    slopeFile,
-    pathFile,
-    uploadToStorage,
-    slopeUrlFromProject,
-    pathUrlFromProject,
-    workerCount,
-    slopeNowUrlCached,
-    pathNowUrlCached,
-  ]);
+  }, [workDetail, hazards, thirdPartyLevel, aiProfile]);
 
   const WeatherCard = useCallback(({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) => {
     const isApplied = appliedHour != null && slot.hour === appliedHour;
@@ -780,10 +389,143 @@ export default function KyNewClient() {
     );
   }, []);
 
-  // ✅ AI表示（レビューと同じ：危険予知/対策は5件・番号なし・重複/注記除去）
-  const aiHazardsTop5 = useMemo(() => formatHazardsForView5(aiHazards), [aiHazards]);
-  const aiMeasuresTop5 = useMemo(() => formatMeasuresForView5(aiCounter), [aiCounter]);
-  const aiThirdView = useMemo(() => formatThirdForView(aiThird), [aiThird]);
+  // ✅ 保存：/api/ky-create 経由（kyIdを受け取ってレビューへ）
+  const onSave = useCallback(async () => {
+    setStatus({ type: null, text: "" });
+
+    if (!partnerCompanyName.trim()) {
+      setStatus({ type: "error", text: "協力会社（必須）を選択してください" });
+      return;
+    }
+    if (!workDetail.trim()) {
+      setStatus({ type: "error", text: "作業内容（必須）を入力してください" });
+      return;
+    }
+
+    setSaving(true);
+    try {
+      // ✅ session token
+      const { data: sess } = await supabase.auth.getSession();
+      const accessToken = s(sess?.session?.access_token).trim();
+      if (!accessToken) throw new Error("ログインが必要です（access tokenなし）");
+
+      // ✅ 写真URL確定（キャッシュ優先）
+      let slopeSavedUrl: string | null = null;
+      let pathSavedUrl: string | null = null;
+
+      if (slopeNowUrlCached) slopeSavedUrl = slopeNowUrlCached;
+      else {
+        if (slopeMode === "file" && slopeFile) slopeSavedUrl = await uploadToStorage(slopeFile, "slope");
+        else if (slopeMode === "url") slopeSavedUrl = slopeUrlFromProject || null;
+      }
+
+      if (pathNowUrlCached) pathSavedUrl = pathNowUrlCached;
+      else {
+        if (pathMode === "file" && pathFile) pathSavedUrl = await uploadToStorage(pathFile, "path");
+        else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;
+      }
+
+      // ✅ ky-create payload（キー名：work_content）
+      const createPayload: any = {
+        project_id: projectId,
+        work_date: workDate,
+        partner_company_name: partnerCompanyName.trim(),
+
+        worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
+
+        work_content: workDetail.trim(),
+        hazards: hazards.trim() ? hazards.trim() : null,
+        countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
+        third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
+
+        weather_slots: appliedSlots && appliedSlots.length ? appliedSlots : null,
+
+        // AI互換
+        ai_work_detail: null,
+        ai_hazards: aiHazards.trim() ? aiHazards.trim() : null,
+        ai_countermeasures: aiCounter.trim() ? aiCounter.trim() : null,
+        ai_third_party: aiThird.trim() ? aiThird.trim() : null,
+
+        // ✅ AI正本
+        ai_risk_items: aiRiskItems.length ? aiRiskItems.slice(0, 5) : null,
+        ai_profile: "strict",
+      };
+
+      const resp = await fetch("/api/ky-create", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify(createPayload),
+      });
+
+      const jr = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(jr?.error || "保存に失敗しました");
+
+      const kyId = s(jr?.kyId).trim();
+      if (!kyId) throw new Error("保存に失敗しました（kyId不明）");
+
+      // ✅ ky_photos へ保存（既存運用）
+      const photoRows: any[] = [];
+      if (slopeSavedUrl) {
+        photoRows.push({
+          project_id: projectId,
+          ky_id: kyId,
+          ky_entry_id: kyId,
+          kind: "slope",
+          image_url: slopeSavedUrl,
+          photo_url: slopeSavedUrl,
+        });
+      }
+      if (pathSavedUrl) {
+        photoRows.push({
+          project_id: projectId,
+          ky_id: kyId,
+          ky_entry_id: kyId,
+          kind: "path",
+          image_url: pathSavedUrl,
+          photo_url: pathSavedUrl,
+        });
+      }
+      if (photoRows.length) {
+        const { error: photoErr } = await (supabase as any).from("ky_photos").insert(photoRows);
+        if (photoErr) throw photoErr;
+      }
+
+      setStatus({ type: "success", text: "保存しました（レビューへ移動）" });
+      router.push(`/projects/${projectId}/ky/${kyId}/review`);
+      router.refresh();
+    } catch (e: any) {
+      setStatus({ type: "error", text: e?.message ?? "保存に失敗しました" });
+    } finally {
+      setSaving(false);
+    }
+  }, [
+    partnerCompanyName,
+    workDetail,
+    hazards,
+    countermeasures,
+    thirdPartyLevel,
+    projectId,
+    workDate,
+    appliedSlots,
+    aiHazards,
+    aiCounter,
+    aiThird,
+    aiRiskItems,
+    workerCount,
+    router,
+    slopeMode,
+    pathMode,
+    slopeFile,
+    pathFile,
+    uploadToStorage,
+    slopeUrlFromProject,
+    pathUrlFromProject,
+    slopeNowUrlCached,
+    pathNowUrlCached,
+  ]);
 
   if (loading) {
     return (
@@ -808,10 +550,6 @@ export default function KyNewClient() {
             KY一覧へ
           </Link>
         </div>
-      </div>
-
-      <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800">
-        工事情報編集で「通路（定点）停止画URL」を入力してください（未設置なら空欄OK）
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
@@ -922,7 +660,7 @@ export default function KyNewClient() {
             onChange={(e) => setWorkDetail(e.target.value)}
             rows={3}
             className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-            placeholder="例：法面整形、転圧、土砂運搬 など"
+            placeholder="例：舗装工（表層工 アスファルト舗設）など"
           />
         </div>
 
@@ -947,7 +685,50 @@ export default function KyNewClient() {
         <div className="text-xs text-slate-500">※ 墓参者の多少に応じて、誘導・区画分離・声掛け等をAI補足に反映します。</div>
       </div>
 
-      {/* ---（中略：写真ブロックは元のまま）--- */}
+      {/* 写真（最小：URL or ファイル） */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+        <div className="text-sm font-semibold text-slate-800">写真（任意）</div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <div className="text-xs text-slate-600">法面（今回）</div>
+            <div className="flex gap-2 flex-wrap">
+              <button type="button" onClick={() => { setSlopeMode("url"); setSlopeFile(null); setSlopeFileName(""); }} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+                定点URLを使う
+              </button>
+              <button type="button" onClick={onPickSlopeFile} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+                ファイル選択
+              </button>
+              <button type="button" onClick={() => { setSlopeMode("none"); setSlopeFile(null); setSlopeFileName(""); setSlopeNowUrlCached(""); }} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+                なし
+              </button>
+            </div>
+            <div className="text-xs text-slate-500">
+              {slopeMode === "url" ? `URL：${slopeUrlFromProject || "（未設定）"}` : slopeMode === "file" ? `ファイル：${slopeFileName}` : "（なし）"}
+            </div>
+            <input ref={slopeFileRef} type="file" accept="image/*" className="hidden" onChange={onSlopeFileChange} />
+          </div>
+
+          <div className="space-y-2">
+            <div className="text-xs text-slate-600">通路（今回）</div>
+            <div className="flex gap-2 flex-wrap">
+              <button type="button" onClick={() => { setPathMode("url"); setPathFile(null); setPathFileName(""); }} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+                定点URLを使う
+              </button>
+              <button type="button" onClick={onPickPathFile} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+                ファイル選択
+              </button>
+              <button type="button" onClick={() => { setPathMode("none"); setPathFile(null); setPathFileName(""); setPathNowUrlCached(""); }} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-50">
+                なし
+              </button>
+            </div>
+            <div className="text-xs text-slate-500">
+              {pathMode === "url" ? `URL：${pathUrlFromProject || "（未設定）"}` : pathMode === "file" ? `ファイル：${pathFileName}` : "（なし）"}
+            </div>
+            <input ref={pathFileRef} type="file" accept="image/*" className="hidden" onChange={onPathFileChange} />
+          </div>
+        </div>
+      </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
         <div className="flex items-center justify-between gap-3">
@@ -962,61 +743,50 @@ export default function KyNewClient() {
           </button>
         </div>
 
-        {/* ✅ 作業内容の補足は表示しない（人の入力が正） */}
-        {/* <div className="space-y-2">
-          <div className="text-xs text-slate-600">作業内容の補足</div>
-          <textarea value={aiWork} onChange={(e) => setAiWork(e.target.value)} rows={4} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
-        </div> */}
+        {/* ✅ 作業内容の補足は不要（人入力が正） */}
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">危険予知の補足（上位5項目・番号なし）</div>
-          {aiHazardsTop5.length ? (
+          <div className="text-xs text-slate-600">危険予知の補足（上位5・リスク順）</div>
+          {aiRiskItems.length ? (
             <div className="rounded-lg border border-slate-300 bg-white p-3">
               <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {aiHazardsTop5.map((x, i) => (
-                  <li key={`${x}-${i}`}>{x}</li>
+                {aiRiskItems.slice(0, 5).map((x) => (
+                  <li key={`h-${x.rank}`}>{x.hazard}</li>
                 ))}
               </ul>
             </div>
           ) : (
             <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
           )}
-
-          {/* ✅ 二重表示の原因：下のtextarea（元テキスト）は削除 */}
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">対策の補足（上位5項目・番号なし）</div>
-          {aiMeasuresTop5.length ? (
+          <div className="text-xs text-slate-600">対策の補足（危険予知に対応：1対1）</div>
+          {aiRiskItems.length ? (
             <div className="rounded-lg border border-slate-300 bg-white p-3">
               <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {aiMeasuresTop5.map((x, i) => (
-                  <li key={`${x}-${i}`}>{x}</li>
+                {aiRiskItems.slice(0, 5).map((x) => (
+                  <li key={`m-${x.rank}`}>
+                    <span className="font-semibold">（{x.rank}）</span>
+                    {x.countermeasure}
+                  </li>
                 ))}
               </ul>
             </div>
           ) : (
             <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
           )}
-
-          {/* ✅ 二重表示の原因：下のtextarea（元テキスト）は削除 */}
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">第三者（墓参者）の補足（番号なし）</div>
-          {aiThirdView.length ? (
+          <div className="text-xs text-slate-600">第三者（墓参者）の補足</div>
+          {aiThird.trim() ? (
             <div className="rounded-lg border border-slate-300 bg-white p-3">
-              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
-                {aiThirdView.map((x, i) => (
-                  <li key={`${x}-${i}`}>{x}</li>
-                ))}
-              </ul>
+              <pre className="whitespace-pre-wrap text-sm text-slate-800">{aiThird}</pre>
             </div>
           ) : (
             <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
           )}
-
-          {/* ✅ 二重表示の原因：下のtextarea（元テキスト）は削除 */}
         </div>
       </div>
 
