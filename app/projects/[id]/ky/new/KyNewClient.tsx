@@ -88,6 +88,35 @@ function bulletsFromItemsMeasures(items: RiskItem[]) {
   return items.map((x) => `・（${x.rank}）${x.countermeasure}`).join("\n");
 }
 
+// ✅ 箇条書き文字列（・）から配列へ復元（APIが ai_risk_items を返さない場合の互換）
+function parseBulletLines(text: string): string[] {
+  return s(text)
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .map((x) => x.replace(/^[-•・\s]+/, "").trim())
+    .filter(Boolean);
+}
+
+function rebuildRiskItemsFromTexts(aiHazardsText: string, aiCounterText: string): RiskItem[] {
+  const hs = parseBulletLines(aiHazardsText);
+  const csRaw = parseBulletLines(aiCounterText);
+
+  // 対策側に「（1）」等が混ざっていても消す
+  const cs = csRaw.map((x) => x.replace(/^\(?\d+\)?\s*[）)]?\s*/, "").trim());
+
+  const n = Math.min(hs.length, cs.length, 5);
+  const items: RiskItem[] = [];
+  for (let i = 0; i < n; i++) {
+    items.push({
+      rank: i + 1,
+      hazard: hs[i] || "",
+      countermeasure: cs[i] || "",
+    });
+  }
+  return items;
+}
+
 export default function KyNewClient() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
@@ -310,7 +339,7 @@ export default function KyNewClient() {
     [KY_PHOTO_BUCKET, projectId]
   );
 
-  // ✅ AI生成：作業内容から（ChatGPT推論＋ガード）→ ai_risk_items
+  // ✅ AI生成：/api/ky-ai-suggest（返却が配列でも文字列でも表示できるように互換対応）
   const onGenerateAi = useCallback(async () => {
     setStatus({ type: null, text: "生成中..." });
     setAiGenerating(true);
@@ -319,14 +348,41 @@ export default function KyNewClient() {
       const w = workDetail.trim();
       if (!w) throw new Error("作業内容（必須）を入力してください");
 
+      // ✅ 気象（適用枠）を要約文字列で渡す（UIは変えない）
+      const weatherTextForAi =
+        appliedSlotObj ? `適用：${appliedSlotHour}時 / ${slotSummary(appliedSlotObj)}` : "";
+
+      // ✅ 写真URL（URLモードはそのまま渡せる。fileモードは未アップロードなので空でOK）
+      const slopeUrlForAi =
+        slopeNowUrlCached ||
+        (slopeMode === "url" ? (slopeUrlFromProject || "") : "");
+
+      const pathUrlForAi =
+        pathNowUrlCached ||
+        (pathMode === "url" ? (pathUrlFromProject || "") : "");
+
       const res = await fetch("/api/ky-ai-suggest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
         body: JSON.stringify({
+          // ✅ API側が拾えるように複数キーで送る（中身だけ強化）
           workContent: w,
+          work_detail: w,
+
+          // 参考入力（人の入力も渡す）
           hazardsText: hazards || "",
+          countermeasuresText: countermeasures || "",
+
+          // 第三者・作業員数・気象
           thirdPartyLevel: thirdPartyLevel || "",
+          worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
+          weather_text: weatherTextForAi,
+
+          // 写真（法面/通路）
+          photo_slope_url: slopeUrlForAi || "",
+          photo_path_url: pathUrlForAi || "",
+
           profile: aiProfile,
         }),
       });
@@ -334,31 +390,51 @@ export default function KyNewClient() {
       const j = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(j?.error || "AI補足生成に失敗しました");
 
-      const items = Array.isArray(j?.ai_risk_items) ? (j.ai_risk_items as RiskItem[]) : [];
-      setAiRiskItems(items);
+      // ✅ 1) 配列が返るならそれを正として採用
+      const itemsFromApi = Array.isArray(j?.ai_risk_items) ? (j.ai_risk_items as RiskItem[]) : [];
 
-      // 互換もセット（保存・レビュー互換用）
-      setAiHazards(s(j?.ai_hazards || bulletsFromItemsHazards(items)));
-      setAiCounter(s(j?.ai_countermeasures || bulletsFromItemsMeasures(items)));
+      // ✅ 2) 文字列キー（ai_hazards/ai_countermeasures）が返るなら互換で復元
+      const hazardsText =
+        s(j?.ai_hazards || j?.aiHazards || j?.hazards || j?.hazards_text || "");
+      const counterText =
+        s(j?.ai_countermeasures || j?.aiCountermeasures || j?.countermeasures || j?.countermeasures_text || "");
 
-      // 第三者（現状OKとのことなので簡易で十分）
-      const third = (() => {
-        if (thirdPartyLevel === "多い") {
-          return [
-            "・誘導員を配置し、墓参者の動線を常時監視すること",
-            "・作業区画をコーン・バーで明確化し、立入規制を行うこと",
-            "・接近があれば作業を一時中断し、安全確保後に再開すること",
-          ].join("\n");
-        }
-        if (thirdPartyLevel === "少ない") {
-          return [
-            "・出入口付近に注意喚起表示を行い、声掛けを徹底すること",
-            "・接近時は作業を一時停止し、誘導して安全を確保すること",
-          ].join("\n");
-        }
-        return "";
-      })();
-      setAiThird(third);
+      const itemsFallback =
+        !itemsFromApi.length && (hazardsText.trim() || counterText.trim())
+          ? rebuildRiskItemsFromTexts(hazardsText, counterText)
+          : [];
+
+      const finalItems = itemsFromApi.length ? itemsFromApi : itemsFallback;
+
+      setAiRiskItems(finalItems);
+
+      // 互換テキスト（保存用）
+      setAiHazards(hazardsText.trim() ? hazardsText : bulletsFromItemsHazards(finalItems));
+      setAiCounter(counterText.trim() ? counterText : bulletsFromItemsMeasures(finalItems));
+
+      // 第三者：APIが返すなら優先、無ければ従来のローカル文で補完
+      const thirdFromApi = s(j?.ai_third_party || j?.aiThirdParty || j?.third_party || j?.third_party_text || "");
+      if (thirdFromApi.trim()) {
+        setAiThird(thirdFromApi);
+      } else {
+        const third = (() => {
+          if (thirdPartyLevel === "多い") {
+            return [
+              "・誘導員を配置し、墓参者の動線を常時監視すること",
+              "・作業区画をコーン・バーで明確化し、立入規制を行うこと",
+              "・接近があれば作業を一時中断し、安全確保後に再開すること",
+            ].join("\n");
+          }
+          if (thirdPartyLevel === "少ない") {
+            return [
+              "・出入口付近に注意喚起表示を行い、声掛けを徹底すること",
+              "・接近時は作業を一時停止し、誘導して安全を確保すること",
+            ].join("\n");
+          }
+          return "";
+        })();
+        setAiThird(third);
+      }
 
       setStatus({ type: "success", text: "AI補足を生成しました" });
     } catch (e: any) {
@@ -366,7 +442,22 @@ export default function KyNewClient() {
     } finally {
       setAiGenerating(false);
     }
-  }, [workDetail, hazards, thirdPartyLevel, aiProfile]);
+  }, [
+    workDetail,
+    hazards,
+    countermeasures,
+    thirdPartyLevel,
+    aiProfile,
+    workerCount,
+    appliedSlotObj,
+    appliedSlotHour,
+    slopeMode,
+    pathMode,
+    slopeNowUrlCached,
+    pathNowUrlCached,
+    slopeUrlFromProject,
+    pathUrlFromProject,
+  ]);
 
   const WeatherCard = useCallback(({ slot, appliedHour }: { slot: WeatherSlot; appliedHour: 9 | 12 | 15 | null }) => {
     const isApplied = appliedHour != null && slot.hour === appliedHour;
@@ -404,12 +495,10 @@ export default function KyNewClient() {
 
     setSaving(true);
     try {
-      // ✅ session token
       const { data: sess } = await supabase.auth.getSession();
       const accessToken = s(sess?.session?.access_token).trim();
       if (!accessToken) throw new Error("ログインが必要です（access tokenなし）");
 
-      // ✅ 写真URL確定（キャッシュ優先）
       let slopeSavedUrl: string | null = null;
       let pathSavedUrl: string | null = null;
 
@@ -425,7 +514,6 @@ export default function KyNewClient() {
         else if (pathMode === "url") pathSavedUrl = pathUrlFromProject || null;
       }
 
-      // ✅ ky-create payload（キー名：work_content）
       const createPayload: any = {
         project_id: projectId,
         work_date: workDate,
@@ -440,13 +528,11 @@ export default function KyNewClient() {
 
         weather_slots: appliedSlots && appliedSlots.length ? appliedSlots : null,
 
-        // AI互換
         ai_work_detail: null,
         ai_hazards: aiHazards.trim() ? aiHazards.trim() : null,
         ai_countermeasures: aiCounter.trim() ? aiCounter.trim() : null,
         ai_third_party: aiThird.trim() ? aiThird.trim() : null,
 
-        // ✅ AI正本
         ai_risk_items: aiRiskItems.length ? aiRiskItems.slice(0, 5) : null,
         ai_profile: "strict",
       };
@@ -466,7 +552,6 @@ export default function KyNewClient() {
       const kyId = s(jr?.kyId).trim();
       if (!kyId) throw new Error("保存に失敗しました（kyId不明）");
 
-      // ✅ ky_photos へ保存（既存運用）
       const photoRows: any[] = [];
       if (slopeSavedUrl) {
         photoRows.push({
@@ -742,8 +827,6 @@ export default function KyNewClient() {
             {aiGenerating ? "生成中..." : "AI補足を生成"}
           </button>
         </div>
-
-        {/* ✅ 作業内容の補足は不要（人入力が正） */}
 
         <div className="space-y-2">
           <div className="text-xs text-slate-600">危険予知の補足（上位5・リスク順）</div>
