@@ -100,17 +100,13 @@ function splitLinesSimple(text: string): string[] {
     .filter(Boolean);
 }
 
+// ✅ approved列が無い環境でも安全に承認判定できるようにする
 function isApprovedLike(row: any): boolean {
-  // どの列名でも「承認済み」を拾えるように保険
   if (!row) return false;
-  const v =
-    row?.approved ??
-    row?.is_approved ??
-    row?.approved_flag ??
-    row?.isApproved ??
-    null;
+
+  const v = row?.is_approved ?? row?.approved_flag ?? row?.isApproved ?? null;
   if (typeof v === "boolean") return v;
-  // approved_at / approvedAt が入っていれば承認済み扱い
+
   const at = row?.approved_at ?? row?.approvedAt ?? null;
   return !!at;
 }
@@ -233,6 +229,7 @@ export default function KyEditClient() {
       }
 
       // 3) ky entry（編集の本体）
+      // ✅ 注意：approved 列は存在しない環境があるので select しない
       const { data: ky, error: kyErr } = await (supabase as any)
         .from("ky_entries")
         .select(
@@ -251,7 +248,6 @@ export default function KyEditClient() {
             "ai_hazards",
             "ai_countermeasures",
             "ai_third_party",
-            "approved",
             "is_approved",
             "approved_at",
           ].join(",")
@@ -407,7 +403,6 @@ export default function KyEditClient() {
         return;
       }
 
-      // 保存が無い/一致しない場合は先頭を選択
       if (normalized.length) {
         setSelectedSlotHour(normalized[0].hour);
       } else {
@@ -495,7 +490,6 @@ export default function KyEditClient() {
     let slopeNowUrl: string | null = null;
     let pathNowUrl: string | null = null;
 
-    // URL使用（工事情報の定点URL） or ファイルアップロード
     if (slopeMode === "url") slopeNowUrl = slopeUrlFromProject || null;
     if (slopeMode === "file" && slopeFile) slopeNowUrl = await uploadToStorage(slopeFile, "slope");
     if (slopeMode === "none") slopeNowUrl = slopeNowExistingUrl || null;
@@ -600,7 +594,6 @@ export default function KyEditClient() {
 
   const upsertKyPhoto = useCallback(
     async (kind: "slope" | "path", url: string) => {
-      // 既存の列名差があるので「複数列に同じURLを入れておく」方式で安全に
       const row: any = {
         project_id: projectId,
         ky_id: kyId,
@@ -612,7 +605,6 @@ export default function KyEditClient() {
         url,
       };
 
-      // upsertがキー制約に依存するため、まず「同kindがあれば更新、なければinsert」で確実に
       const { data: existing, error: selErr } = await (supabase as any)
         .from("ky_photos")
         .select("id,kind,photo_kind")
@@ -675,7 +667,6 @@ export default function KyEditClient() {
         third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
         partner_company_name: partnerCompanyName.trim(),
 
-        // ✅ 適用枠を先頭にした並びで保存（レビューで先頭＝適用枠として使う）
         weather_slots: appliedSlots && appliedSlots.length ? appliedSlots : null,
 
         worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
@@ -706,7 +697,6 @@ export default function KyEditClient() {
 
       if (upErr) throw upErr;
 
-      // 写真は差し替えがあったときだけ ky_photos を更新/追加
       if (slopeSavedUrl) {
         await upsertKyPhoto("slope", slopeSavedUrl);
         setSlopeNowExistingUrl(slopeSavedUrl);
@@ -718,7 +708,6 @@ export default function KyEditClient() {
 
       setStatus({ type: "success", text: "更新しました" });
 
-      // 編集後はKY一覧へ戻す（あなたの運用：レビュー確認は一覧→レビューでOK）
       router.push(`/projects/${projectId}/ky`);
       router.refresh();
       setTimeout(() => {
@@ -840,10 +829,6 @@ export default function KyEditClient() {
             KY一覧へ
           </Link>
         </div>
-      </div>
-
-      <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-        ※ 編集画面は新規作成と同じ書式です（気象は「適用枠」を必ず反映します）
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
