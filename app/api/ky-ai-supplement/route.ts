@@ -15,7 +15,7 @@ type WeatherSlot = {
 type Body = {
   work_detail: string;
 
-  // ✅ AIへ送らない（比較用：重複除外のみ）
+  // ✅ 受け取っても「AIへは送らない」（比較用：重複除外のみ）
   hazards?: string | null;
   countermeasures?: string | null;
 
@@ -52,7 +52,7 @@ function splitLines(text: string): string[] {
     .filter(Boolean);
 }
 
-/** 危険予知：因果形式を最後に保証（1行内で濃く書いてOK） */
+/** 因果形式を最後に保証 */
 function ensureCausal(line: string): string {
   const t = stripBulletLead(normalizeText(line));
   if (!t) return "";
@@ -75,8 +75,8 @@ function ensureCausal(line: string): string {
 }
 
 /** =========================
- *  重複判定（人入力と近い行は落とす）
- *  ※落とし過ぎを避けるため threshold は中庸
+ *  重複判定（人入力と似てたら落とす）
+ *  ※落とし過ぎ防止：閾値は「似てても残す」方向（前回の増える版）
  * ========================= */
 function normalizeForSim(x: string): string {
   return (x || "")
@@ -160,6 +160,7 @@ async function callOpenAIResponses(payload: any, apiKey: string, timeoutMs: numb
 function extractAnyTextFromResponses(resp: any): string {
   const direct = s(resp?.output_text).trim();
   if (direct) return direct;
+
   const out = resp?.output;
   if (Array.isArray(out)) {
     for (const block of out) {
@@ -176,6 +177,7 @@ function extractAnyTextFromResponses(resp: any): string {
       }
     }
   }
+
   try {
     return JSON.stringify(resp);
   } catch {
@@ -187,6 +189,7 @@ function parseJsonLoosely(text: string): any | null {
   try {
     return JSON.parse(src);
   } catch {}
+
   const deFenced = src.replace(/```json/gi, "```").replace(/```/g, "").trim();
   const start = deFenced.indexOf("{");
   const end = deFenced.lastIndexOf("}");
@@ -222,21 +225,39 @@ function normalizeArrayToStrings(arr: any): string[] {
     .filter(Boolean);
 }
 
-/** 気象要約（表示用＋AI投入用） */
-function weatherSummary(slots: WeatherSlot[] | null | undefined): string {
+function weatherSummary(slots: WeatherSlot[] | null | undefined): { text: string; isFineDry: boolean; isWindy: boolean; isHot: boolean } {
   const arr = Array.isArray(slots) ? slots : [];
-  if (!arr.length) return "（気象データなし）";
-  const lines = arr
+  if (!arr.length) return { text: "（気象データなし）", isFineDry: false, isWindy: false, isHot: false };
+
+  const srt = arr
     .filter((x) => x && (x.hour === 9 || x.hour === 12 || x.hour === 15))
-    .sort((a, b) => a.hour - b.hour)
-    .map((x) => {
-      const w = s(x.weather_text) || "不明";
-      const t = x.temperature_c == null ? "—" : `${x.temperature_c}℃`;
-      const ws = x.wind_speed_ms == null ? "—" : `${x.wind_speed_ms}m/s`;
-      const p = x.precipitation_mm == null ? "—" : `${x.precipitation_mm}mm`;
-      return `${x.hour}時: ${w} / 気温${t} / 風速${ws} / 降水${p}`;
-    });
-  return lines.join("\n");
+    .sort((a, b) => a.hour - b.hour);
+
+  let maxWind = 0;
+  let maxTemp = -999;
+  let maxPrec = 0;
+  let fineLike = 0;
+
+  const lines = srt.map((x) => {
+    const w = s(x.weather_text) || "不明";
+    const t = x.temperature_c == null ? null : Number(x.temperature_c);
+    const ws = x.wind_speed_ms == null ? null : Number(x.wind_speed_ms);
+    const p = x.precipitation_mm == null ? null : Number(x.precipitation_mm);
+
+    if (ws != null && !Number.isNaN(ws)) maxWind = Math.max(maxWind, ws);
+    if (t != null && !Number.isNaN(t)) maxTemp = Math.max(maxTemp, t);
+    if (p != null && !Number.isNaN(p)) maxPrec = Math.max(maxPrec, p);
+
+    if (/晴|快晴|日差し/.test(w)) fineLike++;
+
+    return `${x.hour}時: ${w} / 気温${t == null ? "—" : `${t}℃`} / 風速${ws == null ? "—" : `${ws}m/s`} / 降水${p == null ? "—" : `${p}mm`}`;
+  });
+
+  const isWindy = maxWind >= 6;
+  const isHot = maxTemp >= 28;
+  const isFineDry = maxPrec === 0 && fineLike >= 1;
+
+  return { text: lines.join("\n"), isFineDry, isWindy, isHot };
 }
 
 export async function POST(req: Request) {
@@ -256,33 +277,32 @@ export async function POST(req: Request) {
     const humanMeaLines = splitLines(s(body?.countermeasures));
     const thirdLevel = normalizeText(s(body?.third_party_level));
 
-    // AI投入：気象＋写真
-    const slots = Array.isArray(body?.weather_slots) ? (body.weather_slots as WeatherSlot[]) : [];
-    const weatherText = weatherSummary(slots);
-
+    // AIへ渡す気象とフラグ
+    const wx = weatherSummary(Array.isArray(body?.weather_slots) ? (body.weather_slots as WeatherSlot[]) : []);
     const slopeNow = safeUrl(body?.slope_photo_url);
     const slopePrev = safeUrl(body?.slope_prev_photo_url);
     const pathNow = safeUrl(body?.path_photo_url);
     const pathPrev = safeUrl(body?.path_prev_photo_url);
 
-    // ✅ ここが本丸：作業内容由来を“主役”にする指示
+    /** ✅ ここだけ “加える” ：作業内容からの危険予知/対策を濃くする指示（前回コードに追記） */
     const systemText = [
       "あなたは日本の建設現場の安全管理（所長補佐）。",
       "出力は必ずJSONのみ。前置き/解説/挨拶は禁止。JSON以外を出力しない。",
       "",
       "入力は「作業内容」「気象要約」「写真（今回/前回）」のみ。",
       "",
-      "最重要ルール：",
-      "A) hazards/measures の主役は『作業内容（工程固有）』。ここを薄くしない。工程の手順・道具・人員動線・合図・停止基準まで踏み込む。",
-      "B) 気象・写真は“追加補強”。作業内容由来を置き換えない。",
+      "【最重要】作業内容（工程固有）由来を薄くしない：",
+      "・作業内容を工程として分解して考える（準備→運搬→施工→片付け 等）。",
+      "・各工程で「いつ/どこで/何を/誰が/何の道具で」危険が出るかを具体化する。",
+      "・対策は『誰が（役割）』『配置（位置）』『手順』『停止基準』『合図』まで書く。",
+      "・抽象語だけ（注意する等）は禁止。現場でそのまま使える密度で。",
       "",
-      "出力ルール：",
-      "1) hazards は必ず『原因（工程/状況）だから、結果（何が起こる）』の因果形式。1行に「どの瞬間」「どこで」「何が」を入れて濃く書く（句読点/セミコロンOK）。",
-      "2) measures は具体策のみ。『誰が（役割）』『どこで（位置）』『いつ（タイミング）』『停止基準（条件）』を可能な限り含める。抽象語（注意する等）禁止。",
-      "3) 工程固有の観点を必ず含める：重機/車両の死角、合図統一、誘導員配置、資機材吊り/運搬、ホース/コード、足元、飛散/粉じん、保護具、点検。",
-      "4) 気象観点：降雨0でも粉じん・風による飛散・日射/眩しさ・熱中症を検討し、必要なら追加する。",
-      "5) 写真観点：今回/前回の差分から、養生・区画・足元・崩れ兆候・資機材散乱を読み取り、必要なら追加する。",
-      "6) 項目数は固定しない。薄くならないことが最優先。",
+      "必須：",
+      "1) hazards は必ず『〇〇だから、〇〇が起こる』形式で1項目=1行。",
+      "2) measures は具体策（手順/配置/合図/停止基準/点検/保護具/立入規制）を1項目=1行。",
+      "3) 気象に応じたリスクと対策を必ず含める（降雨ゼロでも『乾燥/粉じん/眩しさ/日射/熱中症/風による飛散』を検討）。",
+      "4) 写真は今回/前回を比較し、足元状況（ぬかるみ/段差/落石/崩れ兆候/養生不足/資機材散乱/立入規制の有無）を読み取り反映する。",
+      "5) 項目数は多め（上限なし）。ただし薄くするくらいなら増やす。",
     ].join("\n");
 
     const userText = [
@@ -290,11 +310,13 @@ export async function POST(req: Request) {
       workDetail,
       "",
       "【気象要約】",
-      weatherText,
+      wx.text,
+      "",
+      `【気象フラグ】快晴乾燥=${wx.isFineDry ? "Yes" : "No"} / 強風=${wx.isWindy ? "Yes" : "No"} / 高温=${wx.isHot ? "Yes" : "No"}`,
       "",
       "【写真】",
-      "以下の画像（今回/前回）を比較し、気象・写真由来の追加リスクがあれば hazards/measures に追加してください。",
-      "※ 画像が無い場合は、写真由来は“想定”で補完してよい。",
+      "以下の画像（今回/前回）を比較し、危険予知と対策に反映してください。",
+      "※ 画像が無い場合は、その項目は想定リスクで補完してください。",
     ].join("\n");
 
     const schema = {
@@ -320,7 +342,7 @@ export async function POST(req: Request) {
         { role: "user", content: userContent },
       ],
       text: { format: { type: "json_schema", name: "ky_ai_supplement", strict: true, schema } },
-      temperature: 0.3,
+      temperature: 0.4,
       max_output_tokens: maxTokens,
     });
 
@@ -343,29 +365,35 @@ export async function POST(req: Request) {
     let hazards = normalizeArrayToStrings(parsed?.hazards).map(ensureCausal).filter(Boolean);
     let measures = normalizeArrayToStrings(parsed?.measures).map((x) => stripBulletLead(normalizeText(x))).filter(Boolean);
 
-    // ✅ 人入力と同じ/近い内容は落とす（AIの追加価値を担保）
-    hazards = hazards.filter((x) => !isTooSimilar(x, humanHazLines, 0.46));
-    measures = measures.filter((x) => !isTooSimilar(x, humanMeaLines, 0.44));
+    // ✅ 落とし過ぎ防止：閾値を上げて「似てても残す」
+    hazards = hazards.filter((x) => !isTooSimilar(x, humanHazLines, 0.48));
+    measures = measures.filter((x) => !isTooSimilar(x, humanMeaLines, 0.46));
 
     hazards = dedupeKeepOrder(hazards);
     measures = dedupeKeepOrder(measures);
 
-    // ✅ “薄い返答”の最終保険（項目数ではなく「工程固有の濃さ」を最低限入れる）
-    if (!hazards.length || !measures.length) {
-      const fbHaz = [
-        ensureCausal("作業手順の入替時に合図が曖昧になりやすい（重機・人の交錯）"),
-        ensureCausal("ホース・コード・資機材が作業動線に入りやすい"),
-        ensureCausal("足元条件が変化しやすく、踏み外しが起きやすい"),
+    // ✅ 前回の“増える保険”はそのまま（項目数はこだわらないが、薄い時の底上げとして残す）
+    if (hazards.length < 12) {
+      const extra = [
+        ensureCausal("乾燥で粉じんが舞いやすい"),
+        ensureCausal("日差しで眩しく足元確認が遅れやすい"),
+        ensureCausal("日射で熱中症が起きやすい"),
+        ensureCausal("風で飛散物が発生しやすい"),
+        ensureCausal("資機材の仮置きが不安定になりやすい"),
+        ensureCausal("通路側の区画が不十分だと第三者が侵入しやすい"),
       ].filter(Boolean);
-
-      const fbMea = [
-        "合図者を1名固定し、重機は合図者の合図以外では動かさない（見失い＝停止）",
-        "ホース/コードは固定・跨ぎ禁止とし、通路と作業帯を分離して整理整頓を維持する",
-        "足元を事前整備し、段差解消・滑り止めを行い、危険箇所はマーキングして周知する",
+      hazards = dedupeKeepOrder([...hazards, ...extra]).slice(0, 16);
+    }
+    if (measures.length < 12) {
+      const extra = [
+        "散水・集じん・防じんマスクで粉じん対策を実施する（乾燥時は必須）",
+        "日差しで視認性が落ちるため、合図者配置・指差呼称・反射材で見落としを防止する",
+        "WBGT/休憩/水分塩分補給で熱中症対策を実施し、異常時は即中止する基準を周知する",
+        "風で飛散する資材は固定し、養生のめくれ・飛散が出たら作業を停止して復旧する",
+        "資機材は転倒防止の位置決めと仮置き禁止帯を設定する",
+        "第三者動線は区画し、立入禁止表示と誘導員で接近時は作業一時停止する",
       ];
-
-      hazards = hazards.length ? hazards : fbHaz;
-      measures = measures.length ? measures : fbMea;
+      measures = dedupeKeepOrder([...measures, ...extra]).slice(0, 18);
     }
 
     const third =
@@ -386,9 +414,11 @@ export async function POST(req: Request) {
       ai_hazards: joinLines(hazards),
       ai_countermeasures: joinLines(measures),
       ai_third_party: joinLines(third),
+
       ai_hazards_items: hazards,
       ai_countermeasures_items: measures,
       ai_third_party_items: third,
+
       model_used: model,
     });
   } catch (e: any) {
