@@ -1,5 +1,6 @@
 // app/api/line/push-ky/route.ts
 import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
@@ -12,14 +13,27 @@ type WeatherSlot = {
   precipitation_mm?: number | null;
 };
 
+type Idempotency = {
+  project_id: string;
+  ky_id: string;
+  event: "ky_approved" | "ky_updated";
+  rev: string; // approved_at や updated_at など（更新の度に変える）
+};
+
 type Body =
-  | { text: string; to?: string | string[]; also_to?: string | string[] }
+  | {
+      text: string;
+      to?: string | string[];
+      also_to?: string | string[];
+      idempotency?: Idempotency;
+    }
   | {
       title: string;
       url?: string;
       note?: string;
       to?: string | string[];
       also_to?: string | string[];
+      idempotency?: Idempotency;
 
       work_detail?: string | null;
       workers?: number | null;
@@ -41,8 +55,7 @@ async function sleep(ms: number) {
 }
 
 function isValidLineTo(id: string): boolean {
-  // userId: U + 32hex, groupId: C + 32hex, roomId: R + 32hex
-  const x = s(id).trim().replace(/^"+|"+$/g, ""); // 念のため両端の " を除去
+  const x = s(id).trim().replace(/^"+|"+$/g, "");
   return /^[UCR][0-9a-f]{32}$/i.test(x);
 }
 
@@ -52,8 +65,8 @@ function parseRecipients(v: any): string[] {
   return one ? [one] : [];
 }
 
-function parseAdminRecipientsFromEnv(): string[] {
-  const raw = (process.env.LINE_ADMIN_RECIPIENT_IDS || "").trim();
+function parseRecipientsFromEnv(envName: string): string[] {
+  const raw = (process.env[envName] || "").trim();
   if (!raw) return [];
   return raw.split(",").map((x) => x.trim()).filter(Boolean);
 }
@@ -64,10 +77,7 @@ async function callLinePush(token: string, to: string, text: string) {
 
   const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify(payload),
   });
 
@@ -76,7 +86,6 @@ async function callLinePush(token: string, to: string, text: string) {
   return { ok: res.ok, status: res.status, bodyText, retryAfter };
 }
 
-// 既存テンプレ関数（あなたの現行をそのまま使う想定）
 function trimLineOne(text: string, max = 60) {
   const t = s(text).replace(/\r\n/g, "\n").trim();
   if (!t) return "";
@@ -190,6 +199,43 @@ function buildCompletedTemplate(body: Extract<Body, { title: string }>) {
   return text.length > 4900 ? text.slice(0, 4899) + "…" : text;
 }
 
+function looksLikeDuplicateError(msg: string) {
+  const m = s(msg).toLowerCase();
+  return m.includes("duplicate") || m.includes("unique") || m.includes("already exists");
+}
+
+async function canSendWithLog(idem: Idempotency | undefined, toKey: string) {
+  if (!idem) return { allowed: true as const, reason: null as string | null };
+
+  const url = (process.env.NEXT_PUBLIC_SUPABASE_URL || "").trim();
+  const serviceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+  if (!url || !serviceKey) {
+    // ログ機構を使いたいがenvが無ければ「送ってはよい」扱い（現場優先）
+    return { allowed: true as const, reason: "skip_log_env_missing" as const };
+  }
+
+  const supabase = createClient(url, serviceKey, { auth: { persistSession: false } });
+
+  const { error } = await (supabase as any).from("line_send_logs").insert({
+    project_id: idem.project_id,
+    ky_id: idem.ky_id,
+    event: idem.event,
+    rev: idem.rev,
+    to_key: toKey,
+  });
+
+  if (!error) return { allowed: true as const, reason: null };
+
+  // UNIQUE違反相当なら「既送信なのでスキップ」
+  if (looksLikeDuplicateError(error.message)) {
+    return { allowed: false as const, reason: "duplicate" as const };
+  }
+
+  // それ以外のログ失敗は「送ってはよい」扱い（現場優先）
+  console.warn("[line-push-ky] log insert failed (ignore):", error.message);
+  return { allowed: true as const, reason: "log_failed_ignore" as const };
+}
+
 export async function POST(req: Request) {
   const started = Date.now();
 
@@ -218,29 +264,53 @@ export async function POST(req: Request) {
     const token = (process.env.LINE_CHANNEL_ACCESS_TOKEN || "").trim();
     if (!token) return NextResponse.json({ error: "LINE token missing" }, { status: 500 });
 
+    // ✅ 宛先：body(to/also_to) + 所長(ENV) + 社長(ENV)
     const toFromBody = parseRecipients((body as any)?.to);
     const alsoFromBody = parseRecipients((body as any)?.also_to);
-    const adminFromEnv = parseAdminRecipientsFromEnv();
 
-    const rawTargets = Array.from(new Set([...toFromBody, ...alsoFromBody, ...adminFromEnv]));
+    const adminFromEnv = parseRecipientsFromEnv("LINE_ADMIN_RECIPIENT_IDS");
+    const presFromEnv = parseRecipientsFromEnv("LINE_PRESIDENT_RECIPIENT_IDS");
+
+    const rawTargets = Array.from(new Set([...toFromBody, ...alsoFromBody, ...adminFromEnv, ...presFromEnv]));
     const validTargets = rawTargets.map((x) => x.trim().replace(/^"+|"+$/g, "")).filter(isValidLineTo);
     const invalidTargets = rawTargets.filter((x) => !isValidLineTo(x));
 
-    if (invalidTargets.length) {
-      console.warn("[line-push-ky] invalid targets filtered:", invalidTargets);
-    }
+    if (invalidTargets.length) console.warn("[line-push-ky] invalid targets filtered:", invalidTargets);
     if (!validTargets.length) {
       return NextResponse.json({ error: "no valid recipients", invalidTargets }, { status: 400 });
     }
 
-    const results: Array<{ to: string; ok: boolean; status: number; body: string }> = [];
+    const idem = (body as any)?.idempotency as Idempotency | undefined;
+
+    const results: Array<{
+      to: string;
+      ok: boolean;
+      skipped?: boolean;
+      skip_reason?: string | null;
+      status: number;
+      body: string;
+      attempts: number;
+    }> = [];
 
     for (const to of validTargets) {
+      // ✅ to_key（roleを厳密に分けたい場合は body で role を渡す設計に拡張可）
+      const toKey = `to:${to}`;
+
+      // ✅ 二重送信防止（同一イベント・同一rev・同一宛先だけ止める）
+      const gate = await canSendWithLog(idem, toKey);
+      if (!gate.allowed) {
+        results.push({ to, ok: true, skipped: true, skip_reason: gate.reason, status: 200, body: "", attempts: 0 });
+        continue;
+      }
+
       let ok = false;
       let lastStatus = 0;
       let lastBody = "";
+      let attempts = 0;
 
+      // ✅ リトライ：429はretry-after尊重、5xxは指数バックオフ
       for (let attempt = 1; attempt <= 3; attempt++) {
+        attempts = attempt;
         const r = await callLinePush(token, to, text);
         lastStatus = r.status;
         lastBody = r.bodyText;
@@ -257,15 +327,23 @@ export async function POST(req: Request) {
           await sleep(wait * 1000);
           continue;
         }
+
+        if (lastStatus >= 500 && lastStatus <= 599) {
+          // 0.6s → 1.6s → 3.2s（ざっくり）
+          const base = 600 * Math.pow(2, attempt - 1);
+          const jitter = Math.floor(Math.random() * 300);
+          await sleep(Math.min(base + jitter, 3500));
+          continue;
+        }
+
         break;
       }
 
-      results.push({ to, ok, status: lastStatus, body: lastBody.slice(0, 500) });
+      results.push({ to, ok, status: lastStatus, body: lastBody.slice(0, 500), attempts });
     }
 
     const ms = Date.now() - started;
 
-    // 1件でも成功していれば OK 扱いにする（現場運用優先）
     const anyOk = results.some((r) => r.ok);
     if (!anyOk) {
       return NextResponse.json({ error: "line api error (all failed)", targets: validTargets.length, results, ms }, { status: 500 });

@@ -37,6 +37,28 @@ function looksLikeMissingColumnError(msg: string, col: string) {
   return m.includes(col) && (m.includes("does not exist") || m.includes("column") || m.includes("schema cache"));
 }
 
+async function safeUpdateApprove(
+  adminClient: any,
+  kyId: string,
+  payload: Record<string, any>,
+  allowFallback: boolean
+) {
+  // まず is_approved を含むpayloadで更新を試す
+  const r1 = await adminClient.from("ky_entries").update(payload).eq("id", kyId);
+  if (!r1?.error) return { ok: true as const, usedFallback: false as const };
+
+  // is_approved列が無い環境なら、is_approved を外して再試行
+  const msg = s(r1.error?.message);
+  if (allowFallback && looksLikeMissingColumnError(msg, "is_approved")) {
+    const { is_approved, ...rest } = payload;
+    const r2 = await adminClient.from("ky_entries").update(rest).eq("id", kyId);
+    if (!r2?.error) return { ok: true as const, usedFallback: true as const };
+    return { ok: false as const, error: r2.error, usedFallback: true as const };
+  }
+
+  return { ok: false as const, error: r1.error, usedFallback: false as const };
+}
+
 export async function POST(req: Request) {
   try {
     const body = (await req.json()) as Body;
@@ -82,9 +104,27 @@ export async function POST(req: Request) {
     const adminClient = createClient(url, serviceKey, { auth: { persistSession: false } });
 
     // 対象KYの現状取得（協力会社名も取る）
+    // ✅ is_approved 列が無い環境があり得るので、selectには入れない（approved_atで判定可能）
     const { data: current, error: curErr } = await adminClient
       .from("ky_entries")
-      .select("id, project_id, is_approved, public_token, public_enabled, work_date, partner_company_name")
+      .select(
+        [
+          "id",
+          "project_id",
+          "public_token",
+          "public_enabled",
+          "work_date",
+          "partner_company_name",
+          "approved_at",
+          "work_detail",
+          "worker_count",
+          "third_party_level",
+          "weather_slots",
+          "ai_hazards",
+          "ai_countermeasures",
+          "ai_third_party",
+        ].join(",")
+      )
       .eq("id", kyId)
       .maybeSingle();
 
@@ -105,21 +145,25 @@ export async function POST(req: Request) {
 
     if (action === "unapprove") {
       // ✅ 承認解除＝公開停止
-      const { error: updErr } = await adminClient
-        .from("ky_entries")
-        .update({
+      const upd = await safeUpdateApprove(
+        adminClient,
+        kyId,
+        {
           is_approved: false,
           approved_at: null,
           approved_by: null,
           public_enabled: false,
           public_enabled_at: null,
           public_token: null,
-        })
-        .eq("id", kyId);
+        },
+        true
+      );
 
-      if (updErr) return NextResponse.json({ error: `Unapprove failed: ${updErr.message}` }, { status: 500 });
+      if (!upd.ok) {
+        return NextResponse.json({ error: `Unapprove failed: ${upd.error?.message ?? "unknown"}` }, { status: 500 });
+      }
 
-      return NextResponse.json({ ok: true, action: "unapprove" });
+      return NextResponse.json({ ok: true, action: "unapprove", used_fallback: upd.usedFallback });
     }
 
     // approve
@@ -127,27 +171,32 @@ export async function POST(req: Request) {
     const nowIso = new Date().toISOString();
 
     // ✅ 承認＝公開ON
-    const { error: updErr } = await adminClient
-      .from("ky_entries")
-      .update({
+    const upd = await safeUpdateApprove(
+      adminClient,
+      kyId,
+      {
         is_approved: true,
         approved_at: nowIso,
         approved_by: adminUserId,
         public_token: token,
         public_enabled: true,
         public_enabled_at: nowIso,
-      })
-      .eq("id", kyId);
+      },
+      true
+    );
 
-    if (updErr) return NextResponse.json({ error: `Approve failed: ${updErr.message}` }, { status: 500 });
+    if (!upd.ok) {
+      return NextResponse.json({ error: `Approve failed: ${upd.error?.message ?? "unknown"}` }, { status: 500 });
+    }
 
     const publicPath = `/ky/public/${token}`;
     const publicUrl = `${baseUrl}${publicPath}`;
 
     // 3) ★承認成功後にLINE通知（失敗しても承認は成功扱い）
     //    ルール：
+    //    - 承認時に「協力会社 + 所長 + 社長」へ通知
+    //      ※ 所長/社長は push-ky 側が env から必ず追加
     //    - 協力会社は完全分岐（ここでは協力会社宛先のみ渡す）
-    //    - 所長（あなた）宛は push-ky 側で LINE_ADMIN_RECIPIENT_IDS を常に追加して全件受信
     let lineOk: boolean | null = null;
     let lineError: string | null = null;
 
@@ -208,6 +257,16 @@ export async function POST(req: Request) {
 
         const endpoint = new URL("/api/line/push-ky", baseUrl).toString();
 
+        // ✅ 送信テンプレ用の詳細も渡す（push-ky側は既存互換）
+        const work_detail = s((current as any)?.work_detail).trim() || null;
+        const workers = (current as any)?.worker_count == null ? null : Number((current as any)?.worker_count);
+        const third_party_level = s((current as any)?.third_party_level).trim() || null;
+        const weather_slots = Array.isArray((current as any)?.weather_slots) ? (current as any).weather_slots : null;
+
+        const ai_hazards = s((current as any)?.ai_hazards).trim() || null;
+        const ai_countermeasures = s((current as any)?.ai_countermeasures).trim() || null;
+        const ai_third_party = s((current as any)?.ai_third_party).trim() || null;
+
         const res = await fetch(endpoint, {
           method: "POST",
           headers: {
@@ -217,9 +276,27 @@ export async function POST(req: Request) {
           body: JSON.stringify({
             title,
             url: publicUrl,
+
+            work_detail,
+            workers: Number.isFinite(workers as any) ? workers : null,
+            third_party_level,
+            weather_slots,
+
+            ai_hazards,
+            ai_countermeasures,
+            ai_third_party,
+
             // ✅ 協力会社は完全分岐：ここでは協力会社宛先のみ渡す
-            // ✅ 所長（あなた）は push-ky 側で env から必ず追加される
+            // ✅ 所長/社長は push-ky 側で env から必ず追加される
             to: partnerTo && isNonEmptyString(partnerTo) ? partnerTo : undefined,
+
+            // ✅ 二重送信防止（同一承認の重複だけ止める）
+            idempotency: {
+              project_id: projectId,
+              ky_id: kyId,
+              event: "ky_approved",
+              rev: nowIso, // approved_at と同値
+            },
           }),
         });
 
@@ -247,6 +324,9 @@ export async function POST(req: Request) {
       // ✅ push-ky の結果
       line_ok: lineOk,
       line_error: lineError,
+
+      // ✅ is_approved列が無い環境で fallback したか
+      used_fallback: upd.usedFallback,
     });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
