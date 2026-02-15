@@ -365,7 +365,7 @@ type ProcessOptions = {
   alignBonus?: number;
 };
 
-function processAiLines(aiText: string | null | undefined, opts: ProcessOptions = Array.isArray(aiText) ? {} : {}) {
+function processAiLines(aiText: string | null | undefined, opts: ProcessOptions = {}) {
   const { humanText = "", similarityThreshold = 0.72, topN = 5, alignKeywords = [], alignBonus = 2 } = opts;
 
   const humanLines = uniqExact(splitLines(humanText));
@@ -600,7 +600,9 @@ export default function KyReviewClient() {
 
       if (kyErr) throw kyErr;
 
-      const kyData: KyEntryRow | null = (kyRow as any) ?? null;
+      const kyDataRaw: KyEntryRow | null = (kyRow as any) ?? null;
+      const kyData: KyEntryRow | null = kyDataRaw ? ({ ...kyDataRaw } as KyEntryRow) : null;
+
       if (kyData) {
         const sup = safeParseJson(kyData.ai_supplement);
         if (sup) {
@@ -1011,6 +1013,21 @@ export default function KyReviewClient() {
 
   return (
     <div className="p-4 space-y-4">
+      {/* ✅ 印刷：AI補足は「内部スクロール禁止」＋「改ページOK」 */}
+      <style jsx global>{`
+        @media print {
+          .print-no-scroll {
+            overflow: visible !important;
+            max-height: none !important;
+            height: auto !important;
+          }
+          .print-break-auto {
+            break-inside: auto !important;
+            page-break-inside: auto !important;
+          }
+        }
+      `}</style>
+
       <div className="flex items-start justify-between gap-3 no-print">
         <div>
           <div className="text-lg font-bold text-slate-900">KY レビュー</div>
@@ -1096,7 +1113,7 @@ export default function KyReviewClient() {
                 <div className="text-xs text-slate-600 mb-1">R_photo（写真）</div>
                 <div className="text-xl font-bold text-slate-900">{risk.breakdown.photo.score}</div>
                 <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
-                  {risk.breakdown.photo.reasons.slice(0, 3).map((x, i) => (
+                  {(risk.breakdown.photo.reasons ?? []).slice(0, 3).map((x, i) => (
                     <li key={`${x}-${i}`}>{x}</li>
                   ))}
                 </ul>
@@ -1106,7 +1123,7 @@ export default function KyReviewClient() {
                 <div className="text-xs text-slate-600 mb-1">R_third（第三者）</div>
                 <div className="text-xl font-bold text-slate-900">{risk.breakdown.third_party.score}</div>
                 <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
-                  {risk.breakdown.third_party.reasons.slice(0, 3).map((x, i) => (
+                  {(risk.breakdown.third_party.reasons ?? []).slice(0, 3).map((x, i) => (
                     <li key={`${x}-${i}`}>{x}</li>
                   ))}
                 </ul>
@@ -1117,7 +1134,7 @@ export default function KyReviewClient() {
                 <div className="text-xl font-bold text-slate-900">{risk.breakdown.weather.score}</div>
                 <div className="text-xs text-slate-600 mt-1">適用：{appliedWeather ? `${appliedWeather.hour}時` : "—"}</div>
                 <ul className="mt-2 text-xs text-slate-600 list-disc pl-5 space-y-1">
-                  {risk.breakdown.weather.reasons.slice(0, 4).map((x, i) => (
+                  {(risk.breakdown.weather.reasons ?? []).slice(0, 4).map((x, i) => (
                     <li key={`${x}-${i}`}>{x}</li>
                   ))}
                 </ul>
@@ -1410,7 +1427,8 @@ export default function KyReviewClient() {
 
       <div className="print-page-break" />
 
-      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-avoid-break">
+      {/* ✅ AI補足：印刷は「内部スクロール厳禁」なので、ここは改ページOKにする */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-break-auto print-no-scroll">
         <div className="flex items-center justify-between gap-3">
           <div className="text-sm font-semibold text-slate-800">AI補足（要点抽出・重複除外・整合）</div>
 
@@ -1428,19 +1446,25 @@ export default function KyReviewClient() {
 
         {/* ✅ 仕様：作業内容のAI補足は表示しない */}
 
-        <div className="space-y-2 print-avoid-break">
+        <div className="space-y-2">
           <div className="text-xs text-slate-600">危険予知の補足（上位5：番号なし）</div>
-          <div className="rounded-lg border border-slate-300 bg-white p-3">{renderBullets(hazardsTop) ?? <div className="text-sm text-slate-600">（なし）</div>}</div>
+          <div className="rounded-lg border border-slate-300 bg-white p-3 print-no-scroll print-break-auto">
+            {renderBullets(hazardsTop) ?? <div className="text-sm text-slate-600">（なし）</div>}
+          </div>
         </div>
 
-        <div className="space-y-2 print-avoid-break">
+        <div className="space-y-2">
           <div className="text-xs text-slate-600">対策の補足（上位5：危険予知と整合を加点／番号なし）</div>
-          <div className="rounded-lg border border-slate-300 bg-white p-3">{renderBullets(measuresTop) ?? <div className="text-sm text-slate-600">（なし）</div>}</div>
+          <div className="rounded-lg border border-slate-300 bg-white p-3 print-no-scroll print-break-auto">
+            {renderBullets(measuresTop) ?? <div className="text-sm text-slate-600">（なし）</div>}
+          </div>
         </div>
 
-        <div className="space-y-2 print-avoid-break">
+        <div className="space-y-2">
           <div className="text-xs text-slate-600">第三者（墓参者）の補足（上位5：番号なし）</div>
-          <div className="rounded-lg border border-slate-300 bg-white p-3">{renderBullets(thirdTop) ?? <div className="text-sm text-slate-600">（なし）</div>}</div>
+          <div className="rounded-lg border border-slate-300 bg-white p-3 print-no-scroll print-break-auto">
+            {renderBullets(thirdTop) ?? <div className="text-sm text-slate-600">（なし）</div>}
+          </div>
         </div>
       </div>
 
