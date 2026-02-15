@@ -990,7 +990,7 @@ export default function KyNewClient() {
     <div className="p-4 space-y-4">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="text-lg font-bold text-slate-900">KY 新規作成</div>
+          <div className="text-lg font-bold text-slate-900">KY 新規作成（UI-TEST）</div>
           <div className="mt-1 text-sm text-slate-600">工事件名：{project?.name ?? "（不明）"}</div>
         </div>
         <div className="flex flex-col gap-2 shrink-0">
