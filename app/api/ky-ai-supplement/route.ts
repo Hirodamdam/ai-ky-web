@@ -52,11 +52,24 @@ function splitLines(text: string): string[] {
     .filter(Boolean);
 }
 
-/** 因果形式を最後に保証 */
-function ensureCausal(line: string): string {
+/** 先頭タグを外す（【作業】など） */
+function peelTag(line: string): { tag: string; body: string } {
   const t = stripBulletLead(normalizeText(line));
-  if (!t) return "";
-  if (/(だから|ため|恐れ|起こる|発生|転倒|転落|接触|巻き込まれ|飛来|墜落|滑落)/.test(t)) return t;
+  const m = t.match(/^(【(作業|気象|写真)】)\s*(.*)$/);
+  if (!m) return { tag: "", body: t };
+  return { tag: m[1], body: (m[3] || "").trim() };
+}
+
+/** 因果形式を保証（タグがあれば維持） */
+function ensureCausal(line: string): string {
+  const { tag, body } = peelTag(line);
+  const t = stripBulletLead(normalizeText(body));
+  if (!t) return tag ? `${tag} ` : "";
+
+  // 既に因果っぽいならそのまま
+  if (/(だから|ため|恐れ|起こる|発生|転倒|転落|接触|巻き込まれ|飛来|墜落|滑落|挟まれ)/.test(t)) {
+    return tag ? `${tag} ${t}` : t;
+  }
 
   const base = t;
   const risk =
@@ -71,12 +84,13 @@ function ensureCausal(line: string): string {
       : /(重機|バックホウ|ユンボ|車両|死角)/.test(base)
       ? "接触・巻き込まれが起こる"
       : "事故が起こる";
-  return `${base}だから、${risk}`;
+
+  const out = `${base}だから、${risk}`;
+  return tag ? `${tag} ${out}` : out;
 }
 
 /** =========================
  *  重複判定（人入力と似てたら落とす）
- *  ※落とし過ぎ防止：閾値は「似てても残す」方向（前回の増える版）
  * ========================= */
 function normalizeForSim(x: string): string {
   return (x || "")
@@ -208,9 +222,9 @@ function normalizeArrayToStrings(arr: any): string[] {
       if (typeof x === "string") return x;
       if (x && typeof x === "object") {
         const t =
-          (typeof x.text === "string" ? x.text : "") ||
-          (typeof x.content === "string" ? x.content : "") ||
-          (typeof x.value === "string" ? x.value : "") ||
+          (typeof (x as any).text === "string" ? (x as any).text : "") ||
+          (typeof (x as any).content === "string" ? (x as any).content : "") ||
+          (typeof (x as any).value === "string" ? (x as any).value : "") ||
           "";
         if (t) return t;
         try {
@@ -225,7 +239,12 @@ function normalizeArrayToStrings(arr: any): string[] {
     .filter(Boolean);
 }
 
-function weatherSummary(slots: WeatherSlot[] | null | undefined): { text: string; isFineDry: boolean; isWindy: boolean; isHot: boolean } {
+function weatherSummary(slots: WeatherSlot[] | null | undefined): {
+  text: string;
+  isFineDry: boolean;
+  isWindy: boolean;
+  isHot: boolean;
+} {
   const arr = Array.isArray(slots) ? slots : [];
   if (!arr.length) return { text: "（気象データなし）", isFineDry: false, isWindy: false, isHot: false };
 
@@ -260,6 +279,18 @@ function weatherSummary(slots: WeatherSlot[] | null | undefined): { text: string
   return { text: lines.join("\n"), isFineDry, isWindy, isHot };
 }
 
+/** タグ順に並べる：作業→気象→写真→その他 */
+function sortByTagOrder(lines: string[]): string[] {
+  const weight = (x: string) => {
+    const t = stripBulletLead(normalizeText(x));
+    if (t.startsWith("【作業】")) return 0;
+    if (t.startsWith("【気象】")) return 1;
+    if (t.startsWith("【写真】")) return 2;
+    return 3;
+  };
+  return [...lines].sort((a, b) => weight(a) - weight(b));
+}
+
 export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as Body;
@@ -284,25 +315,24 @@ export async function POST(req: Request) {
     const pathNow = safeUrl(body?.path_photo_url);
     const pathPrev = safeUrl(body?.path_prev_photo_url);
 
-    /** ✅ ここだけ “加える” ：作業内容からの危険予知/対策を濃くする指示（前回コードに追記） */
     const systemText = [
       "あなたは日本の建設現場の安全管理（所長補佐）。",
       "出力は必ずJSONのみ。前置き/解説/挨拶は禁止。JSON以外を出力しない。",
       "",
       "入力は「作業内容」「気象要約」「写真（今回/前回）」のみ。",
       "",
-      "【最重要】作業内容（工程固有）由来を薄くしない：",
-      "・作業内容を工程として分解して考える（準備→運搬→施工→片付け 等）。",
-      "・各工程で「いつ/どこで/何を/誰が/何の道具で」危険が出るかを具体化する。",
-      "・対策は『誰が（役割）』『配置（位置）』『手順』『停止基準』『合図』まで書く。",
-      "・抽象語だけ（注意する等）は禁止。現場でそのまま使える密度で。",
+      "【狙い】作業内容（工程固有）を主役にし、気象・写真差分は補足として後段に追加する。",
       "",
-      "必須：",
-      "1) hazards は必ず『〇〇だから、〇〇が起こる』形式で1項目=1行。",
-      "2) measures は具体策（手順/配置/合図/停止基準/点検/保護具/立入規制）を1項目=1行。",
-      "3) 気象に応じたリスクと対策を必ず含める（降雨ゼロでも『乾燥/粉じん/眩しさ/日射/熱中症/風による飛散』を検討）。",
-      "4) 写真は今回/前回を比較し、足元状況（ぬかるみ/段差/落石/崩れ兆候/養生不足/資機材散乱/立入規制の有無）を読み取り反映する。",
-      "5) 項目数は多め（上限なし）。ただし薄くするくらいなら増やす。",
+      "【出力ルール（超重要）】",
+      "1) hazards は必ず『〇〇だから、〇〇が起こる』形式。1行=1項目。",
+      "2) measures は具体策（誰が/配置/手順/合図/停止基準/点検/保護具/立入規制）。『注意する』は禁止。",
+      "3) 各行の先頭にタグを付ける：",
+      "   - 作業内容由来 → 【作業】",
+      "   - 気象由来（乾燥/粉じん/強風/雨/高温/眩しさ等）→ 【気象】",
+      "   - 写真差分由来（ぬかるみ/段差/崩れ兆候/養生不足/資機材散乱/区画不足等）→ 【写真】",
+      "4) 並び順：まず【作業】を多め（hazards 10〜16、measures 10〜16）、次に【気象】2〜6、最後に【写真】2〜6。",
+      "5) 作業内容を工程分解して考える（準備→運搬→施工→片付け）。各工程で『いつ/どこで/何を/誰が/何の道具で』危険が出るかを具体化。",
+      "6) 写真は今回/前回を比較し、変化点があれば優先して【写真】に反映。画像が無い時は想定で補完。",
     ].join("\n");
 
     const userText = [
@@ -351,49 +381,51 @@ export async function POST(req: Request) {
 
     let resp: any = null;
     try {
-      resp = await callOpenAIResponses(buildPayload(1800), apiKey, timeout1);
+      resp = await callOpenAIResponses(buildPayload(2000), apiKey, timeout1);
     } catch (e: any) {
       if (!isAbortError(e)) {
         return NextResponse.json({ error: e?.message ?? "OpenAI API error", detail: e?.detail ?? null }, { status: 500 });
       }
-      resp = await callOpenAIResponses(buildPayload(1200), apiKey, timeout2);
+      resp = await callOpenAIResponses(buildPayload(1400), apiKey, timeout2);
     }
 
     const anyText = extractAnyTextFromResponses(resp);
     const parsed = parseJsonLoosely(anyText) ?? {};
 
     let hazards = normalizeArrayToStrings(parsed?.hazards).map(ensureCausal).filter(Boolean);
-    let measures = normalizeArrayToStrings(parsed?.measures).map((x) => stripBulletLead(normalizeText(x))).filter(Boolean);
+    let measures = normalizeArrayToStrings(parsed?.measures)
+      .map((x) => stripBulletLead(normalizeText(x)))
+      .filter(Boolean);
 
-    // ✅ 落とし過ぎ防止：閾値を上げて「似てても残す」
+    // ✅ 落とし過ぎ防止：似てても残しやすい閾値
     hazards = hazards.filter((x) => !isTooSimilar(x, humanHazLines, 0.48));
     measures = measures.filter((x) => !isTooSimilar(x, humanMeaLines, 0.46));
 
-    hazards = dedupeKeepOrder(hazards);
-    measures = dedupeKeepOrder(measures);
+    hazards = dedupeKeepOrder(sortByTagOrder(hazards));
+    measures = dedupeKeepOrder(sortByTagOrder(measures));
 
-    // ✅ 前回の“増える保険”はそのまま（項目数はこだわらないが、薄い時の底上げとして残す）
+    // ✅ 最低限の保険（タグ付きで補足側に追加）
     if (hazards.length < 12) {
       const extra = [
-        ensureCausal("乾燥で粉じんが舞いやすい"),
-        ensureCausal("日差しで眩しく足元確認が遅れやすい"),
-        ensureCausal("日射で熱中症が起きやすい"),
-        ensureCausal("風で飛散物が発生しやすい"),
-        ensureCausal("資機材の仮置きが不安定になりやすい"),
-        ensureCausal("通路側の区画が不十分だと第三者が侵入しやすい"),
+        ensureCausal("【気象】乾燥で粉じんが舞いやすい"),
+        ensureCausal("【気象】日差しで眩しく足元確認が遅れやすい"),
+        ensureCausal("【気象】日射で熱中症が起きやすい"),
+        ensureCausal("【気象】風で飛散物が発生しやすい"),
+        ensureCausal("【写真】通路側の区画が不十分だと第三者が侵入しやすい"),
+        ensureCausal("【写真】資機材の仮置きが不安定だと転倒・落下が起こる"),
       ].filter(Boolean);
-      hazards = dedupeKeepOrder([...hazards, ...extra]).slice(0, 16);
+      hazards = dedupeKeepOrder(sortByTagOrder([...hazards, ...extra]));
     }
     if (measures.length < 12) {
       const extra = [
-        "散水・集じん・防じんマスクで粉じん対策を実施する（乾燥時は必須）",
-        "日差しで視認性が落ちるため、合図者配置・指差呼称・反射材で見落としを防止する",
-        "WBGT/休憩/水分塩分補給で熱中症対策を実施し、異常時は即中止する基準を周知する",
-        "風で飛散する資材は固定し、養生のめくれ・飛散が出たら作業を停止して復旧する",
-        "資機材は転倒防止の位置決めと仮置き禁止帯を設定する",
-        "第三者動線は区画し、立入禁止表示と誘導員で接近時は作業一時停止する",
+        "【気象】散水・集じん・防じんマスクで粉じん対策を実施する（乾燥時は必須）",
+        "【気象】日差しで視認性が落ちるため、合図者配置・指差呼称で見落としを防止する",
+        "【気象】WBGT/休憩/水分塩分補給で熱中症対策を実施し、異常時は即中止する基準を周知する",
+        "【気象】風で飛散する資材は固定し、養生のめくれ・飛散が出たら作業を停止して復旧する",
+        "【写真】資機材は転倒防止の位置決めと仮置き禁止帯を設定する",
+        "【写真】第三者動線は区画し、接近時は作業一時停止→誘導してから再開する",
       ];
-      measures = dedupeKeepOrder([...measures, ...extra]).slice(0, 18);
+      measures = dedupeKeepOrder(sortByTagOrder([...measures, ...extra]));
     }
 
     const third =
