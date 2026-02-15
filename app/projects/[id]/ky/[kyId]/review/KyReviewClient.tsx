@@ -214,12 +214,7 @@ async function postJsonTry(urls: string[], body: any): Promise<any> {
   throw lastErr ?? new Error("API呼び出しに失敗しました");
 }
 
-/** ============ AI補足：表示（新規作成と完全一致） ============
- * - 重複除外なし
- * - 並べ替えなし
- * - 件数制限なし
- * - 文字は折り返し（枠内改行OK）
- * ================================================ */
+/** ============ AI補足：表示（新規作成と完全一致） ============ */
 
 function stripLeadingMarker(line: string): string {
   return (line ?? "")
@@ -229,13 +224,11 @@ function stripLeadingMarker(line: string): string {
 
 function splitLinesKeepAll(text: string | null | undefined): string[] {
   const raw = (text ?? "").toString().replace(/\r\n/g, "\n");
-  // 空行は潰さず「項目行」だけ拾う（＝表示は新規作成と同じ項目数のまま）
-  // ※ 先頭記号だけは見やすさのため除去（番号無し箇条書きに統一）
   return raw
     .split("\n")
     .map((x) => stripLeadingMarker(x))
     .map((x) => x.trim())
-    .filter((x) => x.length >= 1); // ← “削らない”方針だが、完全空行だけは項目として意味がないので除外
+    .filter((x) => x.length >= 1);
 }
 
 function renderBulletsAll(lines: string[]) {
@@ -278,6 +271,68 @@ type RiskOut = {
   ai_top5: SummaryItem[];
   meta?: any;
 };
+
+function clampDelta(d: number) {
+  if (!Number.isFinite(d)) return 0;
+  return Math.max(-100, Math.min(100, Math.round(d)));
+}
+
+function buildLineMessage(args: {
+  projectName: string;
+  publicUrl: string;
+  risk: RiskOut | null;
+}) {
+  const { projectName, publicUrl, risk } = args;
+
+  const lines: string[] = [];
+  const title = "【KY承認】";
+  lines.push(title);
+
+  if (projectName) lines.push(`工事：${projectName}`);
+
+  if (risk) {
+    const rh = Math.round(Number(risk.total_human) || 0);
+    const ra = Math.round(Number(risk.total_ai) || 0);
+    const d = clampDelta(Number(risk.delta) || (ra - rh));
+
+    // Δ段階（通知文）
+    if (d >= 30) {
+      lines[0] = "【⚠ KY再確認推奨】";
+      lines.push(`AIセカンドオピニオン：厳しめ`);
+      lines.push(`AI総合：${ra} / 人：${rh} / 差：+${d}`);
+      lines.push("写真・第三者・作業手順の見落としがないか再確認してください。");
+    } else if (d >= 20) {
+      lines[0] = "【KY承認・要再確認】";
+      lines.push(`AIセカンドオピニオン：見落としの可能性`);
+      lines.push(`AI総合：${ra} / 人：${rh} / 差：+${d}`);
+      lines.push("写真差分／第三者／気象の項目を中心に再確認してください。");
+    } else if (d >= 10) {
+      lines.push(`AIセカンドオピニオン：やや厳しめ`);
+      lines.push(`AI総合：${ra} / 人：${rh} / 差：+${d}`);
+    } else if (d <= -10) {
+      lines.push(`AIセカンドオピニオン：人が厳しめ`);
+      lines.push(`AI総合：${ra} / 人：${rh} / 差：${d}`);
+    } else {
+      lines.push(`AIセカンドオピニオン：認識差 小`);
+      lines.push(`AI総合：${ra} / 人：${rh} / 差：${d >= 0 ? `+${d}` : `${d}`}`);
+    }
+
+    // TOP3（短く）
+    const top = Array.isArray(risk.ai_top5) ? risk.ai_top5.slice(0, 3) : [];
+    if (top.length) {
+      lines.push("要注意（TOP3）：");
+      for (const t of top) {
+        lines.push(`・${t.label}[${t.score}] ${s(t.reason).trim()}`);
+      }
+    }
+  } else {
+    // リスク未取得でもURLは送る
+    lines.push("（リスク評価は未取得）");
+  }
+
+  lines.push(publicUrl);
+  return lines.join("\n");
+}
 
 export default function KyReviewClient() {
   const params = useParams() as { id?: string; kyId?: string };
@@ -556,7 +611,6 @@ export default function KyReviewClient() {
     const raw = ky?.weather_slots ?? null;
     const arr = Array.isArray(raw) ? (raw as WeatherSlot[]) : [];
     const filtered = arr.filter((x) => x && (x.hour === 9 || x.hour === 12 || x.hour === 15));
-    // ✅ 保存時に「適用枠を先頭」にしているので、ここでは順序を崩さない
     return filtered;
   }, [ky?.weather_slots]);
 
@@ -568,174 +622,6 @@ export default function KyReviewClient() {
   const onPrint = useCallback(() => {
     window.print();
   }, []);
-
-  const onApprove = useCallback(async () => {
-    setStatus({ type: null, text: "" });
-    setActing(true);
-    try {
-      const { data } = await supabase.auth.getSession();
-      const accessToken = data?.session?.access_token;
-      if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
-
-      const j = await postJsonTry(["/api/ky-approve"], { projectId, kyId, accessToken });
-
-      let token = s(j?.public_token || j?.token || j?.publicToken).trim();
-      if (!token) {
-        const { data: row, error } = await supabase.from("ky_entries").select("public_token").eq("id", kyId).maybeSingle();
-        if (error) throw error;
-        token = s((row as any)?.public_token).trim();
-      }
-      if (!token) throw new Error("公開トークンが取得できませんでした（public_tokenが空です）。");
-
-      const origin = typeof window !== "undefined" ? window.location.origin : "";
-      const url = `${origin}/ky/public/${token}`;
-
-      const msg = `KY承認しました\n${project?.name ? `工事：${project.name}\n` : ""}${url}`;
-      const lineUrl = `https://line.me/R/msg/text/?${encodeURIComponent(msg)}`;
-
-      setStatus({ type: "success", text: "承認しました（LINEを開きます）" });
-      await load();
-      window.location.href = lineUrl;
-    } catch (e: any) {
-      setStatus({ type: "error", text: e?.message ?? "承認に失敗しました" });
-    } finally {
-      setActing(false);
-    }
-  }, [projectId, kyId, load, project?.name]);
-
-  const onUnapprove = useCallback(async () => {
-    setStatus({ type: null, text: "" });
-    setActing(true);
-    try {
-      const { data } = await supabase.auth.getSession();
-      const accessToken = data?.session?.access_token;
-      if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
-
-      await postJsonTry(["/api/ky-unapprove", "/api/ky-approve"], { projectId, kyId, accessToken, action: "unapprove" });
-
-      setStatus({ type: "success", text: "承認解除しました（公開停止）" });
-      await load();
-    } catch (e: any) {
-      setStatus({ type: "error", text: e?.message ?? "承認解除に失敗しました" });
-    } finally {
-      setActing(false);
-    }
-  }, [projectId, kyId, load]);
-
-  const onRegenerateAi = useCallback(async () => {
-    if (!ky) return;
-
-    if (ky.is_approved) {
-      setStatus({ type: "error", text: "承認済みのため、AI補足の再生成はできません。" });
-      return;
-    }
-
-    setStatus({ type: null, text: "" });
-    setAiGenerating(true);
-
-    try {
-      const payload = {
-        work_detail: ky.work_detail,
-        hazards: ky.hazards,
-        countermeasures: ky.countermeasures,
-        third_party_level: ky.third_party_level,
-        weather_slots: weatherSlots,
-        slope_photo_url: slopeNowUrl || null,
-        slope_prev_photo_url: slopePrevUrl || null,
-        path_photo_url: pathNowUrl || null,
-        path_prev_photo_url: pathPrevUrl || null,
-        worker_count: ky.worker_count ?? null,
-      };
-
-      const data = await postJsonTry(["/api/ky-ai-supplement"], payload);
-
-      const next: KyEntryRow = {
-        ...ky,
-        ai_work_detail: s(data?.ai_work_detail).trim(),
-        ai_hazards: s(data?.ai_hazards).trim(),
-        ai_countermeasures: s(data?.ai_countermeasures).trim(),
-        ai_third_party: s(data?.ai_third_party).trim(),
-        ai_supplement: s(data?.ai_supplement).trim() || ky.ai_supplement || null,
-      };
-
-      setKy(next);
-
-      const { error } = await supabase
-        .from("ky_entries")
-        .update({
-          ai_work_detail: next.ai_work_detail || null,
-          ai_hazards: next.ai_hazards || null,
-          ai_countermeasures: next.ai_countermeasures || null,
-          ai_third_party: next.ai_third_party || null,
-          ai_supplement: next.ai_supplement || null,
-        })
-        .eq("id", ky.id);
-
-      if (error) throw error;
-
-      setStatus({ type: "success", text: "AI補足を再生成して保存しました。" });
-    } catch (e: any) {
-      setStatus({ type: "error", text: e?.message ?? "AI補足の再生成に失敗しました" });
-    } finally {
-      setAiGenerating(false);
-    }
-  }, [ky, weatherSlots, slopeNowUrl, slopePrevUrl, pathNowUrl, pathPrevUrl]);
-
-  const publicUrl = useMemo(() => {
-    const token = s(ky?.public_token).trim();
-    const approved = !!ky?.is_approved;
-    if (!approved || !token) return "";
-    const origin = typeof window !== "undefined" ? window.location.origin : "";
-    if (!origin) return "";
-    return `${origin}/ky/public/${token}`;
-  }, [ky?.public_token, ky?.is_approved]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const run = async () => {
-      if (!publicUrl) {
-        setQrDataUrl("");
-        return;
-      }
-      try {
-        const dataUrl = await QRCode.toDataURL(publicUrl, {
-          errorCorrectionLevel: "M",
-          margin: 2,
-          width: 320,
-        });
-        if (!cancelled) setQrDataUrl(dataUrl);
-      } catch {
-        if (!cancelled) setQrDataUrl("");
-      }
-    };
-    run();
-    return () => {
-      cancelled = true;
-    };
-  }, [publicUrl]);
-
-  const onCopyPublicUrl = useCallback(async () => {
-    const url = publicUrl;
-    if (!url) return;
-
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(url);
-      } else {
-        const ta = document.createElement("textarea");
-        ta.value = url;
-        ta.style.position = "fixed";
-        ta.style.left = "-9999px";
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        document.body.removeChild(ta);
-      }
-      setStatus({ type: "success", text: "公開リンクをコピーしました" });
-    } catch (e: any) {
-      setStatus({ type: "error", text: e?.message ?? "コピーに失敗しました" });
-    }
-  }, [publicUrl]);
 
   /** ============ リスク（API呼び出し） ============ */
   const loadRisk = useCallback(async () => {
@@ -822,10 +708,200 @@ export default function KyReviewClient() {
     return { label: "低", cls: "bg-emerald-100 text-emerald-800 border-emerald-200" };
   }, [risk?.total_ai]);
 
+  // ✅ Δアラート（AIセカンドオピニオン）
+  const deltaBanner = useMemo(() => {
+    const d = clampDelta(risk?.delta ?? 0);
+    if (d >= 30) return { d, text: "KY再確認推奨（AIセカンドオピニオン：強）", cls: "bg-rose-600 text-white border-rose-200" };
+    if (d >= 20) return { d, text: "見落としの可能性あり（要再確認）", cls: "bg-orange-500 text-white border-orange-200" };
+    if (d >= 10) return { d, text: "AIがやや厳しめ（要点再確認）", cls: "bg-amber-300 text-slate-900 border-amber-200" };
+    if (d <= -10) return { d, text: "人が厳しめ（AIとの差を確認）", cls: "bg-sky-200 text-slate-900 border-sky-200" };
+    return { d, text: "認識差は小さい（概ね一致）", cls: "bg-emerald-600 text-white border-emerald-200" };
+  }, [risk?.delta]);
+
   // ✅ AI補足（新規作成と完全一致：削らない/並べ替えない/件数制限なし）
   const hazardsAll = useMemo(() => splitLinesKeepAll(ky?.ai_hazards), [ky?.ai_hazards]);
   const measuresAll = useMemo(() => splitLinesKeepAll(ky?.ai_countermeasures), [ky?.ai_countermeasures]);
   const thirdAll = useMemo(() => splitLinesKeepAll(ky?.ai_third_party), [ky?.ai_third_party]);
+
+  const publicUrl = useMemo(() => {
+    const token = s(ky?.public_token).trim();
+    const approved = !!ky?.is_approved;
+    if (!approved || !token) return "";
+    const origin = typeof window !== "undefined" ? window.location.origin : "";
+    if (!origin) return "";
+    return `${origin}/ky/public/${token}`;
+  }, [ky?.public_token, ky?.is_approved]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      if (!publicUrl) {
+        setQrDataUrl("");
+        return;
+      }
+      try {
+        const dataUrl = await QRCode.toDataURL(publicUrl, {
+          errorCorrectionLevel: "M",
+          margin: 2,
+          width: 320,
+        });
+        if (!cancelled) setQrDataUrl(dataUrl);
+      } catch {
+        if (!cancelled) setQrDataUrl("");
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [publicUrl]);
+
+  const onCopyPublicUrl = useCallback(async () => {
+    const url = publicUrl;
+    if (!url) return;
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(url);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = url;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      setStatus({ type: "success", text: "公開リンクをコピーしました" });
+    } catch (e: any) {
+      setStatus({ type: "error", text: e?.message ?? "コピーに失敗しました" });
+    }
+  }, [publicUrl]);
+
+  const onApprove = useCallback(async () => {
+    setStatus({ type: null, text: "" });
+    setActing(true);
+    try {
+      const { data } = await supabase.auth.getSession();
+      const accessToken = data?.session?.access_token;
+      if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
+
+      const j = await postJsonTry(["/api/ky-approve"], { projectId, kyId, accessToken });
+
+      let token = s(j?.public_token || j?.token || j?.publicToken).trim();
+      if (!token) {
+        const { data: row, error } = await supabase.from("ky_entries").select("public_token").eq("id", kyId).maybeSingle();
+        if (error) throw error;
+        token = s((row as any)?.public_token).trim();
+      }
+      if (!token) throw new Error("公開トークンが取得できませんでした（public_tokenが空です）。");
+
+      const origin = typeof window !== "undefined" ? window.location.origin : "";
+      const url = `${origin}/ky/public/${token}`;
+
+      // ✅ 承認時：リスクを可能なら最新化してから通知文へ反映
+      try {
+        await loadRisk();
+      } catch {
+        // 失敗しても通知は継続
+      }
+
+      const msg = buildLineMessage({
+        projectName: s(project?.name).trim(),
+        publicUrl: url,
+        risk: risk,
+      });
+
+      const lineUrl = `https://line.me/R/msg/text/?${encodeURIComponent(msg)}`;
+
+      setStatus({ type: "success", text: "承認しました（LINEを開きます）" });
+      await load();
+      window.location.href = lineUrl;
+    } catch (e: any) {
+      setStatus({ type: "error", text: e?.message ?? "承認に失敗しました" });
+    } finally {
+      setActing(false);
+    }
+  }, [projectId, kyId, load, project?.name, risk, loadRisk]);
+
+  const onUnapprove = useCallback(async () => {
+    setStatus({ type: null, text: "" });
+    setActing(true);
+    try {
+      const { data } = await supabase.auth.getSession();
+      const accessToken = data?.session?.access_token;
+      if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
+
+      await postJsonTry(["/api/ky-unapprove", "/api/ky-approve"], { projectId, kyId, accessToken, action: "unapprove" });
+
+      setStatus({ type: "success", text: "承認解除しました（公開停止）" });
+      await load();
+    } catch (e: any) {
+      setStatus({ type: "error", text: e?.message ?? "承認解除に失敗しました" });
+    } finally {
+      setActing(false);
+    }
+  }, [projectId, kyId, load]);
+
+  const onRegenerateAi = useCallback(async () => {
+    if (!ky) return;
+
+    if (ky.is_approved) {
+      setStatus({ type: "error", text: "承認済みのため、AI補足の再生成はできません。" });
+      return;
+    }
+
+    setStatus({ type: null, text: "" });
+    setAiGenerating(true);
+
+    try {
+      const payload = {
+        work_detail: ky.work_detail,
+        hazards: ky.hazards,
+        countermeasures: ky.countermeasures,
+        third_party_level: ky.third_party_level,
+        weather_slots: weatherSlots,
+        slope_photo_url: slopeNowUrl || null,
+        slope_prev_photo_url: slopePrevUrl || null,
+        path_photo_url: pathNowUrl || null,
+        path_prev_photo_url: pathPrevUrl || null,
+        worker_count: ky.worker_count ?? null,
+      };
+
+      const data = await postJsonTry(["/api/ky-ai-supplement"], payload);
+
+      const next: KyEntryRow = {
+        ...ky,
+        ai_work_detail: s(data?.ai_work_detail).trim(),
+        ai_hazards: s(data?.ai_hazards).trim(),
+        ai_countermeasures: s(data?.ai_countermeasures).trim(),
+        ai_third_party: s(data?.ai_third_party).trim(),
+        ai_supplement: s(data?.ai_supplement).trim() || ky.ai_supplement || null,
+      };
+
+      setKy(next);
+
+      const { error } = await supabase
+        .from("ky_entries")
+        .update({
+          ai_work_detail: next.ai_work_detail || null,
+          ai_hazards: next.ai_hazards || null,
+          ai_countermeasures: next.ai_countermeasures || null,
+          ai_third_party: next.ai_third_party || null,
+          ai_supplement: next.ai_supplement || null,
+        })
+        .eq("id", ky.id);
+
+      if (error) throw error;
+
+      setStatus({ type: "success", text: "AI補足を再生成して保存しました。" });
+    } catch (e: any) {
+      setStatus({ type: "error", text: e?.message ?? "AI補足の再生成に失敗しました" });
+    } finally {
+      setAiGenerating(false);
+    }
+  }, [ky, weatherSlots, slopeNowUrl, slopePrevUrl, pathNowUrl, pathPrevUrl]);
 
   if (loading) {
     return (
@@ -890,6 +966,11 @@ export default function KyReviewClient() {
           <div className="text-sm text-rose-700">リスク評価：{riskErr}</div>
         ) : risk ? (
           <>
+            {/* ✅ Δアラート */}
+            <div className={`rounded-lg border px-3 py-2 text-sm font-semibold ${deltaBanner.cls}`}>
+              AIセカンドオピニオン：{deltaBanner.text}（Δ：{deltaBanner.d >= 0 ? `+${deltaBanner.d}` : `${deltaBanner.d}`}）
+            </div>
+
             <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
               <div className="text-xs font-semibold text-slate-800 mb-2">要注意ポイント（人入力以外：高い順 TOP5）</div>
               {risk.ai_top5?.length ? (
@@ -981,7 +1062,7 @@ export default function KyReviewClient() {
             </div>
 
             <div className="text-xs text-slate-500">
-              ※ リスクは /api/ky-risk-score で計算（0〜100）。要注意TOP5は「人入力以外（写真/気象/第三者/作業員/AI文章）」を高い順に抽出。
+              ※ 本評価は <span className="font-semibold">AIによるセカンドオピニオン</span> です。人の判断を否定せず、見落とし防止のための補助診断として提示します。
             </div>
           </>
         ) : (
