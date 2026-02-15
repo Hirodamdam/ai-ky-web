@@ -137,10 +137,9 @@ function slotSummary(slot: WeatherSlot | null | undefined): string {
  *  表示用整形（壊さず改良）
  *  - 重複除去
  *  - 重要度スコアリング
- *  - 上位5件抽出
+ *  - 上位N件抽出（デフォルト20）
  *  - 番号削除（全項目統一）
  *  - 人入力との最小一致文削除
- *  - 危険予知と対策の整合統一（右側採用/番号除去/分割）
  * ========================= */
 
 function normalizeLineBase(raw: string): string {
@@ -349,7 +348,8 @@ function splitMeasuresLine(line: string): string[] {
   return parts.length ? parts : [noLead];
 }
 
-function pickTop5ByScore(lines: string[], kind: "hazard" | "measure" | "third"): string[] {
+/** ✅ 上位N抽出（デフォルト20） */
+function pickByScore(lines: string[], kind: "hazard" | "measure" | "third", limit = 20): string[] {
   const scored = lines
     .map((x) => ({ x: x.trim(), score: scoreImportance(x, kind) }))
     .filter((it) => it.x && it.score > 0);
@@ -358,14 +358,14 @@ function pickTop5ByScore(lines: string[], kind: "hazard" | "measure" | "third"):
 
   const out: string[] = [];
   for (const it of scored) {
-    if (out.length >= 5) break;
+    if (out.length >= limit) break;
     out.push(it.x);
   }
   return out;
 }
 
-// 危険予知：右側だけ採用、注記削除、重複除去、スコア上位5、人入力と類似は除外、番号なし
-function formatHazardsForView5(text: string, humanHazards: string): string[] {
+/** 危険予知：右側だけ採用、注記削除、重複除去、上位N、人入力と類似は除外、番号なし */
+function formatHazardsForView(text: string, humanHazards: string, limit = 20): string[] {
   const lines = String(text ?? "")
     .replace(/\r\n/g, "\n")
     .split("\n")
@@ -391,22 +391,22 @@ function formatHazardsForView5(text: string, humanHazards: string): string[] {
   }
 
   const deduped = dedupeKeepOrder(picked);
+  const ranked = pickByScore(deduped, "hazard", limit);
 
-  const top5 = pickTop5ByScore(deduped, "hazard");
-
-  if (top5.length < 5) {
+  // 保険：スコアで減り過ぎたら先頭から補完（最大limit）
+  if (ranked.length < Math.min(8, limit)) {
     for (const x of deduped) {
-      if (top5.length >= 5) break;
-      if (top5.includes(x)) continue;
-      top5.push(x);
+      if (ranked.length >= limit) break;
+      if (ranked.includes(x)) continue;
+      ranked.push(x);
     }
   }
 
-  return top5.slice(0, 5);
+  return ranked.slice(0, limit);
 }
 
-// 対策：番号削除、複合行分割、右側だけ採用、重複除去、スコア上位5、人入力と類似は除外、番号なし
-function formatMeasuresForView5(text: string, humanMeasures: string): string[] {
+/** 対策：番号削除、複合行分割、右側だけ採用、重複除去、上位N、人入力と類似は除外、番号なし */
+function formatMeasuresForView(text: string, humanMeasures: string, limit = 20): string[] {
   const lines = String(text ?? "")
     .replace(/\r\n/g, "\n")
     .split("\n")
@@ -436,20 +436,20 @@ function formatMeasuresForView5(text: string, humanMeasures: string): string[] {
   }
 
   const deduped = dedupeKeepOrder(items);
-  const top5 = pickTop5ByScore(deduped, "measure");
+  const ranked = pickByScore(deduped, "measure", limit);
 
-  if (top5.length < 5) {
+  if (ranked.length < Math.min(8, limit)) {
     for (const x of deduped) {
-      if (top5.length >= 5) break;
-      if (top5.includes(x)) continue;
-      top5.push(x);
+      if (ranked.length >= limit) break;
+      if (ranked.includes(x)) continue;
+      ranked.push(x);
     }
   }
 
-  return top5.slice(0, 5);
+  return ranked.slice(0, limit);
 }
 
-// 第三者：番号削除、重複除去、人入力（第三者レベル）と一致しそうな薄い文は落とす（上限なし）
+/** 第三者：番号削除、重複除去、人入力（第三者レベル）と一致しそうな薄い文は落とす（上限なし） */
 function formatThirdForView(text: string, thirdLevelHuman: string): string[] {
   const raw = String(text ?? "")
     .replace(/\r\n/g, "\n")
@@ -493,7 +493,6 @@ export default function KyNewClient() {
   const [partnerCompanyName, setPartnerCompanyName] = useState<string>("");
   const [partnerOptions, setPartnerOptions] = useState<PartnerOption[]>([]);
 
-  // ✅ 本日の作業員数
   const [workerCount, setWorkerCount] = useState<string>("");
 
   const [workDetail, setWorkDetail] = useState("");
@@ -746,6 +745,7 @@ export default function KyNewClient() {
 
     return {
       work_detail: w,
+      // ✅ 人入力は投げない（今の仕様維持）
       hazards: hazards.trim() ? hazards.trim() : null,
       countermeasures: countermeasures.trim() ? countermeasures.trim() : null,
       third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
@@ -858,7 +858,6 @@ export default function KyNewClient() {
         third_party_level: thirdPartyLevel.trim() ? thirdPartyLevel.trim() : null,
         partner_company_name: partnerCompanyName.trim(),
 
-        // ✅ 適用枠を先頭にした並びで保存（レビューで先頭＝適用枠として使う）
         weather_slots: appliedSlots && appliedSlots.length ? appliedSlots : null,
 
         worker_count: workerCount.trim() ? Number(workerCount.trim()) : null,
@@ -881,7 +880,11 @@ export default function KyNewClient() {
           .join("\n"),
       };
 
-      const { data: inserted, error: insErr } = await (supabase as any).from("ky_entries").insert(insertPayload).select("id").maybeSingle();
+      const { data: inserted, error: insErr } = await (supabase as any)
+        .from("ky_entries")
+        .insert(insertPayload)
+        .select("id")
+        .maybeSingle();
       if (insErr) throw insErr;
 
       const kyId = s(inserted?.id).trim();
@@ -970,10 +973,10 @@ export default function KyNewClient() {
     );
   }, []);
 
-  // （※整形ロジックは残したまま。UIではテキスト欄を1つに統一）
-  // const aiHazardsTop5 = useMemo(() => formatHazardsForView5(aiHazards, hazards), [aiHazards, hazards]);
-  // const aiMeasuresTop5 = useMemo(() => formatMeasuresForView5(aiCounter, countermeasures), [aiCounter, countermeasures]);
-  // const aiThirdView = useMemo(() => formatThirdForView(aiThird, thirdPartyLevel), [aiThird, thirdPartyLevel]);
+  // ✅ AI表示：最大20件＋スクロール
+  const aiHazardsView = useMemo(() => formatHazardsForView(aiHazards, hazards, 20), [aiHazards, hazards]);
+  const aiMeasuresView = useMemo(() => formatMeasuresForView(aiCounter, countermeasures, 20), [aiCounter, countermeasures]);
+  const aiThirdView = useMemo(() => formatThirdForView(aiThird, thirdPartyLevel), [aiThird, thirdPartyLevel]);
 
   if (loading) {
     return (
@@ -1132,7 +1135,7 @@ export default function KyNewClient() {
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
-        <div className="text-sm font-semibold text-slate-800">第三者（墓参者）の状況</div>
+        <div className="text-sm font-semibold text-slate-800">第三者の状況</div>
         <select value={thirdPartyLevel} onChange={(e) => setThirdPartyLevel(e.target.value)} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm">
           <option value="">選択してください</option>
           <option value="多い">多い</option>
@@ -1205,57 +1208,72 @@ export default function KyNewClient() {
         )}
       </div>
 
-      {/* ✅ AI補足（項目別）：書式のみ修正（欄を1つに統一／作業内容欄削除／第三者表記変更） */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
         <div className="flex items-center justify-between gap-3">
-          <div className="text-sm font-semibold text-slate-800">AI補足（項目別）</div>
+          <div className="text-sm font-semibold text-slate-800">AI補足（箇条書き）</div>
           <button
             type="button"
             onClick={onGenerateAi}
             disabled={aiGenerating}
-            className={`rounded-lg border px-3 py-2 text-sm ${aiGenerating ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"}`}
+            className={`rounded-lg border px-3 py-2 text-sm ${
+              aiGenerating ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
+            }`}
           >
             {aiGenerating ? "生成中..." : "AI補足を生成"}
           </button>
         </div>
 
-        {/* ① 作業内容の補足欄は削除（表示しない） */}
+        {/* ✅ 作業内容の補足欄は削除（aiWorkは保持して保存には入るが、UIでは出さない） */}
 
-        {/* ② 危険予知の補足：欄を1つに */}
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">危険予知の補足</div>
-          <textarea
-            value={aiHazards}
-            onChange={(e) => setAiHazards(e.target.value)}
-            rows={6}
-            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-            placeholder="例：〇〇だから〇〇が起こる（箇条書き推奨）"
-          />
+          <div className="text-xs text-slate-600">危険予知の補足（スクロール表示・最大20項目）</div>
+          {aiHazardsView.length ? (
+            <div className="rounded-lg border border-slate-300 bg-white p-3 max-h-56 overflow-y-auto">
+              <div className="text-xs text-slate-500 mb-2">表示件数：{aiHazardsView.length}</div>
+              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                {aiHazardsView.map((x, i) => (
+                  <li key={`${x}-${i}`}>{x}</li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
+          )}
+          <textarea value={aiHazards} onChange={(e) => setAiHazards(e.target.value)} rows={4} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
         </div>
 
-        {/* ③ 対策の補足：欄を1つに */}
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">対策の補足</div>
-          <textarea
-            value={aiCounter}
-            onChange={(e) => setAiCounter(e.target.value)}
-            rows={6}
-            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-            placeholder="例：各項目ごとに具体的対策（箇条書き推奨）"
-          />
+          <div className="text-xs text-slate-600">対策の補足（スクロール表示・最大20項目）</div>
+          {aiMeasuresView.length ? (
+            <div className="rounded-lg border border-slate-300 bg-white p-3 max-h-56 overflow-y-auto">
+              <div className="text-xs text-slate-500 mb-2">表示件数：{aiMeasuresView.length}</div>
+              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                {aiMeasuresView.map((x, i) => (
+                  <li key={`${x}-${i}`}>{x}</li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
+          )}
+          <textarea value={aiCounter} onChange={(e) => setAiCounter(e.target.value)} rows={4} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
         </div>
 
-        {/* ③（ご指定） 第三者（墓参者）→ 第三者 に変更 */}
-        {/* ④ 第三者の補足：欄を1つに */}
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">第三者の補足</div>
-          <textarea
-            value={aiThird}
-            onChange={(e) => setAiThird(e.target.value)}
-            rows={6}
-            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
-            placeholder="例：立入区画、誘導導線、声掛け、見守り配置 など（箇条書き推奨）"
-          />
+          <div className="text-xs text-slate-600">第三者の補足（番号なし・重複除去）</div>
+          {aiThirdView.length ? (
+            <div className="rounded-lg border border-slate-300 bg-white p-3 max-h-56 overflow-y-auto">
+              <div className="text-xs text-slate-500 mb-2">表示件数：{aiThirdView.length}</div>
+              <ul className="list-disc pl-5 text-sm text-slate-800 space-y-1">
+                {aiThirdView.map((x, i) => (
+                  <li key={`${x}-${i}`}>{x}</li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">（なし）</div>
+          )}
+          <textarea value={aiThird} onChange={(e) => setAiThird(e.target.value)} rows={4} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
         </div>
       </div>
 
@@ -1274,11 +1292,20 @@ export default function KyNewClient() {
       )}
 
       <div className="flex items-center justify-between gap-3">
-        <button type="button" onClick={() => router.push(`/projects/${projectId}/ky`)} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50">
+        <button
+          type="button"
+          onClick={() => router.push(`/projects/${projectId}/ky`)}
+          className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm hover:bg-slate-50"
+        >
           戻る
         </button>
 
-        <button type="button" onClick={onSave} disabled={saving} className={`rounded-lg px-4 py-2 text-sm text-white ${saving ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}>
+        <button
+          type="button"
+          onClick={onSave}
+          disabled={saving}
+          className={`rounded-lg px-4 py-2 text-sm text-white ${saving ? "bg-slate-400" : "bg-black hover:bg-slate-900"}`}
+        >
           {saving ? "保存中..." : "保存"}
         </button>
       </div>
