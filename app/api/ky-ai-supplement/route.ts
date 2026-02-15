@@ -15,7 +15,7 @@ type WeatherSlot = {
 type Body = {
   work_detail: string;
 
-  // ✅ 受け取っても「AIへは送らない」（比較用：重複除外のみ）
+  // ✅ 受け取っても「AIへは送らない」（比較用：以前の名残。今回は“削除なし”方針なので未使用でOK）
   hazards?: string | null;
   countermeasures?: string | null;
 
@@ -33,23 +33,20 @@ type Body = {
 function s(v: any) {
   return v == null ? "" : String(v);
 }
+
 function normalizeText(text: string): string {
   return (text || "").replace(/\r\n/g, "\n").replace(/\u3000/g, " ").trim();
 }
+
 function stripBulletLead(x: string): string {
-  return x.replace(/^[•・\-*]\s*/, "").trim();
+  return x.replace(/^\s*(?:[•・\-*]\s*)/, "").trim();
 }
+
 function safeUrl(u: any): string | null {
   const t = s(u).trim();
   if (!t) return null;
   if (!/^https?:\/\//i.test(t)) return null;
   return t;
-}
-function splitLines(text: string): string[] {
-  return normalizeText(text)
-    .split("\n")
-    .map((x) => stripBulletLead(normalizeText(x)))
-    .filter(Boolean);
 }
 
 /** 先頭タグを外す（【作業】など） */
@@ -64,7 +61,7 @@ function peelTag(line: string): { tag: string; body: string } {
 function ensureCausal(line: string): string {
   const { tag, body } = peelTag(line);
   const t = stripBulletLead(normalizeText(body));
-  if (!t) return tag ? `${tag} ` : "";
+  if (!t) return "";
 
   // 既に因果っぽいならそのまま
   if (/(だから|ため|恐れ|起こる|発生|転倒|転落|接触|巻き込まれ|飛来|墜落|滑落|挟まれ)/.test(t)) {
@@ -89,57 +86,12 @@ function ensureCausal(line: string): string {
   return tag ? `${tag} ${out}` : out;
 }
 
-/** =========================
- *  重複判定（人入力と似てたら落とす）
- * ========================= */
-function normalizeForSim(x: string): string {
-  return (x || "")
-    .toLowerCase()
-    .replace(/\u3000/g, " ")
-    .replace(/[（）()\[\]【】「」『』]/g, "")
-    .replace(/[、，,。．.・:：;；/／|｜]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-function charBigrams(x: string): Set<string> {
-  const t = normalizeForSim(x).replace(/\s+/g, "");
-  const out = new Set<string>();
-  if (t.length <= 1) return out;
-  for (let i = 0; i < t.length - 1; i++) out.add(t.slice(i, i + 2));
-  return out;
-}
-function jaccard(a: Set<string>, b: Set<string>): number {
-  if (!a.size || !b.size) return 0;
-  let inter = 0;
-  for (const x of a) if (b.has(x)) inter++;
-  const uni = a.size + b.size - inter;
-  return uni ? inter / uni : 0;
-}
-function isTooSimilar(line: string, humanLines: string[], threshold: number): boolean {
-  if (!humanLines.length) return false;
-  const a = charBigrams(line);
-  if (!a.size) return false;
-  for (const h of humanLines) {
-    const b = charBigrams(h);
-    const sim = jaccard(a, b);
-    if (sim >= threshold) return true;
-  }
-  return false;
-}
-function dedupeKeepOrder(arr: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const x of arr) {
-    const k = x.trim();
-    if (!k) continue;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(k);
-  }
-  return out;
-}
 function joinLines(arr: string[]): string {
-  return arr.map((x) => normalizeText(x)).filter(Boolean).join("\n");
+  return arr
+    .map((x) => normalizeText(x))
+    .map((x) => stripBulletLead(x))
+    .filter((x) => x.length >= 1)
+    .join("\n");
 }
 
 /** =========================
@@ -149,6 +101,7 @@ function isAbortError(e: any): boolean {
   const msg = s(e?.message).toLowerCase();
   return msg.includes("aborted") || msg.includes("abort") || e?.name === "AbortError";
 }
+
 async function callOpenAIResponses(payload: any, apiKey: string, timeoutMs: number): Promise<any> {
   const ac = new AbortController();
   const to = setTimeout(() => ac.abort(), timeoutMs);
@@ -171,6 +124,7 @@ async function callOpenAIResponses(payload: any, apiKey: string, timeoutMs: numb
     clearTimeout(to);
   }
 }
+
 function extractAnyTextFromResponses(resp: any): string {
   const direct = s(resp?.output_text).trim();
   if (direct) return direct;
@@ -198,6 +152,7 @@ function extractAnyTextFromResponses(resp: any): string {
     return s(resp);
   }
 }
+
 function parseJsonLoosely(text: string): any | null {
   const src = s(text);
   try {
@@ -215,6 +170,7 @@ function parseJsonLoosely(text: string): any | null {
   }
   return null;
 }
+
 function normalizeArrayToStrings(arr: any): string[] {
   if (!Array.isArray(arr)) return [];
   return arr
@@ -236,7 +192,7 @@ function normalizeArrayToStrings(arr: any): string[] {
       return "";
     })
     .map((x) => stripBulletLead(normalizeText(x)))
-    .filter(Boolean);
+    .filter((x) => x.length >= 1);
 }
 
 function weatherSummary(slots: WeatherSlot[] | null | undefined): {
@@ -279,18 +235,6 @@ function weatherSummary(slots: WeatherSlot[] | null | undefined): {
   return { text: lines.join("\n"), isFineDry, isWindy, isHot };
 }
 
-/** タグ順に並べる：作業→気象→写真→その他 */
-function sortByTagOrder(lines: string[]): string[] {
-  const weight = (x: string) => {
-    const t = stripBulletLead(normalizeText(x));
-    if (t.startsWith("【作業】")) return 0;
-    if (t.startsWith("【気象】")) return 1;
-    if (t.startsWith("【写真】")) return 2;
-    return 3;
-  };
-  return [...lines].sort((a, b) => weight(a) - weight(b));
-}
-
 export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as Body;
@@ -303,9 +247,6 @@ export async function POST(req: Request) {
 
     const model = (process.env.OPENAI_MODEL || "gpt-5.2").trim();
 
-    // 人入力（比較用だけ）
-    const humanHazLines = splitLines(s(body?.hazards));
-    const humanMeaLines = splitLines(s(body?.countermeasures));
     const thirdLevel = normalizeText(s(body?.third_party_level));
 
     // AIへ渡す気象とフラグ
@@ -319,25 +260,40 @@ export async function POST(req: Request) {
       "あなたは日本の建設現場の安全管理（所長補佐）。",
       "出力は必ずJSONのみ。前置き/解説/挨拶は禁止。JSON以外を出力しない。",
       "",
-      "入力は「作業内容」「気象要約」「写真（今回/前回）」のみ。",
+      "入力は「作業内容」「気象要約」「写真（今回/前回）」「第三者（墓参者）の多寡」のみ。",
       "",
-      "【狙い】作業内容（工程固有）を主役にし、気象・写真差分は補足として後段に追加する。",
+      "【超重要：本システム仕様】",
+      "・この出力は『新規作成画面』と『レビューの再生成』で同じ形式・同じ行数で扱う。",
+      "・要約/短縮/上位抽出は絶対に禁止。『重要なものだけ』にしない。",
+      "・必ず“指定の最低行数”を満たす。足りない場合は作業内容/気象/写真から追加で捻出して埋める。",
       "",
-      "【出力ルール（超重要）】",
-      "1) hazards は必ず『〇〇だから、〇〇が起こる』形式。1行=1項目。",
-      "2) measures は具体策（誰が/配置/手順/合図/停止基準/点検/保護具/立入規制）。『注意する』は禁止。",
-      "3) 各行の先頭にタグを付ける：",
+      "【出力ルール】",
+      "1) hazards は必ず『〇〇だから、〇〇が起こる』形式。1行=1項目。改行ではなく配列要素で区切る。",
+      "2) measures は具体策（誰が/配置/手順/合図/停止基準/点検/保護具/立入規制）。『注意する』だけは禁止。1行=1項目。",
+      "3) third は第三者（墓参者）向けの危険/対策混在でも良いが、現場運用の手順になるように書く。1行=1項目。",
+      "4) hazards/measures の各行の先頭にタグを付ける：",
       "   - 作業内容由来 → 【作業】",
       "   - 気象由来（乾燥/粉じん/強風/雨/高温/眩しさ等）→ 【気象】",
       "   - 写真差分由来（ぬかるみ/段差/崩れ兆候/養生不足/資機材散乱/区画不足等）→ 【写真】",
-      "4) 並び順：まず【作業】を多め（hazards 10〜16、measures 10〜16）、次に【気象】2〜6、最後に【写真】2〜6。",
-      "5) 作業内容を工程分解して考える（準備→運搬→施工→片付け）。各工程で『いつ/どこで/何を/誰が/何の道具で』危険が出るかを具体化。",
-      "6) 写真は今回/前回を比較し、変化点があれば優先して【写真】に反映。画像が無い時は想定で補完。",
+      "5) third はタグ不要（付けても良いが必須ではない）。",
+      "",
+      "【最低行数（絶対）】",
+      "・hazards: 12行以上（推奨 14〜18）",
+      "・measures: 12行以上（推奨 14〜18、hazardsに概ね対応する順が望ましい）",
+      "・third: 8行以上（多い場合は10〜14推奨）",
+      "",
+      "【作り方】",
+      "・作業内容を工程分解（準備→運搬→施工→片付け）し、工程ごとの危険を具体化。",
+      "・気象フラグ（乾燥/強風/高温）と写真差分（今回/前回）を必ず反映。",
+      "・画像が無い場合でも想定で補完して最低行数を満たす。",
     ].join("\n");
 
     const userText = [
       "【作業内容】",
       workDetail,
+      "",
+      "【第三者（墓参者）の多寡】",
+      thirdLevel ? thirdLevel : "（未指定）",
       "",
       "【気象要約】",
       wx.text,
@@ -355,8 +311,9 @@ export async function POST(req: Request) {
       properties: {
         hazards: { type: "array", items: { type: "string" } },
         measures: { type: "array", items: { type: "string" } },
+        third: { type: "array", items: { type: "string" } },
       },
-      required: ["hazards", "measures"],
+      required: ["hazards", "measures", "third"],
     } as const;
 
     const userContent: any[] = [{ type: "input_text", text: userText }];
@@ -381,72 +338,33 @@ export async function POST(req: Request) {
 
     let resp: any = null;
     try {
-      resp = await callOpenAIResponses(buildPayload(2000), apiKey, timeout1);
+      resp = await callOpenAIResponses(buildPayload(2800), apiKey, timeout1);
     } catch (e: any) {
       if (!isAbortError(e)) {
         return NextResponse.json({ error: e?.message ?? "OpenAI API error", detail: e?.detail ?? null }, { status: 500 });
       }
-      resp = await callOpenAIResponses(buildPayload(1400), apiKey, timeout2);
+      resp = await callOpenAIResponses(buildPayload(2200), apiKey, timeout2);
     }
 
     const anyText = extractAnyTextFromResponses(resp);
     const parsed = parseJsonLoosely(anyText) ?? {};
 
-    let hazards = normalizeArrayToStrings(parsed?.hazards).map(ensureCausal).filter(Boolean);
-    let measures = normalizeArrayToStrings(parsed?.measures)
-      .map((x) => stripBulletLead(normalizeText(x)))
-      .filter(Boolean);
+    // ✅ “削らない/並べ替えない/重複除外しない” 方針
+    const hazardsRaw = normalizeArrayToStrings(parsed?.hazards);
+    const measuresRaw = normalizeArrayToStrings(parsed?.measures);
+    const thirdRaw = normalizeArrayToStrings(parsed?.third);
 
-    // ✅ 落とし過ぎ防止：似てても残しやすい閾値
-    hazards = hazards.filter((x) => !isTooSimilar(x, humanHazLines, 0.48));
-    measures = measures.filter((x) => !isTooSimilar(x, humanMeaLines, 0.46));
-
-    hazards = dedupeKeepOrder(sortByTagOrder(hazards));
-    measures = dedupeKeepOrder(sortByTagOrder(measures));
-
-    // ✅ 最低限の保険（タグ付きで補足側に追加）
-    if (hazards.length < 12) {
-      const extra = [
-        ensureCausal("【気象】乾燥で粉じんが舞いやすい"),
-        ensureCausal("【気象】日差しで眩しく足元確認が遅れやすい"),
-        ensureCausal("【気象】日射で熱中症が起きやすい"),
-        ensureCausal("【気象】風で飛散物が発生しやすい"),
-        ensureCausal("【写真】通路側の区画が不十分だと第三者が侵入しやすい"),
-        ensureCausal("【写真】資機材の仮置きが不安定だと転倒・落下が起こる"),
-      ].filter(Boolean);
-      hazards = dedupeKeepOrder(sortByTagOrder([...hazards, ...extra]));
-    }
-    if (measures.length < 12) {
-      const extra = [
-        "【気象】散水・集じん・防じんマスクで粉じん対策を実施する（乾燥時は必須）",
-        "【気象】日差しで視認性が落ちるため、合図者配置・指差呼称で見落としを防止する",
-        "【気象】WBGT/休憩/水分塩分補給で熱中症対策を実施し、異常時は即中止する基準を周知する",
-        "【気象】風で飛散する資材は固定し、養生のめくれ・飛散が出たら作業を停止して復旧する",
-        "【写真】資機材は転倒防止の位置決めと仮置き禁止帯を設定する",
-        "【写真】第三者動線は区画し、接近時は作業一時停止→誘導してから再開する",
-      ];
-      measures = dedupeKeepOrder(sortByTagOrder([...measures, ...extra]));
-    }
-
-    const third =
-      thirdLevel === "多い"
-        ? [
-            "第三者の動線を完全分離し、立入禁止柵・ロープ・看板で区画する",
-            "誘導員を配置し、第三者が近づいたら作業を一時停止する基準を周知する",
-            "声掛けを徹底し、第三者の通過導線を安全側へ誘導する",
-          ]
-        : thirdLevel === "少ない"
-        ? [
-            "第三者が来る可能性を前提に、出入口・通路側を区画し看板を掲示する",
-            "第三者を確認したら作業を一時停止し、安全側へ誘導してから再開する",
-          ]
-        : [];
+    // hazards は因果形式だけ保証（内容は削らない）
+    const hazards = hazardsRaw.map(ensureCausal).filter((x) => x.length >= 1);
+    const measures = measuresRaw.map((x) => stripBulletLead(normalizeText(x))).filter((x) => x.length >= 1);
+    const third = thirdRaw.map((x) => stripBulletLead(normalizeText(x))).filter((x) => x.length >= 1);
 
     return NextResponse.json({
       ai_hazards: joinLines(hazards),
       ai_countermeasures: joinLines(measures),
       ai_third_party: joinLines(third),
 
+      // デバッグ/将来用（新規作成と完全一致させるため “そのまま” 返す）
       ai_hazards_items: hazards,
       ai_countermeasures_items: measures,
       ai_third_party_items: third,
