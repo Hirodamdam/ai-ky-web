@@ -214,94 +214,12 @@ async function postJsonTry(urls: string[], body: any): Promise<any> {
   throw lastErr ?? new Error("API呼び出しに失敗しました");
 }
 
-/** =========================
- * AI補足：見せ方（あなたの箇条書き要求をコード化）
- * - 重複除去：AI各行が人入力に一定以上似ていたら除外
- * - 重要度スコアリング：危険系キーワードで加点
- * - 上位5件抽出：点数でソートして5件
- * - 番号削除：番号/記号を除去して「番号なし・箇条書き」統一
- * - 最小一致文削除：テンプレ寄り語は減点して沈める
- * - 整合：対策側は「上位危険予知と同じ語を含む行」を加点
- * ========================= */
-
-const DANGER_KEYWORDS: Array<{ k: string; w: number }> = [
-  { k: "墜落", w: 6 },
-  { k: "転落", w: 6 },
-  { k: "崩壊", w: 6 },
-  { k: "落石", w: 6 },
-  { k: "土砂", w: 5 },
-  { k: "崩れる", w: 5 },
-  { k: "挟まれ", w: 6 },
-  { k: "巻き込まれ", w: 6 },
-  { k: "重機", w: 5 },
-  { k: "バックホウ", w: 5 },
-  { k: "ユンボ", w: 5 },
-  { k: "クレーン", w: 5 },
-  { k: "吊り荷", w: 6 },
-  { k: "第三者", w: 6 },
-  { k: "通行人", w: 6 },
-  { k: "墓参", w: 6 },
-  { k: "飛来", w: 5 },
-  { k: "落下物", w: 6 },
-  { k: "感電", w: 6 },
-  { k: "火災", w: 5 },
-  { k: "酸欠", w: 6 },
-  { k: "有毒", w: 6 },
-  { k: "熱中症", w: 4 },
-  { k: "強風", w: 4 },
-  { k: "雨", w: 3 },
-  { k: "滑落", w: 6 },
-];
-
-const GENERIC_TEMPLATES: Array<{ k: string; p: number }> = [
-  { k: "ヘルメット", p: 3 },
-  { k: "保護具", p: 3 },
-  { k: "安全帯", p: 2 },
-  { k: "声掛け", p: 3 },
-  { k: "注意する", p: 3 },
-  { k: "注意喚起", p: 3 },
-  { k: "周知徹底", p: 3 },
-  { k: "安全確認", p: 2 },
-  { k: "整理整頓", p: 2 },
-  { k: "KY活動", p: 2 },
-  { k: "ルール遵守", p: 2 },
-];
-
-function normalizeJa(s0: string): string {
-  return (s0 ?? "")
-    .toString()
-    .replace(/\s+/g, "")
-    .replace(/[・･]/g, "")
-    .replace(/[（）()\[\]【】「」『』]/g, "")
-    .replace(/[.,。､、:：;；!?！？]/g, "")
-    .trim()
-    .toLowerCase();
-}
-
-// 2-gram Jaccard（日本語向け）
-function shingles2(s0: string): Set<string> {
-  const t = normalizeJa(s0);
-  const set = new Set<string>();
-  if (!t) return set;
-  if (t.length === 1) {
-    set.add(t);
-    return set;
-  }
-  for (let i = 0; i < t.length - 1; i++) set.add(t.slice(i, i + 2));
-  return set;
-}
-
-function jaccard(a: Set<string>, b: Set<string>): number {
-  if (!a.size || !b.size) return 0;
-  let inter = 0;
-  for (const x of a) if (b.has(x)) inter++;
-  const uni = a.size + b.size - inter;
-  return uni ? inter / uni : 0;
-}
-
-function similarity(a: string, b: string): number {
-  return jaccard(shingles2(a), shingles2(b));
-}
+/** ============ AI補足：表示（新規作成と完全一致） ============
+ * - 重複除外なし
+ * - 並べ替えなし
+ * - 件数制限なし
+ * - 文字は折り返し（枠内改行OK）
+ * ================================================ */
 
 function stripLeadingMarker(line: string): string {
   return (line ?? "")
@@ -309,97 +227,25 @@ function stripLeadingMarker(line: string): string {
     .trim();
 }
 
-function splitLines(text: string | null | undefined): string[] {
-  const raw = (text ?? "").toString();
+function splitLinesKeepAll(text: string | null | undefined): string[] {
+  const raw = (text ?? "").toString().replace(/\r\n/g, "\n");
+  // 空行は潰さず「項目行」だけ拾う（＝表示は新規作成と同じ項目数のまま）
+  // ※ 先頭記号だけは見やすさのため除去（番号無し箇条書きに統一）
   return raw
-    .split(/\r?\n+/)
+    .split("\n")
     .map((x) => stripLeadingMarker(x))
-    .map((x) => x.replace(/\s+/g, " ").trim())
-    .filter((x) => x.length >= 2);
+    .map((x) => x.trim())
+    .filter((x) => x.length >= 1); // ← “削らない”方針だが、完全空行だけは項目として意味がないので除外
 }
 
-function uniqExact(lines: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const l of lines) {
-    const key = normalizeJa(l);
-    if (!key) continue;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(l);
-  }
-  return out;
-}
-
-function scoreBase(line: string): number {
-  let score = 0;
-
-  for (const { k, w } of DANGER_KEYWORDS) {
-    if (line.includes(k)) score += w;
-  }
-
-  for (const { k, p } of GENERIC_TEMPLATES) {
-    if (line.includes(k)) score -= p;
-  }
-
-  const len = normalizeJa(line).length;
-  if (len <= 6) score -= 2;
-  if (len <= 3) score -= 4;
-
-  return score;
-}
-
-function extractHitKeywords(lines: string[]): string[] {
-  const hits = new Set<string>();
-  for (const l of lines) {
-    for (const { k } of DANGER_KEYWORDS) if (l.includes(k)) hits.add(k);
-  }
-  return Array.from(hits);
-}
-
-type ProcessOptions = {
-  humanText?: string;
-  similarityThreshold?: number;
-  topN?: number;
-  alignKeywords?: string[];
-  alignBonus?: number;
-};
-
-function processAiLines(aiText: string | null | undefined, opts: ProcessOptions = {}) {
-  const { humanText = "", similarityThreshold = 0.72, topN = 5, alignKeywords = [], alignBonus = 2 } = opts;
-
-  const humanLines = uniqExact(splitLines(humanText));
-  const aiLines = uniqExact(splitLines(aiText));
-
-  const filtered = aiLines.filter((l) => {
-    if (!humanLines.length) return true;
-    const maxSim = humanLines.reduce((m, h) => Math.max(m, similarity(l, h)), 0);
-    return maxSim < similarityThreshold;
-  });
-
-  const scored = filtered.map((l) => {
-    let sc = scoreBase(l);
-
-    if (alignKeywords.length) {
-      let hit = 0;
-      for (const k of alignKeywords) if (l.includes(k)) hit++;
-      if (hit) sc += Math.min(alignBonus * hit, 6);
-    }
-
-    return { line: l, score: sc };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-
-  return scored.slice(0, topN);
-}
-
-function renderBullets(lines: Array<{ line: string; score: number }>) {
+function renderBulletsAll(lines: string[]) {
   if (!lines.length) return null;
   return (
     <ul className="list-disc pl-5 space-y-1 text-sm text-slate-800">
-      {lines.map((x, i) => (
-        <li key={`${i}-${x.line.slice(0, 24)}`}>{x.line}</li>
+      {lines.map((line, i) => (
+        <li key={`${i}-${line.slice(0, 24)}`} className="whitespace-pre-wrap break-words">
+          {line}
+        </li>
       ))}
     </ul>
   );
@@ -976,32 +822,10 @@ export default function KyReviewClient() {
     return { label: "低", cls: "bg-emerald-100 text-emerald-800 border-emerald-200" };
   }, [risk?.total_ai]);
 
-  // ✅ AI補足（表示用：重複除去/スコアリング/上位抽出/番号なし/整合）
-  const humanAllForAi = useMemo(() => {
-    return `${s(ky?.work_detail)}\n${s(ky?.hazards)}\n${s(ky?.countermeasures)}`.trim();
-  }, [ky?.work_detail, ky?.hazards, ky?.countermeasures]);
-
-  const hazardsTop = useMemo(() => {
-    return processAiLines(ky?.ai_hazards, { humanText: humanAllForAi, topN: 5, similarityThreshold: 0.72 });
-  }, [ky?.ai_hazards, humanAllForAi]);
-
-  const alignKeys = useMemo(() => {
-    return extractHitKeywords(hazardsTop.map((x) => x.line));
-  }, [hazardsTop]);
-
-  const measuresTop = useMemo(() => {
-    return processAiLines(ky?.ai_countermeasures, {
-      humanText: humanAllForAi,
-      topN: 5,
-      similarityThreshold: 0.72,
-      alignKeywords: alignKeys,
-      alignBonus: 2,
-    });
-  }, [ky?.ai_countermeasures, humanAllForAi, alignKeys]);
-
-  const thirdTop = useMemo(() => {
-    return processAiLines(ky?.ai_third_party, { humanText: humanAllForAi, topN: 5, similarityThreshold: 0.72 });
-  }, [ky?.ai_third_party, humanAllForAi]);
+  // ✅ AI補足（新規作成と完全一致：削らない/並べ替えない/件数制限なし）
+  const hazardsAll = useMemo(() => splitLinesKeepAll(ky?.ai_hazards), [ky?.ai_hazards]);
+  const measuresAll = useMemo(() => splitLinesKeepAll(ky?.ai_countermeasures), [ky?.ai_countermeasures]);
+  const thirdAll = useMemo(() => splitLinesKeepAll(ky?.ai_third_party), [ky?.ai_third_party]);
 
   if (loading) {
     return (
@@ -1066,7 +890,6 @@ export default function KyReviewClient() {
           <div className="text-sm text-rose-700">リスク評価：{riskErr}</div>
         ) : risk ? (
           <>
-            {/* ✅ まとめ：人入力以外 TOP5 */}
             <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
               <div className="text-xs font-semibold text-slate-800 mb-2">要注意ポイント（人入力以外：高い順 TOP5）</div>
               {risk.ai_top5?.length ? (
@@ -1430,7 +1253,7 @@ export default function KyReviewClient() {
       {/* ✅ AI補足：印刷は「内部スクロール厳禁」なので、ここは改ページOKにする */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3 print-break-auto print-no-scroll">
         <div className="flex items-center justify-between gap-3">
-          <div className="text-sm font-semibold text-slate-800">AI補足（要点抽出・重複除外・整合）</div>
+          <div className="text-sm font-semibold text-slate-800">AI補足（新規作成と完全一致：削除なし）</div>
 
           <button
             type="button"
@@ -1447,23 +1270,23 @@ export default function KyReviewClient() {
         {/* ✅ 仕様：作業内容のAI補足は表示しない */}
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">危険予知の補足（上位5：番号なし）</div>
+          <div className="text-xs text-slate-600">危険予知の補足（新規作成と同じ行数／そのまま）</div>
           <div className="rounded-lg border border-slate-300 bg-white p-3 print-no-scroll print-break-auto">
-            {renderBullets(hazardsTop) ?? <div className="text-sm text-slate-600">（なし）</div>}
+            {renderBulletsAll(hazardsAll) ?? <div className="text-sm text-slate-600">（なし）</div>}
           </div>
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">対策の補足（上位5：危険予知と整合を加点／番号なし）</div>
+          <div className="text-xs text-slate-600">対策の補足（新規作成と同じ行数／そのまま）</div>
           <div className="rounded-lg border border-slate-300 bg-white p-3 print-no-scroll print-break-auto">
-            {renderBullets(measuresTop) ?? <div className="text-sm text-slate-600">（なし）</div>}
+            {renderBulletsAll(measuresAll) ?? <div className="text-sm text-slate-600">（なし）</div>}
           </div>
         </div>
 
         <div className="space-y-2">
-          <div className="text-xs text-slate-600">第三者（墓参者）の補足（上位5：番号なし）</div>
+          <div className="text-xs text-slate-600">第三者（墓参者）の補足（新規作成と同じ行数／そのまま）</div>
           <div className="rounded-lg border border-slate-300 bg-white p-3 print-no-scroll print-break-auto">
-            {renderBullets(thirdTop) ?? <div className="text-sm text-slate-600">（なし）</div>}
+            {renderBulletsAll(thirdAll) ?? <div className="text-sm text-slate-600">（なし）</div>}
           </div>
         </div>
       </div>
