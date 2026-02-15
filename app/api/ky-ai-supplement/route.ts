@@ -15,13 +15,11 @@ type WeatherSlot = {
 type Body = {
   work_detail: string;
 
-  // ✅ 受け取っても「AIへは送らない」（比較用：以前の名残。今回は“削除なし”方針なので未使用でOK）
   hazards?: string | null;
   countermeasures?: string | null;
 
   third_party_level?: string | null; // "多い" | "少ない" | ""
 
-  // ✅ AIへ送る
   weather_slots?: WeatherSlot[] | null;
 
   slope_photo_url?: string | null; // 今回
@@ -63,8 +61,7 @@ function ensureCausal(line: string): string {
   const t = stripBulletLead(normalizeText(body));
   if (!t) return "";
 
-  // 既に因果っぽいならそのまま
-  if (/(だから|ため|恐れ|起こる|発生|転倒|転落|接触|巻き込まれ|飛来|墜落|滑落|挟まれ)/.test(t)) {
+  if (/(だから|ため|恐れ|起こる|発生|転倒|転落|接触|巻き込まれ|飛来|墜落|滑落|挟まれ|火傷|やけど)/.test(t)) {
     return tag ? `${tag} ${t}` : t;
   }
 
@@ -74,11 +71,13 @@ function ensureCausal(line: string): string {
       ? "つまずき・転倒が起こる"
       : /(法面|斜面|崩壊|土砂|滑落|落石)/.test(base)
       ? "転落・崩壊が起こる"
+      : /(舗装|アスファルト|合材|フィニッシャ|ローラ|転圧)/.test(base)
+      ? "接触・巻き込まれ・火傷が起こる"
       : /(吹付|ノズル|ホース|圧送|ポンプ|跳ね返り)/.test(base)
       ? "飛散・高圧噴射による受傷が起こる"
       : /(回転|巻き込|攪拌|ミキサ|ベルト|チェーン)/.test(base)
       ? "巻き込まれが起こる"
-      : /(重機|バックホウ|ユンボ|車両|死角)/.test(base)
+      : /(重機|バックホウ|ユンボ|車両|ダンプ|死角)/.test(base)
       ? "接触・巻き込まれが起こる"
       : "事故が起こる";
 
@@ -235,6 +234,98 @@ function weatherSummary(slots: WeatherSlot[] | null | undefined): {
   return { text: lines.join("\n"), isFineDry, isWindy, isHot };
 }
 
+/** ---------- タグカウント/補強（削除なし：足りなければ追記） ---------- */
+function countTag(lines: string[], tag: "【作業】" | "【気象】" | "【写真】"): number {
+  return (lines || []).filter((x) => stripBulletLead(normalizeText(x)).startsWith(tag)).length;
+}
+
+function hasAnyWorkHint(workDetail: string): boolean {
+  const t = normalizeText(workDetail);
+  if (!t) return false;
+  // “舗装工”のように短い場合も拾う
+  return /(舗装|表層|基層|切削|乳剤|合材|アスファルト|転圧|ローラ|フィニッシャ|ダンプ|敷均し|締固め)/.test(t);
+}
+
+function buildWorkExtras(workDetail: string): { hazards: string[]; measures: string[] } {
+  const t = normalizeText(workDetail);
+  const isPaving = /(舗装|表層|基層|合材|アスファルト|転圧|ローラ|フィニッシャ|ダンプ|敷均し|締固め)/.test(t) || /舗装工/.test(t);
+
+  if (isPaving) {
+    return {
+      hazards: [
+        "【作業】ダンプが後退して合材を投入するから、接触・巻き込まれが起こる",
+        "【作業】フィニッシャ周辺で合材が移動するから、巻き込まれが起こる",
+        "【作業】ローラ転圧中に死角が大きいから、接触が起こる",
+        "【作業】敷均し作業で後退動作が多いから、つまずき・転倒が起こる",
+        "【作業】合材が高温だから、火傷が起こる",
+        "【作業】路面端部や段差部で足元が不安定だから、転倒が起こる",
+        "【作業】施工区画が狭く第三者動線が近いから、接触事故が起こる",
+        "【作業】手元作業が機械近接になるから、挟まれが起こる",
+      ].map(ensureCausal),
+      measures: [
+        "【作業】ダンプ後退は誘導員を必ず配置し、合図を一本化（無線or手旗）して合図者以外は指示しない",
+        "【作業】フィニッシャ周辺は立入禁止帯を設定し、手元作業員の立ち位置（左右/後方）を事前に固定する",
+        "【作業】ローラ運転手と作業員の接近禁止距離を決め、旋回・後退時は一時停止→安全確認→再開とする",
+        "【作業】敷均しは進行方向を統一し、後退が必要な場面は声掛け＋指差呼称で足元確認を徹底する",
+        "【作業】高温合材の取扱いは耐熱手袋・長袖・保護眼鏡を使用し、飛散が出る作業は顔面保護を追加する",
+        "【作業】段差・路肩側はカラーコーンで縁を明示し、立ち入りを制限して転倒リスクを下げる",
+        "【作業】第三者動線側はバリケード・ロープ・看板で区画し、接近時は作業停止→誘導→再開の手順を徹底する",
+        "【作業】機械近接の手元作業は最小人数・短時間にし、開始前に『合図・停止基準・退避方向』を再確認する",
+      ].map((x) => stripBulletLead(normalizeText(x))),
+    };
+  }
+
+  // 汎用（作業詳細が薄いときの最低限）
+  return {
+    hazards: [
+      "【作業】資機材の運搬・仮置きがあるから、転倒・落下が起こる",
+      "【作業】作業員の動線が交錯するから、接触・転倒が起こる",
+      "【作業】足元の不陸・段差があるから、つまずき・転倒が起こる",
+      "【作業】車両や重機が出入りするから、接触・巻き込まれが起こる",
+      "【作業】手元作業が多いから、挟まれ・切創が起こる",
+      "【作業】作業区画が狭いから、第三者侵入で事故が起こる",
+      "【作業】片付け・清掃が後回しになるから、転倒が起こる",
+      "【作業】合図系統が曖昧だと、誤動作で接触が起こる",
+    ].map(ensureCausal),
+    measures: [
+      "【作業】資機材は仮置き禁止帯を設定し、転倒防止（楔止め/固定/端部養生）を徹底する",
+      "【作業】動線を一方通行にし、交錯点は誘導員または停止合図で管理する",
+      "【作業】段差・不陸は事前にマーキングし、危険箇所は立入規制して踏まない動線にする",
+      "【作業】車両・重機の作業半径を明示し、接近禁止距離と停止基準を全員で共有する",
+      "【作業】手元作業は保護具（手袋/保護眼鏡）を使用し、挟まれ箇所に手を入れない手順にする",
+      "【作業】第三者動線側は区画（ロープ/柵/看板)し、接近時は作業停止→誘導→再開の手順を徹底する",
+      "【作業】片付けは工程内に組み込み、通路は常に確保してつまずき要因を残さない",
+      "【作業】合図は一本化（合図者固定）し、無線/手旗のどちらかに統一して誤認を防ぐ",
+    ].map((x) => stripBulletLead(normalizeText(x))),
+  };
+}
+
+function padWorkIfNeeded(hazards: string[], measures: string[], workDetail: string) {
+  const minWork = 8;
+
+  const hWork = countTag(hazards, "【作業】");
+  const mWork = countTag(measures, "【作業】");
+
+  if (hWork >= minWork && mWork >= minWork) return { hazards, measures };
+
+  const extras = buildWorkExtras(workDetail);
+
+  const nextHaz = [...hazards];
+  const nextMea = [...measures];
+
+  // ✅ 削除なし：足りない分だけ追加
+  if (hWork < minWork) {
+    const need = minWork - hWork;
+    nextHaz.push(...extras.hazards.slice(0, Math.min(need, extras.hazards.length)));
+  }
+  if (mWork < minWork) {
+    const need = minWork - mWork;
+    nextMea.push(...extras.measures.slice(0, Math.min(need, extras.measures.length)));
+  }
+
+  return { hazards: nextHaz, measures: nextMea };
+}
+
 export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as Body;
@@ -249,7 +340,6 @@ export async function POST(req: Request) {
 
     const thirdLevel = normalizeText(s(body?.third_party_level));
 
-    // AIへ渡す気象とフラグ
     const wx = weatherSummary(Array.isArray(body?.weather_slots) ? (body.weather_slots as WeatherSlot[]) : []);
     const slopeNow = safeUrl(body?.slope_photo_url);
     const slopePrev = safeUrl(body?.slope_prev_photo_url);
@@ -263,29 +353,28 @@ export async function POST(req: Request) {
       "入力は「作業内容」「気象要約」「写真（今回/前回）」「第三者（墓参者）の多寡」のみ。",
       "",
       "【超重要：本システム仕様】",
-      "・この出力は『新規作成画面』と『レビューの再生成』で同じ形式・同じ行数で扱う。",
-      "・要約/短縮/上位抽出は絶対に禁止。『重要なものだけ』にしない。",
-      "・必ず“指定の最低行数”を満たす。足りない場合は作業内容/気象/写真から追加で捻出して埋める。",
+      "・要約/短縮/上位抽出は禁止。省略しない。",
+      "・必ず“最低行数”と“タグ配分”を満たす。足りない場合は作業内容を工程分解して埋める。",
       "",
       "【出力ルール】",
-      "1) hazards は必ず『〇〇だから、〇〇が起こる』形式。1行=1項目。改行ではなく配列要素で区切る。",
+      "1) hazards は必ず『〇〇だから、〇〇が起こる』形式。1行=1項目（配列要素）。",
       "2) measures は具体策（誰が/配置/手順/合図/停止基準/点検/保護具/立入規制）。『注意する』だけは禁止。1行=1項目。",
-      "3) third は第三者（墓参者）向けの危険/対策混在でも良いが、現場運用の手順になるように書く。1行=1項目。",
-      "4) hazards/measures の各行の先頭にタグを付ける：",
-      "   - 作業内容由来 → 【作業】",
-      "   - 気象由来（乾燥/粉じん/強風/雨/高温/眩しさ等）→ 【気象】",
-      "   - 写真差分由来（ぬかるみ/段差/崩れ兆候/養生不足/資機材散乱/区画不足等）→ 【写真】",
-      "5) third はタグ不要（付けても良いが必須ではない）。",
+      "3) タグ必須：hazards/measures の各行の先頭に必ず【作業】【気象】【写真】のいずれかを付ける。",
       "",
       "【最低行数（絶対）】",
-      "・hazards: 12行以上（推奨 14〜18）",
-      "・measures: 12行以上（推奨 14〜18、hazardsに概ね対応する順が望ましい）",
-      "・third: 8行以上（多い場合は10〜14推奨）",
+      "・hazards: 12行以上",
+      "・measures: 12行以上",
+      "・third: 8行以上（第三者が多い場合は10行以上推奨）",
+      "",
+      "【タグ配分（絶対）】",
+      "・hazards の【作業】は必ず8行以上（先頭から優先的に配置）。",
+      "・measures の【作業】は必ず8行以上（hazardsの【作業】と概ね対応する順）。",
+      "・【気象】は2〜6行、【写真】は2〜6行を目安にする。",
       "",
       "【作り方】",
       "・作業内容を工程分解（準備→運搬→施工→片付け）し、工程ごとの危険を具体化。",
-      "・気象フラグ（乾燥/強風/高温）と写真差分（今回/前回）を必ず反映。",
-      "・画像が無い場合でも想定で補完して最低行数を満たす。",
+      "・写真は今回/前回の差分を拾い、危険と対策に反映。",
+      "・作業内容が短い（例：舗装工）場合は一般的な工程（合材運搬→敷均し→転圧→切返し→清掃/片付け）で補完して作る。",
     ].join("\n");
 
     const userText = [
@@ -338,38 +427,46 @@ export async function POST(req: Request) {
 
     let resp: any = null;
     try {
-      resp = await callOpenAIResponses(buildPayload(2800), apiKey, timeout1);
+      resp = await callOpenAIResponses(buildPayload(3000), apiKey, timeout1);
     } catch (e: any) {
       if (!isAbortError(e)) {
         return NextResponse.json({ error: e?.message ?? "OpenAI API error", detail: e?.detail ?? null }, { status: 500 });
       }
-      resp = await callOpenAIResponses(buildPayload(2200), apiKey, timeout2);
+      resp = await callOpenAIResponses(buildPayload(2400), apiKey, timeout2);
     }
 
     const anyText = extractAnyTextFromResponses(resp);
     const parsed = parseJsonLoosely(anyText) ?? {};
 
-    // ✅ “削らない/並べ替えない/重複除外しない” 方針
+    // ✅ 削除なし（そのまま取り出し）
     const hazardsRaw = normalizeArrayToStrings(parsed?.hazards);
     const measuresRaw = normalizeArrayToStrings(parsed?.measures);
     const thirdRaw = normalizeArrayToStrings(parsed?.third);
 
-    // hazards は因果形式だけ保証（内容は削らない）
-    const hazards = hazardsRaw.map(ensureCausal).filter((x) => x.length >= 1);
-    const measures = measuresRaw.map((x) => stripBulletLead(normalizeText(x))).filter((x) => x.length >= 1);
+    const hazards0 = hazardsRaw.map(ensureCausal).filter((x) => x.length >= 1);
+    const measures0 = measuresRaw.map((x) => stripBulletLead(normalizeText(x))).filter((x) => x.length >= 1);
     const third = thirdRaw.map((x) => stripBulletLead(normalizeText(x))).filter((x) => x.length >= 1);
 
+    // ✅ 【作業】が出ない事故を潰す（削除なし＝不足分を追記）
+    const padded = padWorkIfNeeded(hazards0, measures0, workDetail);
+
     return NextResponse.json({
-      ai_hazards: joinLines(hazards),
-      ai_countermeasures: joinLines(measures),
+      ai_hazards: joinLines(padded.hazards),
+      ai_countermeasures: joinLines(padded.measures),
       ai_third_party: joinLines(third),
 
-      // デバッグ/将来用（新規作成と完全一致させるため “そのまま” 返す）
-      ai_hazards_items: hazards,
-      ai_countermeasures_items: measures,
+      ai_hazards_items: padded.hazards,
+      ai_countermeasures_items: padded.measures,
       ai_third_party_items: third,
 
       model_used: model,
+      meta: {
+        work_detail_has_hint: hasAnyWorkHint(workDetail),
+        counts: {
+          hazards_work: countTag(padded.hazards, "【作業】"),
+          measures_work: countTag(padded.measures, "【作業】"),
+        },
+      },
     });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "server error" }, { status: 500 });
