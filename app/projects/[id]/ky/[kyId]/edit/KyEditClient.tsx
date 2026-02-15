@@ -822,13 +822,14 @@ export default function KyEditClient() {
           <div className="mt-1 text-sm text-slate-600">工事件名：{project?.name ?? "（不明）"}</div>
         </div>
         <div className="flex flex-col gap-2 shrink-0">
-          <Link className="text-sm text-blue-600 underline text-right" href="/login">
-            ログイン
-          </Link>
-          <Link className="text-sm text-blue-600 underline text-right" href={`/projects/${projectId}/ky`}>
-            KY一覧へ
-          </Link>
-        </div>
+  <Link
+    className="text-sm text-blue-600 underline text-right"
+    href={`/projects/${projectId}/ky`}
+  >
+    KY一覧へ
+  </Link>
+</div>
+
       </div>
 
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-2">
