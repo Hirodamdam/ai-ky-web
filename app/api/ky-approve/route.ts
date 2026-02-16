@@ -43,11 +43,9 @@ async function safeUpdateApprove(
   payload: Record<string, any>,
   allowFallback: boolean
 ) {
-  // まず is_approved を含むpayloadで更新を試す
   const r1 = await adminClient.from("ky_entries").update(payload).eq("id", kyId);
   if (!r1?.error) return { ok: true as const, usedFallback: false as const };
 
-  // is_approved列が無い環境なら、is_approved を外して再試行
   const msg = s(r1.error?.message);
   if (allowFallback && looksLikeMissingColumnError(msg, "is_approved")) {
     const { is_approved, ...rest } = payload;
@@ -60,10 +58,18 @@ async function safeUpdateApprove(
 }
 
 /**
- * ky-risk-score の返り値は環境で多少違っても良いので、できるだけ柔軟に拾う
+ * ky-risk-score の返り値（現在の実装想定）:
+ * {
+ *   total_human: number,
+ *   total_ai: number,
+ *   delta: number,
+ *   breakdown: {...}
+ * }
+ * ただし揺れに強く拾う
  */
 function pickRiskNumbers(j: any): { human: number | null; ai: number | null; delta: number | null } {
   const candidatesHuman = [
+    j?.total_human,
     j?.human_total,
     j?.humanScore,
     j?.human_score,
@@ -72,6 +78,7 @@ function pickRiskNumbers(j: any): { human: number | null; ai: number | null; del
     j?.scores?.human,
   ];
   const candidatesAi = [
+    j?.total_ai,
     j?.ai_total,
     j?.aiScore,
     j?.ai_score,
@@ -90,17 +97,29 @@ function pickRiskNumbers(j: any): { human: number | null; ai: number | null; del
   const human = toIntOrNull(candidatesHuman.find((v: any) => v != null));
   const ai = toIntOrNull(candidatesAi.find((v: any) => v != null));
   let delta = toIntOrNull(candidatesDelta.find((v: any) => v != null));
-
-  // delta が無い場合は human/ai から作る
   if (delta == null && human != null && ai != null) delta = ai - human;
 
   return { human, ai, delta };
 }
 
+function buildWeatherAppliedFromSlots(weatherSlots: any): any | null {
+  if (!Array.isArray(weatherSlots) || weatherSlots.length === 0) return null;
+  const slot = weatherSlots[0];
+  if (!slot) return null;
+  return {
+    hour: slot.hour,
+    weather_text: s(slot.weather_text).trim(),
+    temperature_c: slot.temperature_c ?? null,
+    wind_direction_deg: slot.wind_direction_deg ?? null,
+    wind_speed_ms: slot.wind_speed_ms ?? null,
+    precipitation_mm: slot.precipitation_mm ?? null,
+  };
+}
+
 /**
  * 承認時にΔを確定保存（失敗しても承認は成功）
  * - ky-risk-score を内部呼び出し
- * - ky_delta_stats に upsert
+ * - ky_delta_stats に delete→insert（UNIQUE無しでも確実）
  */
 async function trySaveDeltaStats(params: {
   adminClient: any;
@@ -111,12 +130,13 @@ async function trySaveDeltaStats(params: {
 }) {
   const { adminClient, baseUrl, projectId, kyId, current } = params;
 
-  // ky-risk-score に渡すボディ（不足があっても route 側で null 許容の前提）
+  const weatherApplied = buildWeatherAppliedFromSlots(current?.weather_slots);
+
   const body: any = {
     human: {
       work_detail: s(current?.work_detail).trim() || null,
-      hazards: s((current as any)?.hazards).trim() || null,
-      countermeasures: s((current as any)?.countermeasures).trim() || null,
+      hazards: s(current?.hazards).trim() || null,
+      countermeasures: s(current?.countermeasures).trim() || null,
       third_party_level: s(current?.third_party_level).trim() || null,
       worker_count: current?.worker_count == null ? null : Number(current?.worker_count),
     },
@@ -125,16 +145,19 @@ async function trySaveDeltaStats(params: {
       ai_countermeasures: s(current?.ai_countermeasures).trim() || null,
       ai_third_party: s(current?.ai_third_party).trim() || null,
     },
-    // weather_applied が無い環境でもOK（null）
-    weather_applied: (current as any)?.weather_applied ?? null,
-    // photos が無い環境でもOK（null）
-    photos: (current as any)?.photos ?? null,
+    weather_applied: weatherApplied,
+    photos: {
+      // ky-approve 側では写真URLを持っていないので null にする（risk側が許容の前提）
+      slope_now_url: null,
+      slope_prev_url: null,
+      path_now_url: null,
+      path_prev_url: null,
+    },
   };
 
   const endpoint = new URL("/api/ky-risk-score", baseUrl).toString();
 
   let riskJson: any = null;
-  let riskOk = false;
   let riskError: string | null = null;
 
   try {
@@ -142,22 +165,17 @@ async function trySaveDeltaStats(params: {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      cache: "no-store",
     });
 
     const txt = await res.text().catch(() => "");
     if (!res.ok) {
-      riskOk = false;
       riskError = `ky-risk-score failed: ${res.status} ${txt}`;
-    } else {
-      riskOk = true;
-      riskJson = txt ? JSON.parse(txt) : {};
+      return { saved: false, risk_ok: false, risk_error: riskError };
     }
+    riskJson = txt ? JSON.parse(txt) : {};
   } catch (e: any) {
-    riskOk = false;
     riskError = String(e?.message ?? e);
-  }
-
-  if (!riskOk || !riskJson) {
     return { saved: false, risk_ok: false, risk_error: riskError };
   }
 
@@ -166,26 +184,29 @@ async function trySaveDeltaStats(params: {
     return { saved: false, risk_ok: true, risk_error: "risk-score response missing numeric fields" };
   }
 
-  // ky_delta_stats へ保存（同一 ky_id は上書き）
-  try {
-    const up = await adminClient
-      .from("ky_delta_stats")
-      .upsert(
-        {
-          project_id: projectId,
-          ky_id: kyId,
-          human_score: human,
-          ai_score: ai,
-          delta,
-          human_breakdown: riskJson?.human_breakdown ?? riskJson?.human ?? null,
-          ai_breakdown: riskJson?.ai_breakdown ?? riskJson?.ai ?? null,
-          computed_at: new Date().toISOString(),
-        },
-        { onConflict: "ky_id" }
-      );
+  const computedAt = new Date().toISOString();
 
-    if (up?.error) {
-      return { saved: false, risk_ok: true, risk_error: `upsert ky_delta_stats failed: ${up.error.message}` };
+  // breakdown は riskJson.breakdown が本命。無ければ全体を薄く保存
+  const breakdown = riskJson?.breakdown ?? null;
+
+  try {
+    // ✅ 同一ky_id を一旦消してから入れる（UNIQUEなしでもOK）
+    await adminClient.from("ky_delta_stats").delete().eq("ky_id", kyId);
+
+    const ins = await adminClient.from("ky_delta_stats").insert({
+      id: crypto.randomUUID(),
+      project_id: projectId,
+      ky_id: kyId,
+      human_score: human,
+      ai_score: ai,
+      delta,
+      human_breakdown: breakdown,
+      ai_breakdown: breakdown,
+      computed_at: computedAt,
+    });
+
+    if (ins?.error) {
+      return { saved: false, risk_ok: true, risk_error: `insert ky_delta_stats failed: ${ins.error.message}` };
     }
 
     return { saved: true, risk_ok: true, risk_error: null, human, ai, delta };
@@ -198,10 +219,8 @@ async function trySaveDeltaStats(params: {
  * ky_entries から追加列を安全に拾う（列が無い環境でも落とさない）
  */
 async function enrichCurrentSafely(adminClient: any, kyId: string, baseSelect: string[]) {
-  // 追加で欲しい候補（無い環境あり得るので段階的に外す）
-  const optionalCols = ["hazards", "countermeasures", "weather_applied", "photos"];
+  const optionalCols = ["hazards", "countermeasures"];
 
-  // まず全部入りで試す
   const tryCols = async (cols: string[]) => {
     return await adminClient.from("ky_entries").select(cols.join(",")).eq("id", kyId).maybeSingle();
   };
@@ -214,14 +233,12 @@ async function enrichCurrentSafely(adminClient: any, kyId: string, baseSelect: s
     if (!r?.error) return { data: r.data, usedCols: cols };
     lastErr = r.error;
 
-    // どれかの列が無い可能性：エラー文に含まれてる列を外して再試行
     const msg = s(r.error?.message);
     const hit = optionalCols.find((c) => looksLikeMissingColumnError(msg, c));
-    if (!hit) break; // 列欠損以外なら抜ける
+    if (!hit) break;
     cols = cols.filter((c) => c !== hit);
   }
 
-  // 追加列が取れなくても、baseSelect分は current で既に持ってるので致命ではない
   console.warn("[ky-approve] enrichCurrentSafely failed:", s(lastErr?.message));
   return { data: null, usedCols: baseSelect };
 }
@@ -270,8 +287,6 @@ export async function POST(req: Request) {
     // 2) 管理クライアント（service role）で更新
     const adminClient = createClient(url, serviceKey, { auth: { persistSession: false } });
 
-    // 対象KYの現状取得（協力会社名も取る）
-    // ✅ is_approved 列が無い環境があり得るので、selectには入れない（approved_atで判定可能）
     const baseSelect = [
       "id",
       "project_id",
@@ -301,7 +316,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
     }
 
-    // optional 列も拾える範囲で拾う（無い環境でも落とさない）
     const enrich = await enrichCurrentSafely(adminClient, kyId, baseSelect);
     const current = { ...(current0 as any), ...(enrich.data as any) };
 
@@ -311,11 +325,9 @@ export async function POST(req: Request) {
     const workDate = s((current as any)?.work_date).trim();
     const partnerName = s((current as any)?.partner_company_name).trim();
 
-    // baseUrl（内部API呼び出し用）
     const baseUrl = getBaseUrl(req) || new URL(req.url).origin;
 
     if (action === "unapprove") {
-      // ✅ 承認解除＝公開停止
       const upd = await safeUpdateApprove(
         adminClient,
         kyId,
@@ -334,7 +346,7 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: `Unapprove failed: ${upd.error?.message ?? "unknown"}` }, { status: 500 });
       }
 
-      // ✅ 承認解除時はΔ統計も削除（存在しなければ無視）
+      // ✅ 承認解除時はΔ統計も削除
       try {
         await adminClient.from("ky_delta_stats").delete().eq("ky_id", kyId);
       } catch {
@@ -348,7 +360,6 @@ export async function POST(req: Request) {
     const token = s((current as any)?.public_token).trim() || crypto.randomUUID();
     const nowIso = new Date().toISOString();
 
-    // ✅ 承認＝公開ON
     const upd = await safeUpdateApprove(
       adminClient,
       kyId,
@@ -370,7 +381,7 @@ export async function POST(req: Request) {
     const publicPath = `/ky/public/${token}`;
     const publicUrl = `${baseUrl}${publicPath}`;
 
-    // 2.5) ★承認成功後にΔ統計を保存（失敗しても承認は成功）
+    // ✅ 承認成功後にΔ統計を保存（失敗しても承認は成功）
     const deltaSave = await trySaveDeltaStats({
       adminClient,
       baseUrl,
@@ -380,10 +391,6 @@ export async function POST(req: Request) {
     });
 
     // 3) ★承認成功後にLINE通知（失敗しても承認は成功扱い）
-    //    ルール：
-    //    - 承認時に「協力会社 + 所長 + 社長」へ通知
-    //      ※ 所長/社長は push-ky 側が env から必ず追加
-    //    - 協力会社は完全分岐（ここでは協力会社宛先のみ渡す）
     let lineOk: boolean | null = null;
     let lineError: string | null = null;
 
@@ -395,11 +402,8 @@ export async function POST(req: Request) {
         lineOk = null;
         lineError = "LINE_PUSH_SECRET missing (skip)";
       } else {
-        // ✅ 協力会社宛先（DBから取得）
         if (partnerName) {
           const key = partnerKeyOf(partnerName);
-
-          // まず partner_company_key で試す（存在しない環境はフォールバック）
           let tgt: any = null;
 
           const q1 = await adminClient
@@ -410,7 +414,6 @@ export async function POST(req: Request) {
             .maybeSingle();
 
           if (q1.error) {
-            // partner_company_key 列が無い/違う場合などは name でフォールバック
             if (looksLikeMissingColumnError(q1.error.message, "partner_company_key")) {
               const q2 = await adminClient
                 .from("partner_line_targets")
@@ -444,7 +447,6 @@ export async function POST(req: Request) {
 
         const endpoint = new URL("/api/line/push-ky", baseUrl).toString();
 
-        // ✅ 送信テンプレ用の詳細も渡す（push-ky側は既存互換）
         const work_detail = s((current as any)?.work_detail).trim() || null;
         const workers = (current as any)?.worker_count == null ? null : Number((current as any)?.worker_count);
         const third_party_level = s((current as any)?.third_party_level).trim() || null;
@@ -473,16 +475,13 @@ export async function POST(req: Request) {
             ai_countermeasures,
             ai_third_party,
 
-            // ✅ 協力会社は完全分岐：ここでは協力会社宛先のみ渡す
-            // ✅ 所長/社長は push-ky 側で env から必ず追加される
             to: partnerTo && isNonEmptyString(partnerTo) ? partnerTo : undefined,
 
-            // ✅ 二重送信防止（同一承認の重複だけ止める）
             idempotency: {
               project_id: projectId,
               ky_id: kyId,
               event: "ky_approved",
-              rev: nowIso, // approved_at と同値
+              rev: nowIso,
             },
           }),
         });
@@ -505,21 +504,18 @@ export async function POST(req: Request) {
       public_enabled: true,
       partner_company_name: partnerName || null,
 
-      // ✅ 協力会社宛（完全分岐の結果）
       partner_line_to: partnerTo,
 
-      // ✅ push-ky の結果
       line_ok: lineOk,
       line_error: lineError,
 
-      // ✅ Δ保存の結果（UIには出さないが、テストでは確認できる）
+      // テスト確認用
       delta_saved: (deltaSave as any)?.saved ?? false,
       delta_human: (deltaSave as any)?.human ?? null,
       delta_ai: (deltaSave as any)?.ai ?? null,
       delta_value: (deltaSave as any)?.delta ?? null,
       delta_error: (deltaSave as any)?.risk_error ?? null,
 
-      // ✅ is_approved列が無い環境で fallback したか
       used_fallback: upd.usedFallback,
     });
   } catch (e: any) {
