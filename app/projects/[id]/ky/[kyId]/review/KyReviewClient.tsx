@@ -277,11 +277,7 @@ function clampDelta(d: number) {
   return Math.max(-100, Math.min(100, Math.round(d)));
 }
 
-function buildLineMessage(args: {
-  projectName: string;
-  publicUrl: string;
-  risk: RiskOut | null;
-}) {
+function buildLineMessage(args: { projectName: string; publicUrl: string; risk: RiskOut | null }) {
   const { projectName, publicUrl, risk } = args;
 
   const lines: string[] = [];
@@ -624,11 +620,11 @@ export default function KyReviewClient() {
   }, []);
 
   /** ============ リスク（API呼び出し） ============ */
-  const loadRisk = useCallback(async () => {
+  const loadRisk = useCallback(async (): Promise<RiskOut | null> => {
     setRiskErr("");
     if (!ky) {
       setRisk(null);
-      return;
+      return null;
     }
 
     setRiskLoading(true);
@@ -666,9 +662,11 @@ export default function KyReviewClient() {
 
       const j = await postJsonTry(["/api/ky-risk-score"], payload);
       setRisk(j as RiskOut);
+      return j as RiskOut;
     } catch (e: any) {
       setRisk(null);
       setRiskErr(e?.message ?? "リスク評価の取得に失敗しました");
+      return null;
     } finally {
       setRiskLoading(false);
     }
@@ -800,24 +798,27 @@ export default function KyReviewClient() {
       const origin = typeof window !== "undefined" ? window.location.origin : "";
       const url = `${origin}/ky/public/${token}`;
 
-      // ✅ 承認時：リスクを可能なら最新化してから通知文へ反映
+      // ✅ 承認時：リスクを可能なら最新化してから通知文へ反映（返り値を使う）
+      let latestRisk: RiskOut | null = null;
       try {
-        await loadRisk();
+        latestRisk = await loadRisk();
       } catch {
-        // 失敗しても通知は継続
+        latestRisk = null;
       }
 
       const msg = buildLineMessage({
         projectName: s(project?.name).trim(),
         publicUrl: url,
-        risk: risk,
+        risk: latestRisk ?? risk,
       });
 
       const lineUrl = `https://line.me/R/msg/text/?${encodeURIComponent(msg)}`;
 
-      setStatus({ type: "success", text: "承認しました（LINEを開きます）" });
+      setStatus({ type: "success", text: "承認しました（LINEを別タブで開きます）" });
       await load();
-      window.location.href = lineUrl;
+
+      // ✅ 重要：同一タブ遷移をやめて、別タブで開く（承認APIの処理完走を妨げない）
+      window.open(lineUrl, "_blank", "noopener,noreferrer");
     } catch (e: any) {
       setStatus({ type: "error", text: e?.message ?? "承認に失敗しました" });
     } finally {
