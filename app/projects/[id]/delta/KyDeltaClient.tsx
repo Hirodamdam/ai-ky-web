@@ -1,12 +1,44 @@
+// app/projects/[id]/delta/KyDeltaClient.tsx
 "use client";
 
 import Link from "next/link";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 import { supabase } from "@/app/lib/supabaseClient";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+  ResponsiveContainer,
+  Legend,
+} from "recharts";
 
-type Row = {
+type Mode = "daily" | "monthly";
+
+type DeltaRow = {
+  id: string;
+  project_id: string;
+  ky_id: string;
+  human_score: number;
+  ai_score: number;
+  delta: number;
+  computed_at: string; // timestamptz
+};
+
+type DailyAgg = {
   d: string; // YYYY-MM-DD
+  delta_avg: number;
+  delta_max: number;
+  human_avg: number;
+  ai_avg: number;
+  n: number;
+};
+
+type MonthlyAgg = {
+  m: string; // YYYY-MM
   delta_avg: number;
   delta_max: number;
   human_avg: number;
@@ -18,197 +50,368 @@ function s(v: any) {
   return v == null ? "" : String(v);
 }
 
-function fmtDateJp(d: string) {
-  const m = d.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return d;
-  return `${m[1]}年${Number(m[2])}月${Number(m[3])}日`;
+function isoDate(iso: string) {
+  const m = s(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return "";
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
+function isoMonth(iso: string) {
+  const m = s(iso).match(/^(\d{4})-(\d{2})/);
+  if (!m) return "";
+  return `${m[1]}-${m[2]}`;
 }
 
 function round1(n: number) {
-  if (!Number.isFinite(n)) return 0;
   return Math.round(n * 10) / 10;
 }
 
-function clampDelta(d: number) {
-  if (!Number.isFinite(d)) return 0;
-  return Math.max(-100, Math.min(100, Math.round(d)));
+function labelDelta(d: number) {
+  if (d >= 30) return { text: "要再確認（強）", cls: "bg-rose-100 text-rose-800 border-rose-200" };
+  if (d >= 20) return { text: "要再確認", cls: "bg-orange-100 text-orange-800 border-orange-200" };
+  if (d >= 10) return { text: "やや厳しめ", cls: "bg-amber-100 text-amber-800 border-amber-200" };
+  if (d <= -10) return { text: "人が厳しめ", cls: "bg-sky-100 text-sky-800 border-sky-200" };
+  return { text: "概ね一致", cls: "bg-emerald-100 text-emerald-800 border-emerald-200" };
 }
 
-/** ============ SVG チャート（依存ゼロ） ============ */
-
-type SeriesKey = "delta" | "ai" | "human";
-
-function buildPoints(args: {
-  rows: Row[];
-  key: SeriesKey;
-  w: number;
-  h: number;
-  pad: number;
-  yMin: number;
-  yMax: number;
-}) {
-  const { rows, key, w, h, pad, yMin, yMax } = args;
-  const innerW = w - pad * 2;
-  const innerH = h - pad * 2;
-
-  const xOf = (i: number) => pad + (rows.length <= 1 ? innerW / 2 : (innerW * i) / (rows.length - 1));
-  const yOf = (v: number) => {
-    const t = yMax === yMin ? 0.5 : (v - yMin) / (yMax - yMin);
-    const yy = pad + (1 - t) * innerH;
-    return Math.max(pad, Math.min(h - pad, yy));
+function toCsv(rows: Array<Record<string, any>>) {
+  if (!rows.length) return "";
+  const headers = Object.keys(rows[0]);
+  const esc = (x: any) => {
+    const t = s(x);
+    if (t.includes('"') || t.includes(",") || t.includes("\n")) return `"${t.replace(/"/g, '""')}"`;
+    return t;
   };
-
-  const valOf = (r: Row) => {
-    if (key === "delta") return r.delta_avg;
-    if (key === "ai") return r.ai_avg;
-    return r.human_avg;
-  };
-
-  const pts = rows.map((r, i) => `${xOf(i)},${yOf(valOf(r))}`).join(" ");
-  return pts;
+  const lines = [
+    headers.join(","),
+    ...rows.map((r) => headers.map((h) => esc(r[h])).join(",")),
+  ];
+  return lines.join("\n");
 }
 
-function yRange(rows: Row[]) {
-  if (!rows.length) return { min: 0, max: 1 };
-  const vals = rows.flatMap((r) => [r.delta_avg, r.ai_avg, r.human_avg]);
-  let min = Math.min(...vals);
-  let max = Math.max(...vals);
-  if (!Number.isFinite(min) || !Number.isFinite(max)) return { min: 0, max: 1 };
-  if (min === max) {
-    min -= 1;
-    max += 1;
-  } else {
-    const pad = (max - min) * 0.12;
-    min -= pad;
-    max += pad;
-  }
-  return { min, max };
+function downloadText(filename: string, text: string) {
+  const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 export default function KyDeltaClient() {
   const params = useParams() as { id?: string };
-  const projectId = useMemo(() => String(params?.id ?? ""), [params?.id]);
+  const projectId = useMemo(() => s(params?.id).trim(), [params?.id]);
 
-  const [days, setDays] = useState<number>(60);
+  const [days, setDays] = useState<30 | 60 | 90 | 180>(30);
+  const [mode, setMode] = useState<Mode>("daily");
+
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
-  const [rows, setRows] = useState<Row[]>([]);
 
-  const load = useCallback(async () => {
+  const [raw, setRaw] = useState<DeltaRow[]>([]);
+
+  const sinceIso = useMemo(() => {
+    const now = new Date();
+    const since = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+    return since.toISOString();
+  }, [days]);
+
+  const fetchRows = useCallback(async () => {
     if (!projectId) return;
-    setErr("");
+
     setLoading(true);
+    setErr("");
+
     try {
-      const { data } = await supabase.auth.getSession();
-      const accessToken = data?.session?.access_token;
-      if (!accessToken) throw new Error("セッションがありません。ログインしてください。");
+      // ✅ ここは Supabase の型生成に ky_delta_stats が入ってない環境があるので as any で吸収
+      const q = (supabase as any)
+        .from("ky_delta_stats")
+        .select("id,project_id,ky_id,human_score,ai_score,delta,computed_at")
+        .eq("project_id", projectId)
+        .gte("computed_at", sinceIso)
+        .order("computed_at", { ascending: true })
+        .limit(5000);
 
-      const res = await fetch("/api/ky-delta-summary", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({ projectId, accessToken, days }),
-      });
+      const { data, error } = await q;
+      if (error) throw error;
 
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
+      const rows: DeltaRow[] = Array.isArray(data)
+        ? data.map((r: any) => ({
+            id: s(r.id),
+            project_id: s(r.project_id),
+            ky_id: s(r.ky_id),
+            human_score: Number(r.human_score ?? 0),
+            ai_score: Number(r.ai_score ?? 0),
+            delta: Number(r.delta ?? 0),
+            computed_at: s(r.computed_at),
+          }))
+        : [];
 
-      const r = Array.isArray(j?.rows) ? (j.rows as Row[]) : [];
-      setRows(
-        r.map((x) => ({
-          d: s(x.d).slice(0, 10),
-          delta_avg: Number(x.delta_avg) || 0,
-          delta_max: Number(x.delta_max) || 0,
-          human_avg: Number(x.human_avg) || 0,
-          ai_avg: Number(x.ai_avg) || 0,
-          n: Number(x.n) || 0,
-        }))
-      );
+      setRaw(rows);
     } catch (e: any) {
+      setRaw([]);
       setErr(e?.message ?? "読み込みに失敗しました");
-      setRows([]);
     } finally {
       setLoading(false);
     }
-  }, [projectId, days]);
+  }, [projectId, sinceIso]);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    fetchRows();
+  }, [fetchRows]);
 
-  const kpi = useMemo(() => {
-    if (!rows.length) return null;
-    const n = rows.reduce((a, b) => a + (b.n || 0), 0);
-    const avgDelta = rows.reduce((a, b) => a + b.delta_avg, 0) / rows.length;
-    const maxDelta = Math.max(...rows.map((r) => r.delta_max));
-    const last = rows[rows.length - 1];
+  const dailyRows: DailyAgg[] = useMemo(() => {
+    // group by day
+    const map = new Map<string, DeltaRow[]>();
+    for (const r of raw) {
+      const d = isoDate(r.computed_at);
+      if (!d) continue;
+      const a = map.get(d) ?? [];
+      a.push(r);
+      map.set(d, a);
+    }
+
+    const out: DailyAgg[] = [];
+    const keys = Array.from(map.keys()).sort();
+    for (const d of keys) {
+      const arr = map.get(d) ?? [];
+      if (!arr.length) continue;
+
+      const n = arr.length;
+      const delta_avg = arr.reduce((p, c) => p + c.delta, 0) / n;
+      const delta_max = Math.max(...arr.map((x) => x.delta));
+      const human_avg = arr.reduce((p, c) => p + c.human_score, 0) / n;
+      const ai_avg = arr.reduce((p, c) => p + c.ai_score, 0) / n;
+
+      out.push({
+        d,
+        delta_avg: round1(delta_avg),
+        delta_max: round1(delta_max),
+        human_avg: round1(human_avg),
+        ai_avg: round1(ai_avg),
+        n,
+      });
+    }
+    return out;
+  }, [raw]);
+
+  const monthlyRows: MonthlyAgg[] = useMemo(() => {
+    // group by month
+    const map = new Map<string, DeltaRow[]>();
+    for (const r of raw) {
+      const m = isoMonth(r.computed_at);
+      if (!m) continue;
+      const a = map.get(m) ?? [];
+      a.push(r);
+      map.set(m, a);
+    }
+
+    const out: MonthlyAgg[] = [];
+    const keys = Array.from(map.keys()).sort();
+    for (const m of keys) {
+      const arr = map.get(m) ?? [];
+      if (!arr.length) continue;
+
+      const n = arr.length;
+      const delta_avg = arr.reduce((p, c) => p + c.delta, 0) / n;
+      const delta_max = Math.max(...arr.map((x) => x.delta));
+      const human_avg = arr.reduce((p, c) => p + c.human_score, 0) / n;
+      const ai_avg = arr.reduce((p, c) => p + c.ai_score, 0) / n;
+
+      out.push({
+        m,
+        delta_avg: round1(delta_avg),
+        delta_max: round1(delta_max),
+        human_avg: round1(human_avg),
+        ai_avg: round1(ai_avg),
+        n,
+      });
+    }
+    return out;
+  }, [raw]);
+
+  const viewRows = useMemo(() => {
+    return mode === "daily" ? dailyRows : monthlyRows;
+  }, [mode, dailyRows, monthlyRows]);
+
+  const latest = useMemo(() => {
+    if (!raw.length) return null;
+    const last = raw[raw.length - 1];
     return {
-      days: rows.length,
-      n,
-      avgDelta,
-      maxDelta,
-      lastDelta: last.delta_avg,
-      lastHuman: last.human_avg,
-      lastAi: last.ai_avg,
+      delta: last.delta,
+      ai: last.ai_score,
+      human: last.human_score,
     };
-  }, [rows]);
+  }, [raw]);
 
-  const { min: yMin, max: yMax } = useMemo(() => yRange(rows), [rows]);
+  const summary = useMemo(() => {
+    if (!viewRows.length) {
+      return {
+        latestDeltaAvg: 0,
+        periodDeltaAvg: 0,
+        periodDeltaMax: 0,
+        humanAvg: 0,
+        aiAvg: 0,
+        n: 0,
+      };
+    }
 
-  // SVG サイズ
-  const W = 980;
-  const H = 280;
-  const PAD = 28;
+    const last: any = viewRows[viewRows.length - 1];
+    const latestDeltaAvg = Number(last.delta_avg ?? 0);
 
-  const ptsDelta = useMemo(() => buildPoints({ rows, key: "delta", w: W, h: H, pad: PAD, yMin, yMax }), [rows, yMin, yMax]);
-  const ptsAi = useMemo(() => buildPoints({ rows, key: "ai", w: W, h: H, pad: PAD, yMin, yMax }), [rows, yMin, yMax]);
-  const ptsHuman = useMemo(() => buildPoints({ rows, key: "human", w: W, h: H, pad: PAD, yMin, yMax }), [rows, yMin, yMax]);
+    const n = viewRows.reduce((p: number, c: any) => p + Number(c.n ?? 0), 0);
+    const periodDeltaAvg =
+      n > 0
+        ? viewRows.reduce((p: number, c: any) => p + Number(c.delta_avg ?? 0) * Number(c.n ?? 0), 0) / n
+        : 0;
 
-  const deltaBadge = useMemo(() => {
-    const d = clampDelta(kpi?.lastDelta ?? 0);
-    if (d >= 30) return { text: "KY再確認推奨", cls: "bg-rose-100 text-rose-800 border-rose-200" };
-    if (d >= 20) return { text: "要再確認", cls: "bg-orange-100 text-orange-800 border-orange-200" };
-    if (d >= 10) return { text: "やや厳しめ", cls: "bg-amber-100 text-amber-800 border-amber-200" };
-    if (d <= -10) return { text: "人が厳しめ", cls: "bg-sky-100 text-sky-800 border-sky-200" };
-    return { text: "概ね一致", cls: "bg-emerald-100 text-emerald-800 border-emerald-200" };
-  }, [kpi?.lastDelta]);
+    const periodDeltaMax = Math.max(...viewRows.map((x: any) => Number(x.delta_max ?? 0)));
+    const humanAvg =
+      n > 0
+        ? viewRows.reduce((p: number, c: any) => p + Number(c.human_avg ?? 0) * Number(c.n ?? 0), 0) / n
+        : 0;
+    const aiAvg =
+      n > 0
+        ? viewRows.reduce((p: number, c: any) => p + Number(c.ai_avg ?? 0) * Number(c.n ?? 0), 0) / n
+        : 0;
+
+    return {
+      latestDeltaAvg: round1(latestDeltaAvg),
+      periodDeltaAvg: round1(periodDeltaAvg),
+      periodDeltaMax: round1(periodDeltaMax),
+      humanAvg: round1(humanAvg),
+      aiAvg: round1(aiAvg),
+      n,
+    };
+  }, [viewRows]);
+
+  const badge = useMemo(() => labelDelta(summary.latestDeltaAvg), [summary.latestDeltaAvg]);
+
+  const chartData = useMemo(() => {
+    if (mode === "daily") {
+      return (dailyRows as any[]).map((r) => ({
+        x: r.d,
+        delta: r.delta_avg,
+        ai: r.ai_avg,
+        human: r.human_avg,
+      }));
+    }
+    return (monthlyRows as any[]).map((r) => ({
+      x: r.m,
+      delta: r.delta_avg,
+      ai: r.ai_avg,
+      human: r.human_avg,
+    }));
+  }, [mode, dailyRows, monthlyRows]);
+
+  const onDownloadCsv = useCallback(() => {
+    const rows =
+      mode === "daily"
+        ? dailyRows.map((r) => ({
+            date: r.d,
+            delta_avg: r.delta_avg,
+            delta_max: r.delta_max,
+            human_avg: r.human_avg,
+            ai_avg: r.ai_avg,
+            count: r.n,
+          }))
+        : monthlyRows.map((r) => ({
+            month: r.m,
+            delta_avg: r.delta_avg,
+            delta_max: r.delta_max,
+            human_avg: r.human_avg,
+            ai_avg: r.ai_avg,
+            count: r.n,
+          }));
+
+    const csv = toCsv(rows as any);
+    const name = mode === "daily" ? `delta_daily_${projectId}.csv` : `delta_monthly_${projectId}.csv`;
+    downloadText(name, csv);
+  }, [mode, dailyRows, monthlyRows, projectId]);
+
+  const periodButtons: Array<{ d: 30 | 60 | 90 | 180; label: string }> = [
+    { d: 30, label: "30日" },
+    { d: 60, label: "60日" },
+    { d: 90, label: "90日" },
+    { d: 180, label: "180日" },
+  ];
 
   return (
     <div className="p-4 space-y-4">
       <div className="flex items-start justify-between gap-3">
         <div>
           <div className="text-lg font-bold text-slate-900">Δ推移（AI − 人）</div>
-          <div className="mt-1 text-sm text-slate-600">プロジェクト：{projectId}</div>
+          <div className="mt-1 text-sm text-slate-600 break-all">プロジェクト：{projectId || "（不明）"}</div>
         </div>
-
-        <div className="flex flex-col gap-2 shrink-0">
-          <Link className="text-sm text-blue-600 underline text-right" href={`/projects/${projectId}/ky`}>
+        <div className="flex items-center gap-3">
+          <Link className="text-sm text-blue-600 underline" href={`/projects/${projectId}/ky`}>
             KY一覧へ
           </Link>
         </div>
       </div>
 
+      {!!err && (
+        <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800">
+          {err}
+        </div>
+      )}
+
       <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
-        <div className="flex items-center justify-between gap-2 flex-wrap">
-          <div className="text-sm font-semibold text-slate-800">期間</div>
-          <div className="flex items-center gap-2 flex-wrap">
-            {[30, 60, 90, 180].map((d) => (
-              <button
-                key={d}
-                type="button"
-                onClick={() => setDays(d)}
-                className={`rounded-lg border px-3 py-1.5 text-sm ${
-                  days === d ? "border-slate-900 bg-slate-900 text-white" : "border-slate-300 bg-white hover:bg-slate-50"
-                }`}
-              >
-                {d}日
-              </button>
-            ))}
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={load}
+              onClick={() => setMode("daily")}
+              className={`rounded-lg border px-3 py-2 text-sm ${
+                mode === "daily" ? "border-slate-900 bg-slate-900 text-white" : "border-slate-300 bg-white hover:bg-slate-50"
+              }`}
+            >
+              日次
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode("monthly")}
+              className={`rounded-lg border px-3 py-2 text-sm ${
+                mode === "monthly" ? "border-slate-900 bg-slate-900 text-white" : "border-slate-300 bg-white hover:bg-slate-50"
+              }`}
+            >
+              月次
+            </button>
+
+            <button
+              type="button"
+              onClick={onDownloadCsv}
+              disabled={!viewRows.length}
+              className={`rounded-lg border px-3 py-2 text-sm ${
+                viewRows.length ? "border-slate-300 bg-white hover:bg-slate-50" : "border-slate-300 bg-slate-100 text-slate-400"
+              }`}
+            >
+              CSV
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2 flex-wrap">
+            {periodButtons.map((b) => (
+              <button
+                key={b.d}
+                type="button"
+                onClick={() => setDays(b.d)}
+                className={`rounded-lg border px-3 py-2 text-sm ${
+                  days === b.d ? "border-slate-900 bg-slate-900 text-white" : "border-slate-300 bg-white hover:bg-slate-50"
+                }`}
+              >
+                {b.label}
+              </button>
+            ))}
+
+            <button
+              type="button"
+              onClick={fetchRows}
               disabled={loading}
-              className={`rounded-lg border px-3 py-1.5 text-sm ${
+              className={`rounded-lg border px-3 py-2 text-sm ${
                 loading ? "border-slate-300 bg-slate-100 text-slate-400" : "border-slate-300 bg-white hover:bg-slate-50"
               }`}
             >
@@ -217,130 +420,84 @@ export default function KyDeltaClient() {
           </div>
         </div>
 
-        {err ? <div className="text-sm text-rose-700">{err}</div> : null}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="text-xs text-slate-600 mb-1">最新Δ（平均）</div>
+            <div className="text-2xl font-bold text-slate-900">{viewRows.length ? summary.latestDeltaAvg : "—"}</div>
+            <div className={`inline-flex mt-2 text-xs px-2 py-1 rounded-full border ${badge.cls}`}>{badge.text}</div>
+          </div>
 
-        {kpi ? (
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-              <div className="text-xs text-slate-600 mb-1">最新Δ（平均）</div>
-              <div className="text-2xl font-bold text-slate-900">{round1(kpi.lastDelta)}</div>
-              <div className={`mt-2 inline-flex items-center rounded-full border px-2 py-1 text-xs ${deltaBadge.cls}`}>{deltaBadge.text}</div>
-            </div>
-
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-              <div className="text-xs text-slate-600 mb-1">期間平均Δ</div>
-              <div className="text-2xl font-bold text-slate-900">{round1(kpi.avgDelta)}</div>
-              <div className="text-xs text-slate-600 mt-1">日数：{kpi.days} / 件数：{kpi.n}</div>
-            </div>
-
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-              <div className="text-xs text-slate-600 mb-1">最大Δ（Max）</div>
-              <div className="text-2xl font-bold text-slate-900">{round1(kpi.maxDelta)}</div>
-              <div className="text-xs text-slate-600 mt-1">期間内で最も差が出た日</div>
-            </div>
-
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-              <div className="text-xs text-slate-600 mb-1">最新：AI / 人</div>
-              <div className="text-xl font-bold text-slate-900">
-                {round1(kpi.lastAi)} / {round1(kpi.lastHuman)}
-              </div>
-              <div className="text-xs text-slate-600 mt-1">AI平均 / 人平均</div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="text-xs text-slate-600 mb-1">期間平均Δ</div>
+            <div className="text-2xl font-bold text-slate-900">{viewRows.length ? summary.periodDeltaAvg : "—"}</div>
+            <div className="text-xs text-slate-600 mt-2">
+              {mode === "daily" ? "日数" : "月数"}：{viewRows.length} / 件数：{summary.n}
             </div>
           </div>
-        ) : (
-          <div className="text-sm text-slate-600">（データがありません。承認でΔが保存されると表示されます）</div>
-        )}
 
-        {/* チャート */}
-        <div className="rounded-xl border border-slate-200 bg-white p-3 overflow-x-auto">
-          <div className="min-w-[980px]">
-            <svg width={W} height={H} className="block">
-              {/* 背景 */}
-              <rect x="0" y="0" width={W} height={H} fill="white" />
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="text-xs text-slate-600 mb-1">最大Δ（Max）</div>
+            <div className="text-2xl font-bold text-slate-900">{viewRows.length ? summary.periodDeltaMax : "—"}</div>
+            <div className="text-xs text-slate-600 mt-2">期間内で最も差が出た{mode === "daily" ? "日" : "月"}</div>
+          </div>
 
-              {/* ガイド（水平線 4本） */}
-              {Array.from({ length: 5 }).map((_, i) => {
-                const y = PAD + ((H - PAD * 2) * i) / 4;
-                const v = yMax - ((yMax - yMin) * i) / 4;
-                return (
-                  <g key={i}>
-                    <line x1={PAD} y1={y} x2={W - PAD} y2={y} stroke="#e5e7eb" strokeWidth="1" />
-                    <text x={6} y={y + 4} fontSize="10" fill="#64748b">
-                      {round1(v)}
-                    </text>
-                  </g>
-                );
-              })}
-
-              {/* 系列：Human / AI / Delta（色は固定で見分けやすく） */}
-              {rows.length ? (
-                <>
-                  <polyline points={ptsHuman} fill="none" stroke="#0ea5e9" strokeWidth="2" />
-                  <polyline points={ptsAi} fill="none" stroke="#22c55e" strokeWidth="2" />
-                  <polyline points={ptsDelta} fill="none" stroke="#ef4444" strokeWidth="2.2" />
-
-                  {/* 最終点マーカー */}
-                  <circle cx={W - PAD} cy={Number(ptsDelta.split(" ").slice(-1)[0]?.split(",")[1] || PAD)} r="3.5" fill="#ef4444" />
-                </>
-              ) : null}
-
-              {/* X軸（日付：先頭/中央/末尾） */}
-              {rows.length ? (
-                <>
-                  <text x={PAD} y={H - 8} fontSize="10" fill="#64748b">
-                    {rows[0]?.d}
-                  </text>
-                  <text x={W / 2 - 36} y={H - 8} fontSize="10" fill="#64748b">
-                    {rows[Math.floor(rows.length / 2)]?.d}
-                  </text>
-                  <text x={W - PAD - 80} y={H - 8} fontSize="10" fill="#64748b">
-                    {rows[rows.length - 1]?.d}
-                  </text>
-                </>
-              ) : null}
-            </svg>
-
-            <div className="mt-2 flex items-center gap-4 text-xs text-slate-600">
-              <div className="flex items-center gap-2">
-                <span className="inline-block w-3 h-0.5" style={{ background: "#ef4444" }} />
-                Δ（平均）
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="inline-block w-3 h-0.5" style={{ background: "#22c55e" }} />
-                AI（平均）
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="inline-block w-3 h-0.5" style={{ background: "#0ea5e9" }} />
-                人（平均）
-              </div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="text-xs text-slate-600 mb-1">最新：AI / 人</div>
+            <div className="text-2xl font-bold text-slate-900">
+              {latest ? `${latest.ai} / ${latest.human}` : "—"}
+            </div>
+            <div className="text-xs text-slate-600 mt-2">
+              AI平均 / 人平均：{viewRows.length ? `${summary.aiAvg} / ${summary.humanAvg}` : "—"}
             </div>
           </div>
         </div>
 
-        {/* 表（最後に確認できるように） */}
-        {rows.length ? (
-          <div className="rounded-xl border border-slate-200 bg-white overflow-hidden">
-            <div className="grid grid-cols-12 gap-0 border-b border-slate-200 bg-slate-50 text-xs text-slate-600">
-              <div className="col-span-3 px-3 py-2">日付</div>
-              <div className="col-span-2 px-3 py-2">Δ平均</div>
-              <div className="col-span-2 px-3 py-2">Δ最大</div>
-              <div className="col-span-2 px-3 py-2">人平均</div>
-              <div className="col-span-2 px-3 py-2">AI平均</div>
-              <div className="col-span-1 px-3 py-2 text-right">件数</div>
-            </div>
-
-            {rows.map((r) => (
-              <div key={r.d} className="grid grid-cols-12 gap-0 border-b border-slate-100 text-sm">
-                <div className="col-span-3 px-3 py-2 text-slate-800">{fmtDateJp(r.d)}</div>
-                <div className="col-span-2 px-3 py-2 text-slate-800">{round1(r.delta_avg)}</div>
-                <div className="col-span-2 px-3 py-2 text-slate-800">{round1(r.delta_max)}</div>
-                <div className="col-span-2 px-3 py-2 text-slate-800">{round1(r.human_avg)}</div>
-                <div className="col-span-2 px-3 py-2 text-slate-800">{round1(r.ai_avg)}</div>
-                <div className="col-span-1 px-3 py-2 text-right text-slate-700">{r.n}</div>
-              </div>
-            ))}
+        <div className="rounded-lg border border-slate-200 bg-white p-3">
+          <div className="h-[360px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={chartData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="x" tick={{ fontSize: 12 }} />
+                <YAxis tick={{ fontSize: 12 }} />
+                <Tooltip />
+                <Legend />
+                <Line type="monotone" dataKey="delta" name="Δ（平均）" dot={false} strokeWidth={2} />
+                <Line type="monotone" dataKey="ai" name="AI（平均）" dot={false} strokeWidth={2} />
+                <Line type="monotone" dataKey="human" name="人（平均）" dot={false} strokeWidth={2} />
+              </LineChart>
+            </ResponsiveContainer>
           </div>
-        ) : null}
+        </div>
+
+        <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
+          <div className="grid grid-cols-12 gap-0 border-b border-slate-200 bg-slate-50 text-xs text-slate-600">
+            <div className="col-span-3 px-3 py-2">{mode === "daily" ? "日付" : "月"}</div>
+            <div className="col-span-2 px-3 py-2">Δ平均</div>
+            <div className="col-span-2 px-3 py-2">Δ最大</div>
+            <div className="col-span-2 px-3 py-2">人平均</div>
+            <div className="col-span-2 px-3 py-2">AI平均</div>
+            <div className="col-span-1 px-3 py-2 text-right">件数</div>
+          </div>
+
+          {viewRows.length ? (
+            (viewRows as any[]).map((r) => (
+              <div key={mode === "daily" ? r.d : r.m} className="grid grid-cols-12 gap-0 border-b border-slate-100 text-sm">
+                <div className="col-span-3 px-3 py-2 text-slate-800">{mode === "daily" ? r.d : r.m}</div>
+                <div className="col-span-2 px-3 py-2 text-slate-800">{r.delta_avg}</div>
+                <div className="col-span-2 px-3 py-2 text-slate-800">{r.delta_max}</div>
+                <div className="col-span-2 px-3 py-2 text-slate-800">{r.human_avg}</div>
+                <div className="col-span-2 px-3 py-2 text-slate-800">{r.ai_avg}</div>
+                <div className="col-span-1 px-3 py-2 text-slate-800 text-right">{r.n}</div>
+              </div>
+            ))
+          ) : (
+            <div className="px-3 py-6 text-sm text-slate-600">（データがありません）</div>
+          )}
+        </div>
+
+        <div className="text-xs text-slate-500">
+          ※ 集計は <span className="font-semibold">承認時に確定保存した ky_delta_stats</span> を使用します（編集で数値がズレない設計）。
+        </div>
       </div>
     </div>
   );
