@@ -37,15 +37,12 @@ function looksLikeMissingColumnError(msg: string, col: string) {
   return m.includes(col) && (m.includes("does not exist") || m.includes("column") || m.includes("schema cache"));
 }
 
-async function safeUpdateApprove(
-  adminClient: any,
-  kyId: string,
-  payload: Record<string, any>,
-  allowFallback: boolean
-) {
+async function safeUpdateApprove(adminClient: any, kyId: string, payload: Record<string, any>, allowFallback: boolean) {
+  // まず is_approved を含むpayloadで更新を試す
   const r1 = await adminClient.from("ky_entries").update(payload).eq("id", kyId);
   if (!r1?.error) return { ok: true as const, usedFallback: false as const };
 
+  // is_approved列が無い環境なら、is_approved を外して再試行
   const msg = s(r1.error?.message);
   if (allowFallback && looksLikeMissingColumnError(msg, "is_approved")) {
     const { is_approved, ...rest } = payload;
@@ -57,35 +54,36 @@ async function safeUpdateApprove(
   return { ok: false as const, error: r1.error, usedFallback: false as const };
 }
 
+/** ========= ky_photos の列名差を吸収（レビューと同系） ========= */
+function pickKind(row: any): string {
+  return s(row?.photo_kind).trim() || s(row?.kind).trim() || s(row?.type).trim() || s(row?.category).trim() || "";
+}
+function pickUrl(row: any): string {
+  return (
+    s(row?.image_url).trim() ||
+    s(row?.photo_url).trim() ||
+    s(row?.url).trim() ||
+    s(row?.photo_path).trim() ||
+    s(row?.path).trim() ||
+    ""
+  );
+}
+function canonicalKind(kindRaw: string): "slope" | "path" | "" {
+  const k = s(kindRaw).trim();
+  if (!k) return "";
+  if (k === "slope" || k === "slope_photo" || k === "法面") return "slope";
+  if (k === "path" || k === "path_photo" || k === "通路") return "path";
+  if (k.includes("slope") || k.includes("法面")) return "slope";
+  if (k.includes("path") || k.includes("通路")) return "path";
+  return "";
+}
+
 /**
- * ky-risk-score の返り値（現在の実装想定）:
- * {
- *   total_human: number,
- *   total_ai: number,
- *   delta: number,
- *   breakdown: {...}
- * }
- * ただし揺れに強く拾う
+ * ky-risk-score の返り値は多少違っても良いので、できるだけ柔軟に拾う
  */
 function pickRiskNumbers(j: any): { human: number | null; ai: number | null; delta: number | null } {
-  const candidatesHuman = [
-    j?.total_human,
-    j?.human_total,
-    j?.humanScore,
-    j?.human_score,
-    j?.human?.total,
-    j?.human?.score,
-    j?.scores?.human,
-  ];
-  const candidatesAi = [
-    j?.total_ai,
-    j?.ai_total,
-    j?.aiScore,
-    j?.ai_score,
-    j?.ai?.total,
-    j?.ai?.score,
-    j?.scores?.ai,
-  ];
+  const candidatesHuman = [j?.total_human, j?.human_total, j?.humanScore, j?.human_score, j?.human?.total, j?.human?.score, j?.scores?.human];
+  const candidatesAi = [j?.total_ai, j?.ai_total, j?.aiScore, j?.ai_score, j?.ai?.total, j?.ai?.score, j?.scores?.ai];
   const candidatesDelta = [j?.delta, j?.diff, j?.scores?.delta];
 
   const toIntOrNull = (v: any) => {
@@ -102,24 +100,10 @@ function pickRiskNumbers(j: any): { human: number | null; ai: number | null; del
   return { human, ai, delta };
 }
 
-function buildWeatherAppliedFromSlots(weatherSlots: any): any | null {
-  if (!Array.isArray(weatherSlots) || weatherSlots.length === 0) return null;
-  const slot = weatherSlots[0];
-  if (!slot) return null;
-  return {
-    hour: slot.hour,
-    weather_text: s(slot.weather_text).trim(),
-    temperature_c: slot.temperature_c ?? null,
-    wind_direction_deg: slot.wind_direction_deg ?? null,
-    wind_speed_ms: slot.wind_speed_ms ?? null,
-    precipitation_mm: slot.precipitation_mm ?? null,
-  };
-}
-
 /**
  * 承認時にΔを確定保存（失敗しても承認は成功）
- * - ky-risk-score を内部呼び出し
- * - ky_delta_stats に delete→insert（UNIQUE無しでも確実）
+ * - レビューと同じ入力を組み立てて ky-risk-score を内部呼び出し
+ * - ky_delta_stats に upsert
  */
 async function trySaveDeltaStats(params: {
   adminClient: any;
@@ -130,8 +114,87 @@ async function trySaveDeltaStats(params: {
 }) {
   const { adminClient, baseUrl, projectId, kyId, current } = params;
 
-  const weatherApplied = buildWeatherAppliedFromSlots(current?.weather_slots);
+  // 1) 適用枠（weather_slots 先頭）をレビューと同じ前提で作る
+  const slots = Array.isArray(current?.weather_slots) ? current.weather_slots : [];
+  const applied = slots?.length ? slots[0] : null;
 
+  const weather_applied = applied
+    ? {
+        hour: applied.hour,
+        weather_text: applied.weather_text ?? null,
+        temperature_c: applied.temperature_c ?? null,
+        wind_direction_deg: applied.wind_direction_deg ?? null,
+        wind_speed_ms: applied.wind_speed_ms ?? null,
+        precipitation_mm: applied.precipitation_mm ?? null,
+      }
+    : null;
+
+  // 2) 写真（今回／前回）を ky_photos から拾う（レビューと同じ基準）
+  let slope_now_url: string | null = null;
+  let slope_prev_url: string | null = null;
+  let path_now_url: string | null = null;
+  let path_prev_url: string | null = null;
+
+  try {
+    const { data: photos, error: phErr } = await adminClient
+      .from("ky_photos")
+      .select("*")
+      .eq("project_id", projectId)
+      .order("created_at", { ascending: false })
+      .limit(200);
+
+    if (phErr) {
+      console.warn("[ky-approve] ky_photos fetch error:", phErr.message);
+    } else if (Array.isArray(photos)) {
+      const curKyKey = s(kyId).trim();
+
+      for (const row of photos as any[]) {
+        const url = pickUrl(row);
+        if (!url) continue;
+
+        const k = canonicalKind(pickKind(row));
+        if (!k) continue;
+
+        const rowKy = s(row?.ky_id).trim() || s(row?.ky_entry_id).trim();
+        const isCurrent = rowKy === curKyKey;
+
+        if (k === "slope") {
+          if (!slope_now_url && isCurrent) {
+            slope_now_url = url;
+            continue;
+          }
+          if (!slope_prev_url && !isCurrent) {
+            slope_prev_url = url;
+            continue;
+          }
+        }
+
+        if (k === "path") {
+          if (!path_now_url && isCurrent) {
+            path_now_url = url;
+            continue;
+          }
+          if (!path_prev_url && !isCurrent) {
+            path_prev_url = url;
+            continue;
+          }
+        }
+
+        if (slope_now_url && slope_prev_url && path_now_url && path_prev_url) break;
+      }
+    }
+  } catch (e: any) {
+    console.warn("[ky-approve] ky_photos exception:", String(e?.message ?? e));
+  }
+
+  const photosPayload = {
+    slope_now_url: slope_now_url || null,
+    slope_prev_url: slope_prev_url || null,
+    path_now_url: path_now_url || null,
+    path_prev_url: path_prev_url || null,
+  };
+
+  // 3) ky-risk-score に渡すボディ（レビューと同等）
   const body: any = {
     human: {
       work_detail: s(current?.work_detail).trim() || null,
@@ -145,19 +208,14 @@ async function trySaveDeltaStats(params: {
       ai_countermeasures: s(current?.ai_countermeasures).trim() || null,
       ai_third_party: s(current?.ai_third_party).trim() || null,
     },
-    weather_applied: weatherApplied,
-    photos: {
-      // ky-approve 側では写真URLを持っていないので null にする（risk側が許容の前提）
-      slope_now_url: null,
-      slope_prev_url: null,
-      path_now_url: null,
-      path_prev_url: null,
-    },
+    weather_applied,
+    photos: photosPayload,
   };
 
   const endpoint = new URL("/api/ky-risk-score", baseUrl).toString();
 
   let riskJson: any = null;
+  let riskOk = false;
   let riskError: string | null = null;
 
   try {
@@ -165,17 +223,22 @@ async function trySaveDeltaStats(params: {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      cache: "no-store",
     });
 
     const txt = await res.text().catch(() => "");
     if (!res.ok) {
+      riskOk = false;
       riskError = `ky-risk-score failed: ${res.status} ${txt}`;
-      return { saved: false, risk_ok: false, risk_error: riskError };
+    } else {
+      riskOk = true;
+      riskJson = txt ? JSON.parse(txt) : {};
     }
-    riskJson = txt ? JSON.parse(txt) : {};
   } catch (e: any) {
+    riskOk = false;
     riskError = String(e?.message ?? e);
+  }
+
+  if (!riskOk || !riskJson) {
     return { saved: false, risk_ok: false, risk_error: riskError };
   }
 
@@ -184,29 +247,26 @@ async function trySaveDeltaStats(params: {
     return { saved: false, risk_ok: true, risk_error: "risk-score response missing numeric fields" };
   }
 
-  const computedAt = new Date().toISOString();
-
-  // breakdown は riskJson.breakdown が本命。無ければ全体を薄く保存
-  const breakdown = riskJson?.breakdown ?? null;
-
+  // 4) ky_delta_stats へ保存（同一 ky_id は上書き）
   try {
-    // ✅ 同一ky_id を一旦消してから入れる（UNIQUEなしでもOK）
-    await adminClient.from("ky_delta_stats").delete().eq("ky_id", kyId);
+    const up = await adminClient
+      .from("ky_delta_stats")
+      .upsert(
+        {
+          project_id: projectId,
+          ky_id: kyId,
+          human_score: human,
+          ai_score: ai,
+          delta,
+          human_breakdown: riskJson?.breakdown ? (riskJson.breakdown as any) : riskJson?.human_breakdown ?? riskJson?.human ?? null,
+          ai_breakdown: riskJson?.breakdown ? (riskJson.breakdown as any) : riskJson?.ai_breakdown ?? riskJson?.ai ?? null,
+          computed_at: new Date().toISOString(),
+        },
+        { onConflict: "ky_id" }
+      );
 
-    const ins = await adminClient.from("ky_delta_stats").insert({
-      id: crypto.randomUUID(),
-      project_id: projectId,
-      ky_id: kyId,
-      human_score: human,
-      ai_score: ai,
-      delta,
-      human_breakdown: breakdown,
-      ai_breakdown: breakdown,
-      computed_at: computedAt,
-    });
-
-    if (ins?.error) {
-      return { saved: false, risk_ok: true, risk_error: `insert ky_delta_stats failed: ${ins.error.message}` };
+    if (up?.error) {
+      return { saved: false, risk_ok: true, risk_error: `upsert ky_delta_stats failed: ${up.error.message}` };
     }
 
     return { saved: true, risk_ok: true, risk_error: null, human, ai, delta };
@@ -220,7 +280,6 @@ async function trySaveDeltaStats(params: {
  */
 async function enrichCurrentSafely(adminClient: any, kyId: string, baseSelect: string[]) {
   const optionalCols = ["hazards", "countermeasures"];
-
   const tryCols = async (cols: string[]) => {
     return await adminClient.from("ky_entries").select(cols.join(",")).eq("id", kyId).maybeSingle();
   };
@@ -260,8 +319,7 @@ export async function POST(req: Request) {
     if (!adminUserId || !url || !anonKey || !serviceKey) {
       return NextResponse.json(
         {
-          error:
-            "Missing env: KY_ADMIN_USER_ID / NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY",
+          error: "Missing env: KY_ADMIN_USER_ID / NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY",
         },
         { status: 500 }
       );
@@ -287,6 +345,8 @@ export async function POST(req: Request) {
     // 2) 管理クライアント（service role）で更新
     const adminClient = createClient(url, serviceKey, { auth: { persistSession: false } });
 
+    // 対象KYの現状取得（協力会社名も取る）
+    // ✅ is_approved 列が無い環境があり得るので、selectには入れない（approved_atで判定可能）
     const baseSelect = [
       "id",
       "project_id",
@@ -304,11 +364,7 @@ export async function POST(req: Request) {
       "ai_third_party",
     ];
 
-    const { data: current0, error: curErr } = await adminClient
-      .from("ky_entries")
-      .select(baseSelect.join(","))
-      .eq("id", kyId)
-      .maybeSingle();
+    const { data: current0, error: curErr } = await adminClient.from("ky_entries").select(baseSelect.join(",")).eq("id", kyId).maybeSingle();
 
     if (curErr) return NextResponse.json({ error: `Fetch ky failed: ${curErr.message}` }, { status: 500 });
     if (!current0) return NextResponse.json({ error: "KY not found" }, { status: 404 });
@@ -316,6 +372,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Project mismatch" }, { status: 400 });
     }
 
+    // optional 列も拾える範囲で拾う（無い環境でも落とさない）
     const enrich = await enrichCurrentSafely(adminClient, kyId, baseSelect);
     const current = { ...(current0 as any), ...(enrich.data as any) };
 
@@ -325,9 +382,11 @@ export async function POST(req: Request) {
     const workDate = s((current as any)?.work_date).trim();
     const partnerName = s((current as any)?.partner_company_name).trim();
 
+    // baseUrl（内部API呼び出し用）
     const baseUrl = getBaseUrl(req) || new URL(req.url).origin;
 
     if (action === "unapprove") {
+      // ✅ 承認解除＝公開停止
       const upd = await safeUpdateApprove(
         adminClient,
         kyId,
@@ -346,7 +405,7 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: `Unapprove failed: ${upd.error?.message ?? "unknown"}` }, { status: 500 });
       }
 
-      // ✅ 承認解除時はΔ統計も削除
+      // ✅ 承認解除時はΔ統計も削除（存在しなければ無視）
       try {
         await adminClient.from("ky_delta_stats").delete().eq("ky_id", kyId);
       } catch {
@@ -360,6 +419,7 @@ export async function POST(req: Request) {
     const token = s((current as any)?.public_token).trim() || crypto.randomUUID();
     const nowIso = new Date().toISOString();
 
+    // ✅ 承認＝公開ON
     const upd = await safeUpdateApprove(
       adminClient,
       kyId,
@@ -381,7 +441,7 @@ export async function POST(req: Request) {
     const publicPath = `/ky/public/${token}`;
     const publicUrl = `${baseUrl}${publicPath}`;
 
-    // ✅ 承認成功後にΔ統計を保存（失敗しても承認は成功）
+    // 2.5) ★承認成功後にΔ統計を保存（レビューと同じ入力で計算）
     const deltaSave = await trySaveDeltaStats({
       adminClient,
       baseUrl,
@@ -391,6 +451,10 @@ export async function POST(req: Request) {
     });
 
     // 3) ★承認成功後にLINE通知（失敗しても承認は成功扱い）
+    //    ルール：
+    //    - 承認時に「協力会社 + 所長 + 社長」へ通知
+    //      ※ 所長/社長は push-ky 側が env から必ず追加
+    //    - 協力会社は完全分岐（ここでは協力会社宛先のみ渡す）
     let lineOk: boolean | null = null;
     let lineError: string | null = null;
 
@@ -402,8 +466,10 @@ export async function POST(req: Request) {
         lineOk = null;
         lineError = "LINE_PUSH_SECRET missing (skip)";
       } else {
+        // ✅ 協力会社宛先（DBから取得）
         if (partnerName) {
           const key = partnerKeyOf(partnerName);
+
           let tgt: any = null;
 
           const q1 = await adminClient
@@ -475,13 +541,16 @@ export async function POST(req: Request) {
             ai_countermeasures,
             ai_third_party,
 
+            // ✅ 協力会社は完全分岐：ここでは協力会社宛先のみ渡す
+            // ✅ 所長/社長は push-ky 側で env から必ず追加される
             to: partnerTo && isNonEmptyString(partnerTo) ? partnerTo : undefined,
 
+            // ✅ 二重送信防止（同一承認の重複だけ止める）
             idempotency: {
               project_id: projectId,
               ky_id: kyId,
               event: "ky_approved",
-              rev: nowIso,
+              rev: nowIso, // approved_at と同値
             },
           }),
         });
@@ -504,18 +573,21 @@ export async function POST(req: Request) {
       public_enabled: true,
       partner_company_name: partnerName || null,
 
+      // ✅ 協力会社宛（完全分岐の結果）
       partner_line_to: partnerTo,
 
+      // ✅ push-ky の結果
       line_ok: lineOk,
       line_error: lineError,
 
-      // テスト確認用
+      // ✅ Δ保存の結果（テスト確認用）
       delta_saved: (deltaSave as any)?.saved ?? false,
       delta_human: (deltaSave as any)?.human ?? null,
       delta_ai: (deltaSave as any)?.ai ?? null,
       delta_value: (deltaSave as any)?.delta ?? null,
       delta_error: (deltaSave as any)?.risk_error ?? null,
 
+      // ✅ is_approved列が無い環境で fallback したか
       used_fallback: upd.usedFallback,
     });
   } catch (e: any) {
