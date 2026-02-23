@@ -268,8 +268,12 @@ export async function POST(req: Request) {
     const toFromBody = parseRecipients((body as any)?.to);
     const alsoFromBody = parseRecipients((body as any)?.also_to);
 
-    const adminFromEnv = parseRecipientsFromEnv("LINE_ADMIN_RECIPIENT_IDS");
-    const presFromEnv = parseRecipientsFromEnv("LINE_PRESIDENT_RECIPIENT_IDS");
+    const adminFromEnv =
+  parseRecipientsFromEnv("LINE_ADMIN_RECIPIENT_IDS")
+  .concat(parseRecipientsFromEnv("LINE_ADMIN_TO"));
+
+const presFromEnv =
+  parseRecipientsFromEnv("LINE_PRESIDENT_RECIPIENT_IDS");
 
     const rawTargets = Array.from(new Set([...toFromBody, ...alsoFromBody, ...adminFromEnv, ...presFromEnv]));
     const validTargets = rawTargets.map((x) => x.trim().replace(/^"+|"+$/g, "")).filter(isValidLineTo);
